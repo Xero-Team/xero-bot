@@ -7,7 +7,7 @@
 use serde_json::{json, Value};
 
 use crate::config::Config;
-use crate::github::Client;
+use crate::github::{Client, GhError};
 
 pub const SEVERITIES: [&str; 5] = ["critical", "high", "medium", "low", "info"];
 
@@ -19,6 +19,64 @@ pub fn sev_meta(sev: &str) -> (&'static str, &'static str) {
         "low" => ("🔵", "低"),
         _ => ("⚪", "信息"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Diff parsing — per-file added line numbers (RIGHT side)
+// ---------------------------------------------------------------------------
+
+/// For each file, collect line numbers on the new side that were added.
+/// These are the only lines GitHub lets inline review comments attach to.
+pub fn parse_added_lines(
+    diff: &str,
+) -> std::collections::HashMap<String, std::collections::HashSet<i64>> {
+    use regex::Regex;
+    use std::collections::{HashMap, HashSet};
+
+    let mut added: HashMap<String, HashSet<i64>> = HashMap::new();
+    let file_re = Regex::new(r"^\+\+\+ b/(.+)$").unwrap();
+    let hunk_re = Regex::new(r"\+(\d+)(?:,(\d+))?").unwrap();
+
+    let mut current_file: Option<String> = None;
+    let mut new_line: i64 = 0;
+
+    for line in diff.lines() {
+        if let Some(m) = file_re.captures(line) {
+            let name = m.get(1).unwrap().as_str().to_string();
+            added.entry(name.clone()).or_default();
+            current_file = Some(name);
+            continue;
+        }
+        if line.starts_with("+++ ") {
+            current_file = None;
+            continue;
+        }
+        if line.starts_with("@@") {
+            if let Some(mm) = hunk_re.captures(line) {
+                new_line = mm.get(1).and_then(|d| d.as_str().parse().ok()).unwrap_or(0) - 1;
+            }
+            continue;
+        }
+        let Some(file) = &current_file else {
+            continue;
+        };
+        if line.starts_with('+') {
+            new_line += 1;
+            added.get_mut(file).unwrap().insert(new_line);
+        } else if line.starts_with('-') {
+            // removed line: new-side numbering unchanged
+        } else {
+            new_line += 1;
+        }
+    }
+    added
+}
+
+pub fn truncate(diff: &str, max_chars: usize) -> (String, bool) {
+    if diff.len() <= max_chars {
+        return (diff.to_string(), false);
+    }
+    (diff.chars().take(max_chars).collect(), true)
 }
 
 // ---------------------------------------------------------------------------
@@ -116,6 +174,53 @@ pub async fn call_ai(
         serde_json::from_str(&text).map_err(|e| format!("AI response not JSON: {e}"))?;
 
     extract_ai_text(&fmt, &out)
+}
+
+fn extract_ai_text(fmt: &str, out: &Value) -> Result<String, String> {
+    match fmt {
+        "chat" => out
+            .pointer("/choices/0/message/content")
+            .and_then(|c| c.as_str())
+            .map(String::from)
+            .ok_or_else(|| format!("chat API: no content in {out}")),
+        "responses" => {
+            if let Some(t) = out.get("output_text").and_then(|t| t.as_str()) {
+                return Ok(t.to_string());
+            }
+            // fallback: walk output array backwards
+            if let Some(arr) = out.get("output").and_then(|o| o.as_array()) {
+                for item in arr.iter().rev() {
+                    if let Some(content) = item.get("content").and_then(|c| c.as_array()) {
+                        for c in content {
+                            if c.get("type").and_then(|t| t.as_str()) == Some("output_text") {
+                                if let Some(t) = c.get("text").and_then(|t| t.as_str()) {
+                                    if !t.is_empty() {
+                                        return Ok(t.to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Err(format!("responses API: no text in {out}"))
+        }
+        "anthropic" => {
+            if let Some(content) = out.get("content").and_then(|c| c.as_array()) {
+                for block in content {
+                    if block.get("type").and_then(|t| t.as_str()) == Some("text") {
+                        if let Some(t) = block.get("text").and_then(|t| t.as_str()) {
+                            if !t.is_empty() {
+                                return Ok(t.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            Err(format!("anthropic API: no text in {out}"))
+        }
+        _ => Err("unknown format".into()),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -335,111 +440,77 @@ pub fn build_inline_comments(
     inline
 }
 
-fn extract_ai_text(fmt: &str, out: &Value) -> Result<String, String> {
-    match fmt {
-        "chat" => out
-            .pointer("/choices/0/message/content")
-            .and_then(|c| c.as_str())
-            .map(String::from)
-            .ok_or_else(|| format!("chat API: no content in {out}")),
-        "responses" => {
-            if let Some(t) = out.get("output_text").and_then(|t| t.as_str()) {
-                return Ok(t.to_string());
-            }
-            // fallback: walk output array backwards
-            if let Some(arr) = out.get("output").and_then(|o| o.as_array()) {
-                for item in arr.iter().rev() {
-                    if let Some(content) = item.get("content").and_then(|c| c.as_array()) {
-                        for c in content {
-                            if c.get("type").and_then(|t| t.as_str()) == Some("output_text") {
-                                if let Some(t) = c.get("text").and_then(|t| t.as_str()) {
-                                    if !t.is_empty() {
-                                        return Ok(t.to_string());
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            Err(format!("responses API: no text in {out}"))
-        }
-        "anthropic" => {
-            if let Some(content) = out.get("content").and_then(|c| c.as_array()) {
-                for block in content {
-                    if block.get("type").and_then(|t| t.as_str()) == Some("text") {
-                        if let Some(t) = block.get("text").and_then(|t| t.as_str()) {
-                            if !t.is_empty() {
-                                return Ok(t.to_string());
-                            }
-                        }
-                    }
-                }
-            }
-            Err(format!("anthropic API: no text in {out}"))
-        }
-        _ => Err("unknown format".into()),
-    }
-}
-
 // ---------------------------------------------------------------------------
-// Diff parsing — per-file added line numbers (RIGHT side)
+// Orchestration — run_builtin
 // ---------------------------------------------------------------------------
 
-/// For each file, collect line numbers on the new side that were added.
-/// These are the only lines GitHub lets inline review comments attach to.
-pub fn parse_added_lines(
-    diff: &str,
-) -> std::collections::HashMap<String, std::collections::HashSet<i64>> {
-    use regex::Regex;
-    use std::collections::{HashMap, HashSet};
-
-    let mut added: HashMap<String, HashSet<i64>> = HashMap::new();
-    let file_re = Regex::new(r"^\+\+\+ b/(.+)$").unwrap();
-    let hunk_re = Regex::new(r"\+(\d+)(?:,(\d+))?").unwrap();
-
-    let mut current_file: Option<String> = None;
-    let mut new_line: i64 = 0;
-
-    for line in diff.lines() {
-        if let Some(m) = file_re.captures(line) {
-            let name = m.get(1).unwrap().as_str().to_string();
-            added.entry(name.clone()).or_default();
-            current_file = Some(name);
-            continue;
-        }
-        if line.starts_with("+++ ") {
-            current_file = None;
-            continue;
-        }
-        if line.starts_with("@@") {
-            if let Some(mm) = hunk_re.captures(line) {
-                new_line = mm.get(1).and_then(|d| d.as_str().parse().ok()).unwrap_or(0) - 1;
-            }
-            continue;
-        }
-        let Some(file) = &current_file else {
-            continue;
-        };
-        if line.starts_with('+') {
-            new_line += 1;
-            added.get_mut(file).unwrap().insert(new_line);
-        } else if line.starts_with('-') {
-            // removed line: new-side numbering unchanged
-        } else {
-            new_line += 1;
+/// The builtin review run: returns a status string, never panics.
+/// Errors are reported to the PR as comments (Python bot behavior).
+pub async fn run_builtin(gh: &Client, cfg: &Config, repo: &str, pr_number: i64) -> String {
+    match run_builtin_inner(gh, cfg, repo, pr_number).await {
+        Ok(status) => status,
+        Err(e) => {
+            let body = format!("## 🤖 AI Code Review\n\n❌ 审查出错: `{e}`");
+            let _ = gh.post_issue_comment(repo, pr_number, &body).await;
+            format!("error: {e}")
         }
     }
-    added
 }
 
-pub fn truncate(diff: &str, max_chars: usize) -> (String, bool) {
-    if diff.len() <= max_chars {
-        return (diff.to_string(), false);
-    }
-    (diff.chars().take(max_chars).collect(), true)
+async fn run_builtin_inner(
+    gh: &Client,
+    cfg: &Config,
+    repo: &str,
+    pr_number: i64,
+) -> Result<String, String> {
+    // processing indicator (best-effort)
+    let _ = gh
+        .post_issue_comment(repo, pr_number, "🔄 正在审查,稍候…")
+        .await;
+
+    // fetch diff + meta
+    let diff = gh
+        .get_pr_diff(repo, pr_number)
+        .await
+        .map_err(|e| e.to_string())?;
+    let meta = gh
+        .get_pr(repo, pr_number)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let (diff, truncated) = truncate(&diff, cfg.max_diff_chars);
+    let added = parse_added_lines(&diff);
+
+    // incremental context
+    let (previous_review, new_commits) =
+        fetch_incremental_context(gh, repo, pr_number, cfg.max_diff_chars).await;
+
+    let user_prompt = build_user_prompt(
+        &diff,
+        &meta,
+        truncated,
+        previous_review.as_deref(),
+        new_commits.as_deref(),
+    );
+
+    let raw = call_ai(cfg, SYSTEM_PROMPT, &user_prompt).await?;
+    let Some(verdict) = parse_verdict(&raw) else {
+        let body = format!(
+            "## 🤖 AI Code Review\n\n⚠️ 未能解析模型返回的 JSON,以下为原始输出:\n\n```\n{raw}\n```"
+        );
+        let _ = gh.post_issue_comment(repo, pr_number, &body).await;
+        return Ok("parse-failed".into());
+    };
+
+    let summary = render_summary(&verdict, "builtin");
+    let inline = build_inline_comments(&verdict, &added);
+    gh.post_review(repo, pr_number, &summary, inline)
+        .await
+        .map_err(|e: GhError| e.to_string())?;
+    Ok("ok".into())
 }
 
+/// Fetch (previous own review body, new commits since that review).
 pub async fn fetch_incremental_context(
     gh: &Client,
     repo: &str,
@@ -569,22 +640,6 @@ index 111..222 100644
     }
 
     #[test]
-    fn test_build_user_prompt_incremental_sections() {
-        let meta = serde_json::json!({"title": "T", "body": "B"});
-        let p = build_user_prompt(
-            "d",
-            &meta,
-            false,
-            Some("上一轮: 修了 X"),
-            Some("fix: a\nfix: b"),
-        );
-        assert!(p.contains("上一轮审查意见"));
-        assert!(p.contains("上一轮: 修了 X"));
-        assert!(p.contains("新提交"));
-        assert!(p.contains("fix: a"));
-    }
-
-    #[test]
     fn test_render_summary_empty() {
         let verdict = serde_json::json!({"summary": "clean", "findings": []});
         let out = render_summary(&verdict, "builtin");
@@ -627,5 +682,21 @@ index 111..222 100644
         assert_eq!(inline.len(), 1);
         assert_eq!(inline[0]["path"], "src/main.rs");
         assert_eq!(inline[0]["line"], 3);
+    }
+
+    #[test]
+    fn test_build_user_prompt_incremental_sections() {
+        let meta = serde_json::json!({"title": "T", "body": "B"});
+        let p = build_user_prompt(
+            "d",
+            &meta,
+            false,
+            Some("上一轮: 修了 X"),
+            Some("fix: a\nfix: b"),
+        );
+        assert!(p.contains("上一轮审查意见"));
+        assert!(p.contains("上一轮: 修了 X"));
+        assert!(p.contains("新提交"));
+        assert!(p.contains("fix: a"));
     }
 }
