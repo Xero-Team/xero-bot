@@ -6,5 +6,6 @@ pub mod config;
 pub mod github;
 pub mod handlers;
 pub mod agent;
+pub mod rebase;
 pub mod review;
 pub mod webhook;
