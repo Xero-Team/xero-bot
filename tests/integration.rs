@@ -194,3 +194,104 @@ async fn test_ready_label_flow_with_mock() {
     .await;
     assert_eq!(results, vec!["ok"]);
 }
+
+#[tokio::test]
+async fn test_r_plus_permission_denied() {
+    let server = MockServer::start().await;
+
+    // commenter has only "read" permission
+    Mock::given(method("GET"))
+        .and(path("/repos/octocat/hello/collaborators/alice/permission"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"permission": "read"})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    // a rejection comment should be posted
+    Mock::given(method("POST"))
+        .and(path("/repos/octocat/hello/issues/7/comments"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({"id": 1})))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let crab = octocrab::OctocrabBuilder::new()
+        .personal_token("ghp_test")
+        .base_uri(server.uri())
+        .unwrap()
+        .build()
+        .unwrap();
+    let gh = Client {
+        crab,
+        app_slug: "xero-review".into(),
+    };
+    let cfg = test_cfg();
+    let ctx = xero_bot::handlers::CommentContext {
+        repo: "octocat/hello".into(),
+        pr_number: 7,
+        commenter: "alice".into(),
+        pr_author: "bob".into(),
+        app_slug: "xero-review".into(),
+        installation_id: 42,
+    };
+    let results = xero_bot::handlers::handle_comment(
+        &gh,
+        &cfg,
+        &ctx,
+        vec![xero_bot::commands::Command::Approve { on_behalf_of: None }],
+    )
+    .await;
+    assert_eq!(results, vec!["denied"]);
+}
+
+#[tokio::test]
+async fn test_r_plus_approves_with_write() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/repos/octocat/hello/collaborators/alice/permission"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"permission": "write"})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    // APPROVE review + confirmation comment
+    Mock::given(method("POST"))
+        .and(path("/repos/octocat/hello/pulls/7/reviews"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": 99})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/repos/octocat/hello/issues/7/comments"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({"id": 1})))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let crab = octocrab::OctocrabBuilder::new()
+        .personal_token("ghp_test")
+        .base_uri(server.uri())
+        .unwrap()
+        .build()
+        .unwrap();
+    let gh = Client {
+        crab,
+        app_slug: "xero-review".into(),
+    };
+    let cfg = test_cfg();
+    let ctx = xero_bot::handlers::CommentContext {
+        repo: "octocat/hello".into(),
+        pr_number: 7,
+        commenter: "alice".into(),
+        pr_author: "bob".into(),
+        app_slug: "xero-review".into(),
+        installation_id: 42,
+    };
+    let results = xero_bot::handlers::handle_comment(
+        &gh,
+        &cfg,
+        &ctx,
+        vec![xero_bot::commands::Command::Approve { on_behalf_of: None }],
+    )
+    .await;
+    assert_eq!(results, vec!["ok"]);
+}
