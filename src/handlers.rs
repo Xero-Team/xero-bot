@@ -53,6 +53,9 @@ async fn handle_one(gh: &Client, cfg: &Config, ctx: &CommentContext, cmd: Comman
             .is_ok()
             .then_some("ok".into())
             .unwrap_or_else(|| "error".into()),
+        Command::Ready | Command::Author | Command::Blocked => {
+            set_status_label(gh, cfg, ctx, cmd).await
+        }
         Command::Cc { users } => {
             let mentions: Vec<String> = users.iter().map(|u| format!("@{u}")).collect();
             let _ = gh
@@ -92,5 +95,57 @@ async fn handle_one(gh: &Client, cfg: &Config, ctx: &CommentContext, cmd: Comman
                 }
             }
         }
+    }
+}
+
+/// ready/author/blocked: add one status label, remove its siblings.
+async fn set_status_label(gh: &Client, cfg: &Config, ctx: &CommentContext, cmd: Command) -> String {
+    let (add, label_desc) = match cmd {
+        Command::Ready => (&cfg.label_waiting_review, "等待审查"),
+        Command::Author => (&cfg.label_waiting_author, "等待作者"),
+        Command::Blocked => (&cfg.label_blocked, "受阻"),
+        _ => unreachable!(),
+    };
+    let siblings: Vec<String> = [
+        &cfg.label_waiting_review,
+        &cfg.label_waiting_author,
+        &cfg.label_blocked,
+    ]
+    .into_iter()
+    .filter(|l| l.as_str() != add.as_str())
+    .cloned()
+    .collect();
+
+    let mut ok = true;
+    if let Err(e) = gh
+        .add_labels(&ctx.repo, ctx.pr_number, &[add.clone()])
+        .await
+    {
+        let _ = gh
+            .post_issue_comment(&ctx.repo, ctx.pr_number, &format!("⚠️ 打标签失败: `{e}`"))
+            .await;
+        ok = false;
+    }
+    if ok {
+        for l in &siblings {
+            if let Err(e) = gh.remove_label(&ctx.repo, ctx.pr_number, l).await {
+                if !matches!(&e, GhError::Api { status: 404, .. }) {
+                    // removing a non-existent label is fine; anything else worth logging
+                    tracing::warn!("remove label {l}: {e}");
+                }
+            }
+        }
+        let _ = gh
+            .post_issue_comment(
+                &ctx.repo,
+                ctx.pr_number,
+                &format!("状态已更新: **{label_desc}**(`{add}`)。"),
+            )
+            .await;
+    }
+    if ok {
+        "ok".into()
+    } else {
+        "error".into()
     }
 }

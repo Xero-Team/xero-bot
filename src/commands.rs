@@ -23,6 +23,12 @@ pub enum Command {
     Cc {
         users: Vec<String>,
     },
+    /// ready / review / reviewer — set waiting-on-review, clear siblings
+    Ready,
+    /// author — set waiting-on-author, clear siblings
+    Author,
+    /// blocked — set blocked, clear siblings
+    Blocked,
 }
 
 /// One parsed command plus where it appeared (for ordered execution).
@@ -103,8 +109,49 @@ pub fn parse_commands(bot_name: &str, text: &str) -> Vec<ParsedCommand> {
         });
     }
 
+    // --- anchor 3: ? short commands (?r, ?r cc @user) ---
+    // (no look-behind in the regex crate; emulate with a char class capture)
+    let short_re = Regex::new(r"(?i)(?:^|[^A-Za-z0-9?-])\?r\b").unwrap();
+    for m in short_re.find_iter(&cleaned) {
+        let start = m.start()
+            + if cleaned[m.start()..].starts_with('?') {
+                0
+            } else {
+                1 // skip the separator char
+            };
+        commands.push(ParsedCommand {
+            command: Command::Ready,
+            start,
+        });
+        // `?r cc @user` — parse a trailing cc
+        let rest = &cleaned[m.end()..];
+        if let Some(users) = parse_cc_args(rest) {
+            commands.push(ParsedCommand {
+                command: Command::Cc { users },
+                start,
+            });
+        }
+    }
+
     commands.sort_by_key(|c| c.start);
     commands
+}
+
+/// `?r cc @user1 @user2` — match "cc" followed by at least one @user.
+fn parse_cc_args(rest: &str) -> Option<Vec<String>> {
+    let trimmed = rest.trim_start();
+    let lower = trimmed.to_lowercase();
+    if !lower.starts_with("cc") {
+        return None;
+    }
+    // skip the "cc" prefix in the ORIGINAL text (byte offset 2)
+    let after_raw = &trimmed[2..];
+    let users = parse_users(after_raw);
+    if users.is_empty() {
+        None
+    } else {
+        Some(users)
+    }
 }
 
 /// Parse the verb (and arguments) following an `@bot` mention.
@@ -129,6 +176,9 @@ fn parse_verb(bot_name: &str, rest: &str) -> Option<Command> {
                 Some(Command::Cc { users })
             }
         }
+        "ready" | "reviewer" => Some(Command::Ready),
+        "author" => Some(Command::Author),
+        "blocked" => Some(Command::Blocked),
         _ => {
             // `r? @user` also valid right after mention: `@xero r? @user`
             if word == "r?" {
@@ -248,5 +298,39 @@ mod tests {
     fn test_r_question_inside_code_block_ignored() {
         let cmds = parse_commands("xero-review", "```\nr? @octocat\n```");
         assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn test_short_r() {
+        let cmds = parse_commands("xero-review", "?r");
+        assert_eq!(cmds.len(), 1);
+        assert!(matches!(cmds[0].command, Command::Ready));
+    }
+
+    #[test]
+    fn test_short_r_cc() {
+        let cmds = parse_commands("xero-review", "?r cc @alice @bob");
+        assert_eq!(cmds.len(), 2);
+        assert!(matches!(cmds[0].command, Command::Ready));
+        match &cmds[1].command {
+            Command::Cc { users } => {
+                assert_eq!(users, &vec!["alice".to_string(), "bob".to_string()])
+            }
+            other => panic!("expected Cc, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_ready_author_blocked() {
+        for (text, want) in [
+            ("@xero-review ready", Command::Ready),
+            ("@xero-review reviewer", Command::Ready),
+            ("@xero-review author", Command::Author),
+            ("@xero-review blocked", Command::Blocked),
+        ] {
+            let cmds = parse_commands("xero-review", text);
+            assert_eq!(cmds.len(), 1, "for {text}");
+            assert_eq!(cmds[0].command, want);
+        }
     }
 }
