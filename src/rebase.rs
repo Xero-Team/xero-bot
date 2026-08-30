@@ -106,6 +106,25 @@ pub async fn check_pr(gh: &Client, cfg: &Config, repo: &str, pr_number: i64) -> 
     }
 }
 
+/// Handle a pull_request synchronize/reopened/opened webhook: wait for GitHub
+/// to compute mergeability, then check.
+pub async fn handle_push_event(
+    gh: &Client,
+    cfg: &Config,
+    repo: &str,
+    pr_number: i64,
+    action: &str,
+) {
+    if action == "opened" {
+        // on open, mergeable is almost always still being computed; the daily
+        // sweep will catch genuine conflicts. Skip to reduce noise.
+        return;
+    }
+    tokio::time::sleep(std::time::Duration::from_secs(cfg.rebase_check_delay_secs)).await;
+    let status = check_pr(gh, cfg, repo, pr_number).await;
+    tracing::info!("rebase check {repo}#{pr_number} ({action}): {status}");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

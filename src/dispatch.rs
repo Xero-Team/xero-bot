@@ -71,10 +71,18 @@ pub fn route_event(cfg: &Config, event_header: &str, payload: &Value) -> Routing
                 Routing::Respond(serde_json::json!({"ignored": "label not configured"}))
             }
         }
+        WebhookEvent::PullRequest {
+            repo,
+            pr_number,
+            action,
+            installation_id,
+        } => Routing::Act(Work::RebaseCheck {
+            repo,
+            pr_number,
+            action,
+            installation_id,
+        }),
         // push events: rebase check wiring lands with the rebase feature
-        WebhookEvent::PullRequest { .. } => {
-            Routing::Respond(serde_json::json!({"ignored": "pull_request event not wired yet"}))
-        }
     }
 }
 
@@ -100,6 +108,12 @@ pub enum Work {
     Codeql {
         repo: String,
         pr_number: i64,
+        installation_id: i64,
+    },
+    RebaseCheck {
+        repo: String,
+        pr_number: i64,
+        action: String,
         installation_id: i64,
     },
 }
@@ -146,6 +160,17 @@ async fn execute_work_inner(cfg: &Config, work: Work) -> Result<(), String> {
                 .map_err(|e| format!("installation client: {e}"))?;
             let status = crate::codeql::run_codeql_report(&gh, cfg, &repo, pr_number).await;
             tracing::info!("codeql report {repo}#{pr_number}: {status}");
+            Ok(())
+        }
+        Work::RebaseCheck {
+            repo,
+            pr_number,
+            action,
+            installation_id,
+        } => {
+            let gh = Client::installation(cfg, installation_id, "")
+                .map_err(|e| format!("installation client: {e}"))?;
+            crate::rebase::handle_push_event(&gh, cfg, &repo, pr_number, &action).await;
             Ok(())
         }
     }
