@@ -253,11 +253,7 @@ impl<'a> Lexer<'a> {
     fn lex_other(&mut self, start: usize) {
         // Advance past the leading character using its real width; `start + 1`
         // would land inside a multibyte codepoint.
-        let first_len = self
-            .chars
-            .next()
-            .map(|(_, c)| c.len_utf8())
-            .unwrap_or(1);
+        let first_len = self.chars.next().map(|(_, c)| c.len_utf8()).unwrap_or(1);
         let end = self.take_while(|c| {
             !c.is_whitespace()
                 && c != '@'
@@ -323,12 +319,7 @@ mod tests {
     fn sigils_are_single_tokens() {
         assert_eq!(
             kinds("b", "r? r+ r- ?r"),
-            vec![
-                Tok::ReviewReq,
-                Tok::Approve,
-                Tok::Reject,
-                Tok::ShortReady
-            ]
+            vec![Tok::ReviewReq, Tok::Approve, Tok::Reject, Tok::ShortReady]
         );
     }
 
@@ -410,7 +401,10 @@ mod tests {
     fn invalid_logins_are_kept_for_diagnostics() {
         // hyphens are in the login charset, so this is a single bad name
         assert_eq!(kinds("b", "@-bad"), vec![Tok::RawUser("-bad".into())]);
-        assert_eq!(kinds("b", "@trailing-"), vec![Tok::RawUser("trailing-".into())]);
+        assert_eq!(
+            kinds("b", "@trailing-"),
+            vec![Tok::RawUser("trailing-".into())]
+        );
         assert_eq!(kinds("b", "@"), vec![Tok::RawUser("".into())]);
     }
 
@@ -452,8 +446,20 @@ mod tests {
     #[test]
     fn never_panics_on_nasty_input() {
         let seeds = [
-            "@@@@", "????", "++++", "----", ";;;;", "@[bot]", "r?r?r?", "?r?r",
-            "@a[bot][bot]", "\u{212A}\u{2126}\u{130}", "中文@中文", "@-", "+", "-",
+            "@@@@",
+            "????",
+            "++++",
+            "----",
+            ";;;;",
+            "@[bot]",
+            "r?r?r?",
+            "?r?r",
+            "@a[bot][bot]",
+            "\u{212A}\u{2126}\u{130}",
+            "中文@中文",
+            "@-",
+            "+",
+            "-",
         ];
         for s in seeds {
             let _ = lex("xero-review", s);

@@ -52,8 +52,10 @@ pub fn resolve(
             .map(|i| status_name(&parsed[*i].command))
             .collect();
         diagnostics.push(Diagnostic::ConflictingStatus { kept, dropped });
-        let drop_set: std::collections::HashSet<usize> =
-            status_positions.into_iter().filter(|i| *i != keep).collect();
+        let drop_set: std::collections::HashSet<usize> = status_positions
+            .into_iter()
+            .filter(|i| *i != keep)
+            .collect();
         parsed = parsed
             .into_iter()
             .enumerate()

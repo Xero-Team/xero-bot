@@ -43,7 +43,11 @@ fn validate_rejects_unusable_key() {
     assert!(cfg.validate().is_err(), "garbage key must fail validation");
 
     cfg.private_key_pem = Some(TEST_KEY.into());
-    assert!(cfg.validate().is_ok(), "valid RSA key must pass: {:?}", cfg.validate());
+    assert!(
+        cfg.validate().is_ok(),
+        "valid RSA key must pass: {:?}",
+        cfg.validate()
+    );
 }
 
 /// A blank `PRIVATE_KEY_B64=` left in `.env` must not shadow the path.
@@ -151,7 +155,10 @@ fn tempfile() -> TempFile {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    p.push(format!("xero-key-{unique}-{:?}.pem", std::thread::current().id()));
+    p.push(format!(
+        "xero-key-{unique}-{:?}.pem",
+        std::thread::current().id()
+    ));
     std::fs::File::create(&p).unwrap();
     TempFile(p)
 }

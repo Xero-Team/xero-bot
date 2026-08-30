@@ -277,6 +277,9 @@ mod tests {
     fn pick_and_t_agree_on_the_language() {
         let user = "alice";
         assert_eq!(Lang::En.pick("pong", "乒"), "pong");
-        assert_eq!(t!(Lang::Zh, "Assigned @{user}.", "已指派给 @{user}。"), "已指派给 @alice。");
+        assert_eq!(
+            t!(Lang::Zh, "Assigned @{user}.", "已指派给 @{user}。"),
+            "已指派给 @alice。"
+        );
     }
 }

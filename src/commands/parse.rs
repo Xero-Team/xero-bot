@@ -187,7 +187,8 @@ impl<'a> Parser<'a> {
                 let raw = raw.clone();
                 let span = self.span();
                 self.pos += 1;
-                self.diagnostics.push(Diagnostic::InvalidLogin { raw, span });
+                self.diagnostics
+                    .push(Diagnostic::InvalidLogin { raw, span });
                 None
             }
             _ => {
@@ -217,7 +218,8 @@ impl<'a> Parser<'a> {
                     let raw = raw.clone();
                     let span = self.span();
                     self.pos += 1;
-                    self.diagnostics.push(Diagnostic::InvalidLogin { raw, span });
+                    self.diagnostics
+                        .push(Diagnostic::InvalidLogin { raw, span });
                 }
                 _ => self.pos += 1,
             }
@@ -382,7 +384,8 @@ impl<'a> Parser<'a> {
                 let raw = raw.clone();
                 let span = self.span();
                 self.pos += 1;
-                self.diagnostics.push(Diagnostic::InvalidLogin { raw, span });
+                self.diagnostics
+                    .push(Diagnostic::InvalidLogin { raw, span });
                 None
             }
             _ => None,
@@ -431,8 +434,8 @@ impl<'a> Parser<'a> {
     fn bare_review_request(&mut self) {
         let start = self.span().start;
         self.pos += 1; // r?
-        // Deliberately no diagnostic when a user doesn't follow: a rhetorical
-        // "who should review this r?" is prose, not a failed command.
+                       // Deliberately no diagnostic when a user doesn't follow: a rhetorical
+                       // "who should review this r?" is prose, not a failed command.
         self.skip_filler();
         if let Some(Tok::User(u)) = self.peek().cloned() {
             self.pos += 1;

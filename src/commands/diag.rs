@@ -262,8 +262,8 @@ mod tests {
         let two =
             render_messages(&["a".to_string(), "b".to_string()], "bot", Lang::Zh).expect("some");
         assert!(two.contains("有 2 处"), "{two}");
-        let en = render_messages(&["a".to_string(), "b".to_string()], "bot", Lang::En)
-            .expect("some");
+        let en =
+            render_messages(&["a".to_string(), "b".to_string()], "bot", Lang::En).expect("some");
         assert!(en.contains("2 thing"), "{en}");
         assert_eq!(render_messages(&[], "bot", Lang::Zh), None);
     }

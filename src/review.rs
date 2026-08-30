@@ -417,10 +417,7 @@ pub fn render_summary(verdict: &Value, engine_tag: &str, lang: Lang) -> String {
     }
 
     if findings.is_empty() {
-        lines.push(
-            lang.pick("Nothing found 🎉", "未发现问题 🎉")
-                .to_string(),
-        );
+        lines.push(lang.pick("Nothing found 🎉", "未发现问题 🎉").to_string());
         return lines.join("\n");
     }
 
