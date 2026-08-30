@@ -382,3 +382,80 @@ async fn run_codex_inner(
     }
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Engine dispatch
+// ---------------------------------------------------------------------------
+
+/// Pick and run an engine. `token` is needed only for subprocess engines.
+pub async fn run_review(
+    gh: &Client,
+    cfg: &Config,
+    repo: &str,
+    pr_number: i64,
+    token: &str,
+) -> String {
+    let choice = cfg.review_engine.to_lowercase();
+    match choice.as_str() {
+        "builtin" => crate::review::run_builtin(gh, cfg, repo, pr_number).await,
+        "agent" => crate::agent::run_agent_review(gh, cfg, repo, pr_number).await,
+        "pi" => run_pi(gh, cfg, repo, pr_number, token).await,
+        "codex" => run_codex(gh, cfg, repo, pr_number, token).await,
+        _ => {
+            // auto: pi → codex → agent → builtin
+            if engine_available(&cfg.pi_path).await {
+                run_pi(gh, cfg, repo, pr_number, token).await
+            } else if engine_available(&cfg.codex_path).await {
+                run_codex(gh, cfg, repo, pr_number, token).await
+            } else if cfg.ai_ready() {
+                crate::agent::run_agent_review(gh, cfg, repo, pr_number).await
+            } else {
+                let _ = gh
+                    .post_issue_comment(repo, pr_number, "⚠️ 未配置 AI 引擎(缺 AI_BASE_URL/AI_API_KEY/AI_MODEL),也无法使用 pi/codex。")
+                    .await;
+                "error: no engine".into()
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_prompt_contains_schema() {
+        let meta = serde_json::json!({
+            "title": "Add feature",
+            "body": "does things",
+            "base": {"ref": "main"},
+            "head": {"sha": "abc123"}
+        });
+        let p = build_review_prompt("o/r", 7, &meta, Some("上一轮: X"), Some("fix: y"));
+        assert!(p.contains("PR #7"));
+        assert!(p.contains("Add feature"));
+        assert!(p.contains("上一轮: X"));
+        assert!(p.contains("fix: y"));
+        assert!(p.contains("findings"));
+    }
+
+    #[test]
+    fn test_repo_dir_paths() {
+        let cfg = crate::config::Config {
+            data_dir: "/data".into(),
+            ..test_cfg()
+        };
+        assert_eq!(
+            repo_dir(&cfg, "octocat/hello"),
+            Path::new("/data/repos/octocat__hello")
+        );
+        assert_eq!(
+            sessions_dir(&cfg, "octocat/hello"),
+            Path::new("/data/sessions/octocat__hello")
+        );
+    }
+
+    fn test_cfg() -> crate::config::Config {
+        crate::config::Config::from_env()
+    }
+}

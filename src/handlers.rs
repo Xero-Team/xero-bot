@@ -80,7 +80,12 @@ async fn handle_one(gh: &Client, cfg: &Config, ctx: &CommentContext, cmd: Comman
                     .await;
                 return "ai-not-configured".into();
             }
-            crate::review::run_builtin(gh, cfg, &ctx.repo, ctx.pr_number).await
+            // token for subprocess engines: installation token via REST
+            let token = gh
+                .installation_token(cfg, ctx.installation_id)
+                .await
+                .unwrap_or_default();
+            crate::engines_subproc::run_review(gh, cfg, &ctx.repo, ctx.pr_number, &token).await
         }
         Command::RequestReview { user } => {
             // triagebot: assignment is the review request
