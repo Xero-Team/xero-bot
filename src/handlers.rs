@@ -19,6 +19,7 @@ pub fn help_text(bot_name: &str) -> String {
         "### 🤖 xero-bot 命令参考\n\n\
 | 命令 | 说明 |\n|---|---|\n\
 | `@{bot_name} review` | AI 代码审查(增量:结合上一轮审查与新提交) |\n\
+| `@{bot_name} codeql` | CodeQL 质量报告(读取仓库存量告警并映射到本次变更) |\n\
 | `@{bot_name} ping` | 健康检查 |\n\
 | `@{bot_name} help` | 显示本帮助 |\n\
 | `r? @user` | 请求 @user 审查(自动指派为 reviewer) |\n\
@@ -29,8 +30,11 @@ pub fn help_text(bot_name: &str) -> String {
 | `@{bot_name} label +a -b` | 添加/移除标签 |\n\
 | `@{bot_name} assign @user` | 指派给 @user |\n\
 | `@{bot_name} claim` | 认领(指派给自己) |\n\
-| `@{bot_name} unclaim` | 释放指派 |\n\n\
-_更多命令陆续加入。_"
+| `@{bot_name} unclaim` | 释放指派 |\n\
+| `@{bot_name} r+` | 代审批(需 write 权限;bot 以你的名义提交 APPROVE) |\n\
+| `@{bot_name} r+ as @user` | 以 @user 名义代审批(用于转发他处给出的批准) |\n\
+| `@{bot_name} r-` | 撤回 bot 的审批 |\n\n\
+_冲突的 PR 会被自动打上 `needs-rebase` 标签并提醒。_"
     )
 }
 
@@ -242,8 +246,6 @@ async fn handle_one(gh: &Client, cfg: &Config, ctx: &CommentContext, cmd: Comman
                 }
             }
         }
-        Command::Approve { on_behalf_of } => handle_approve(gh, cfg, ctx, on_behalf_of).await,
-        Command::Reject => handle_reject(gh, cfg, ctx).await,
         Command::Unclaim => {
             match gh
                 .remove_assignees(&ctx.repo, ctx.pr_number, &[ctx.commenter.clone()])
@@ -271,6 +273,8 @@ async fn handle_one(gh: &Client, cfg: &Config, ctx: &CommentContext, cmd: Comman
                 }
             }
         }
+        Command::Approve { on_behalf_of } => handle_approve(gh, cfg, ctx, on_behalf_of).await,
+        Command::Reject => handle_reject(gh, cfg, ctx).await,
     }
 }
 

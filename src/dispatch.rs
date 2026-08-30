@@ -40,7 +40,8 @@ pub fn route_event(cfg: &Config, event_header: &str, payload: &Value) -> Routing
                 return Routing::Respond(serde_json::json!({"ignored": "no command"}));
             }
             if !is_pr {
-                // keep it simple and require a PR (matching the Python bot)
+                // commands other than review/label work on issues too; keep it
+                // simple and require a PR (matching the Python bot)
                 return Routing::Respond(serde_json::json!({"ignored": "not a PR"}));
             }
 
@@ -54,7 +55,17 @@ pub fn route_event(cfg: &Config, event_header: &str, payload: &Value) -> Routing
                 commands: commands.into_iter().map(|c| c.command).collect(),
             })
         }
-        // pull_request / labeled events: rebase wiring lands later
+        WebhookEvent::PullRequest {
+            repo,
+            pr_number,
+            action,
+            installation_id,
+        } => Routing::Act(Work::RebaseCheck {
+            repo,
+            pr_number,
+            action,
+            installation_id,
+        }),
         WebhookEvent::PrLabeled {
             repo,
             pr_number,
@@ -71,18 +82,6 @@ pub fn route_event(cfg: &Config, event_header: &str, payload: &Value) -> Routing
                 Routing::Respond(serde_json::json!({"ignored": "label not configured"}))
             }
         }
-        WebhookEvent::PullRequest {
-            repo,
-            pr_number,
-            action,
-            installation_id,
-        } => Routing::Act(Work::RebaseCheck {
-            repo,
-            pr_number,
-            action,
-            installation_id,
-        }),
-        // push events: rebase check wiring lands with the rebase feature
     }
 }
 
@@ -105,15 +104,15 @@ pub enum Work {
         pr_author: String,
         commands: Vec<crate::commands::Command>,
     },
-    Codeql {
-        repo: String,
-        pr_number: i64,
-        installation_id: i64,
-    },
     RebaseCheck {
         repo: String,
         pr_number: i64,
         action: String,
+        installation_id: i64,
+    },
+    Codeql {
+        repo: String,
+        pr_number: i64,
         installation_id: i64,
     },
 }
@@ -151,17 +150,6 @@ async fn execute_work_inner(cfg: &Config, work: Work) -> Result<(), String> {
             tracing::info!("comment commands on {repo}#{pr_number}: {results:?}");
             Ok(())
         }
-        Work::Codeql {
-            repo,
-            pr_number,
-            installation_id,
-        } => {
-            let gh = Client::installation(cfg, installation_id, "")
-                .map_err(|e| format!("installation client: {e}"))?;
-            let status = crate::codeql::run_codeql_report(&gh, cfg, &repo, pr_number).await;
-            tracing::info!("codeql report {repo}#{pr_number}: {status}");
-            Ok(())
-        }
         Work::RebaseCheck {
             repo,
             pr_number,
@@ -171,6 +159,17 @@ async fn execute_work_inner(cfg: &Config, work: Work) -> Result<(), String> {
             let gh = Client::installation(cfg, installation_id, "")
                 .map_err(|e| format!("installation client: {e}"))?;
             crate::rebase::handle_push_event(&gh, cfg, &repo, pr_number, &action).await;
+            Ok(())
+        }
+        Work::Codeql {
+            repo,
+            pr_number,
+            installation_id,
+        } => {
+            let gh = Client::installation(cfg, installation_id, "")
+                .map_err(|e| format!("installation client: {e}"))?;
+            let status = crate::codeql::run_codeql_report(&gh, cfg, &repo, pr_number).await;
+            tracing::info!("codeql report {repo}#{pr_number}: {status}");
             Ok(())
         }
     }

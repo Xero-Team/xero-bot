@@ -1,11 +1,11 @@
+pub mod agent;
 pub mod codeql;
 pub mod commands;
+pub mod config;
 pub mod dispatch;
 pub mod engines_subproc;
-pub mod config;
 pub mod github;
 pub mod handlers;
-pub mod agent;
 pub mod rebase;
 pub mod review;
 pub mod webhook;

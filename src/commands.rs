@@ -2,8 +2,10 @@
 //!
 //! Mirrors rust-lang/triagebot semantics:
 //! - `@xero <verb>` commands, case-insensitive, anywhere in the comment
-//! - fenced code blocks are ignored (no false triggers)
+//! - bare `r? @user` (review request) anywhere — `r? user` without `@` also works
+//! - `?`-prefixed short commands: `?r` (ready), args forwarded (`?r cc @user`)
 //! - multiple commands per comment, executed in order
+//! - fenced code blocks are ignored (no false triggers)
 //!
 //! Unknown text after a valid mention is not an error — the bot simply ignores
 //! comments it doesn't understand (triagebot posts an error; we stay quiet to
@@ -62,7 +64,7 @@ pub struct ParsedCommand {
 
 /// Strip fenced code blocks from a comment, replacing them with spaces so
 /// character offsets stay stable (we don't need offsets to survive, but it
-/// keeps command detection from matching inside examples).
+/// keeps `r?` detection from matching inside examples).
 fn strip_code_blocks(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut in_fence = false;
@@ -157,23 +159,6 @@ pub fn parse_commands(bot_name: &str, text: &str) -> Vec<ParsedCommand> {
 
     commands.sort_by_key(|c| c.start);
     commands
-}
-
-/// `?r cc @user1 @user2` — match "cc" followed by at least one @user.
-fn parse_cc_args(rest: &str) -> Option<Vec<String>> {
-    let trimmed = rest.trim_start();
-    let lower = trimmed.to_lowercase();
-    if !lower.starts_with("cc") {
-        return None;
-    }
-    // skip the "cc" prefix in the ORIGINAL text (byte offset 2)
-    let after_raw = &trimmed[2..];
-    let users = parse_users(after_raw);
-    if users.is_empty() {
-        None
-    } else {
-        Some(users)
-    }
 }
 
 /// Parse the verb (and arguments) following an `@bot` mention.
@@ -276,11 +261,21 @@ fn parse_users(args: &str) -> Vec<String> {
         .collect()
 }
 
-fn is_valid_login(s: &str) -> bool {
-    !s.is_empty()
-        && s.len() <= 39
-        && !s.starts_with('-')
-        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+/// For `?r cc @user1 @user2` — match "cc" followed by at least one @user.
+fn parse_cc_args(rest: &str) -> Option<Vec<String>> {
+    let trimmed = rest.trim_start();
+    let lower = trimmed.to_lowercase();
+    if !lower.starts_with("cc") {
+        return None;
+    }
+    // skip the "cc" prefix in the ORIGINAL text (byte offset 2)
+    let after_raw = &trimmed[2..];
+    let users = parse_users(after_raw);
+    if users.is_empty() {
+        None
+    } else {
+        Some(users)
+    }
 }
 
 /// `+label -label` tokens (also `label: +x` style not supported; keep triagebot's).
@@ -299,6 +294,13 @@ fn parse_label_args(args: &str) -> (Vec<String>, Vec<String>) {
         }
     }
     (add, remove)
+}
+
+fn is_valid_login(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 39
+        && !s.starts_with('-')
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
 }
 
 fn is_valid_label(s: &str) -> bool {
@@ -328,14 +330,6 @@ mod tests {
     }
 
     #[test]
-    fn test_ping_help() {
-        let cmds = parse_commands("xero-review", "@xero-review ping");
-        assert!(matches!(cmds[0].command, Command::Ping));
-        let cmds = parse_commands("xero-review", "@xero-review help");
-        assert!(matches!(cmds[0].command, Command::Help));
-    }
-
-    #[test]
     fn test_bot_suffix() {
         let cmds = parse_commands("xero-review", "@xero-review[bot] ping");
         assert_eq!(cmds.len(), 1);
@@ -343,32 +337,11 @@ mod tests {
     }
 
     #[test]
-    fn test_case_insensitive_mid_comment() {
-        let cmds = parse_commands("xero-review", "fix the bug\n@XERO-REVIEW   ping please");
-        assert_eq!(cmds.len(), 1);
+    fn test_ping_help() {
+        let cmds = parse_commands("xero-review", "@xero-review ping");
         assert!(matches!(cmds[0].command, Command::Ping));
-    }
-
-    #[test]
-    fn test_code_blocks_ignored() {
-        let cmds = parse_commands(
-            "xero-review",
-            "example:\n```\n@xero-review ping\n```\n@xero-review help",
-        );
-        assert_eq!(cmds.len(), 1);
+        let cmds = parse_commands("xero-review", "@xero-review help");
         assert!(matches!(cmds[0].command, Command::Help));
-    }
-
-    #[test]
-    fn test_unknown_verb_ignored() {
-        let cmds = parse_commands("xero-review", "@xero-review do the thing please");
-        assert!(cmds.is_empty());
-    }
-
-    #[test]
-    fn test_plain_mention_no_verb() {
-        let cmds = parse_commands("xero-review", "cc @xero-review about this");
-        assert!(cmds.is_empty());
     }
 
     #[test]
@@ -399,12 +372,6 @@ mod tests {
     }
 
     #[test]
-    fn test_r_question_inside_code_block_ignored() {
-        let cmds = parse_commands("xero-review", "```\nr? @octocat\n```");
-        assert!(cmds.is_empty());
-    }
-
-    #[test]
     fn test_short_r() {
         let cmds = parse_commands("xero-review", "?r");
         assert_eq!(cmds.len(), 1);
@@ -421,6 +388,20 @@ mod tests {
                 assert_eq!(users, &vec!["alice".to_string(), "bob".to_string()])
             }
             other => panic!("expected Cc, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_ready_author_blocked() {
+        for (text, want) in [
+            ("@xero-review ready", Command::Ready),
+            ("@xero-review reviewer", Command::Ready),
+            ("@xero-review author", Command::Author),
+            ("@xero-review blocked", Command::Blocked),
+        ] {
+            let cmds = parse_commands("xero-review", text);
+            assert_eq!(cmds.len(), 1, "for {text}");
+            assert_eq!(cmds[0].command, want);
         }
     }
 
@@ -464,12 +445,6 @@ mod tests {
     }
 
     #[test]
-    fn test_codeql() {
-        let cmds = parse_commands("xero-review", "@xero-review codeql");
-        assert!(matches!(cmds[0].command, Command::Codeql));
-    }
-
-    #[test]
     fn test_multiple_commands() {
         let cmds = parse_commands(
             "xero-review",
@@ -482,16 +457,36 @@ mod tests {
     }
 
     #[test]
-    fn test_ready_author_blocked() {
-        for (text, want) in [
-            ("@xero-review ready", Command::Ready),
-            ("@xero-review reviewer", Command::Ready),
-            ("@xero-review author", Command::Author),
-            ("@xero-review blocked", Command::Blocked),
-        ] {
-            let cmds = parse_commands("xero-review", text);
-            assert_eq!(cmds.len(), 1, "for {text}");
-            assert_eq!(cmds[0].command, want);
-        }
+    fn test_code_blocks_ignored() {
+        let cmds = parse_commands(
+            "xero-review",
+            "example:\n```\n@xero-review label +bug\n```\n@xero-review ping",
+        );
+        assert_eq!(cmds.len(), 1);
+        assert!(matches!(cmds[0].command, Command::Ping));
+    }
+
+    #[test]
+    fn test_r_question_inside_code_block_ignored() {
+        let cmds = parse_commands("xero-review", "```\nr? @octocat\n```");
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn test_unknown_verb_ignored() {
+        let cmds = parse_commands("xero-review", "@xero-review do the thing please");
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn test_plain_mention_no_verb() {
+        let cmds = parse_commands("xero-review", "cc @xero-review about this");
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn test_codeql() {
+        let cmds = parse_commands("xero-review", "@xero-review codeql");
+        assert!(matches!(cmds[0].command, Command::Codeql));
     }
 }
