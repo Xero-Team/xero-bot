@@ -125,6 +125,76 @@ pub async fn handle_push_event(
     tracing::info!("rebase check {repo}#{pr_number} ({action}): {status}");
 }
 
+/// Sweep every installation's repositories for conflicted PRs.
+/// App-level client lists installations; each repo gets an installation client.
+pub async fn sweep(cfg: &Config) -> String {
+    if !cfg.rebase_sweep_enabled {
+        return "sweep disabled".into();
+    }
+    let app = match crate::github::Client::app_client(cfg) {
+        Ok(c) => c,
+        Err(e) => return format!("app-client-error: {e}"),
+    };
+
+    // list installations
+    let installations: Vec<Value> = match app
+        .get::<Value, _, _>("/app/installations?per_page=100", None::<&()>)
+        .await
+    {
+        Ok(v) => v.as_array().cloned().unwrap_or_default(),
+        Err(e) => return format!("installations-error: {e}"),
+    };
+
+    let mut checked = 0usize;
+    let mut flagged = 0usize;
+    let mut errors = 0usize;
+
+    for inst in &installations {
+        let Some(inst_id) = inst.get("id").and_then(|i| i.as_i64()) else {
+            continue;
+        };
+        let slug = inst
+            .get("app_slug")
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .to_string();
+        let Ok(gh) = crate::github::Client::installation(cfg, inst_id, &slug) else {
+            errors += 1;
+            continue;
+        };
+
+        let repos = match crate::github::Client::installation_repositories_via(&gh).await {
+            Ok(r) => r,
+            Err(_) => {
+                errors += 1;
+                continue;
+            }
+        };
+
+        for repo in repos {
+            let Ok(prs) = gh.open_prs(&repo).await else {
+                errors += 1;
+                continue;
+            };
+            for pr in prs {
+                let Some(n) = pr.get("number").and_then(|n| n.as_i64()) else {
+                    continue;
+                };
+                checked += 1;
+                let status = check_pr(&gh, cfg, &repo, n).await;
+                if status == "flagged" {
+                    flagged += 1;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+        }
+    }
+
+    let summary = format!("sweep done: {checked} PRs checked, {flagged} flagged, {errors} errors");
+    tracing::info!("{summary}");
+    summary
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

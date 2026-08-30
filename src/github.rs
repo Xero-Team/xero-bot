@@ -61,60 +61,6 @@ impl Client {
         Ok(OctocrabBuilder::new().app(AppId(app_id), key).build()?)
     }
 
-    /// Fetch the current installation access token as a raw string (for git
-    /// clone auth in subprocess engines). Builds a short-lived app JWT and
-    /// exchanges it — independent of octocrab's internal cache.
-    pub async fn installation_token(
-        &self,
-        cfg: &Config,
-        installation_id: i64,
-    ) -> Result<String, GhError> {
-        // Build the app JWT manually (same claims as octocrab's flow)
-        let now = chrono_now_secs();
-        let claims = json!({
-            "iat": now - 60,
-            "exp": now + 9 * 60,
-            "iss": cfg.app_id,
-        });
-        let key = jsonwebtoken::EncodingKey::from_ec_pem(
-            cfg.pem().map_err(GhError::BadShape)?.as_bytes(),
-        )
-        .map_err(|e| GhError::BadShape(format!("bad PEM key: {e}")))?;
-        let jwt = jsonwebtoken::encode(
-            &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256),
-            &claims,
-            &key,
-        )
-        .map_err(|e| GhError::BadShape(format!("jwt encode: {e}")))?;
-
-        let http = reqwest::Client::new();
-        let resp = http
-            .post(format!(
-                "https://api.github.com/app/installations/{installation_id}/access_tokens"
-            ))
-            .bearer_auth(&jwt)
-            .header("Accept", "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", "2022-11-28")
-            .send()
-            .await
-            .map_err(|e| GhError::BadShape(e.to_string()))?;
-        let status = resp.status().as_u16();
-        let v: Value = resp
-            .json()
-            .await
-            .map_err(|e| GhError::BadShape(e.to_string()))?;
-        if status < 200 || status >= 300 {
-            return Err(GhError::Api {
-                status,
-                message: v.to_string(),
-            });
-        }
-        v.get("token")
-            .and_then(|t| t.as_str())
-            .map(String::from)
-            .ok_or_else(|| GhError::BadShape("no token in response".into()))
-    }
-
     /// Build an installation-scoped client.
     pub fn installation(
         cfg: &Config,
@@ -207,6 +153,60 @@ impl Client {
                 message: text.chars().take(300).collect(),
             })
         }
+    }
+
+    /// Fetch the current installation access token as a raw string (for git
+    /// clone auth in subprocess engines). Builds a short-lived app JWT and
+    /// exchanges it — independent of octocrab's internal cache.
+    pub async fn installation_token(
+        &self,
+        cfg: &Config,
+        installation_id: i64,
+    ) -> Result<String, GhError> {
+        // Build the app JWT manually (same claims as octocrab's flow)
+        let now = chrono_now_secs();
+        let claims = json!({
+            "iat": now - 60,
+            "exp": now + 9 * 60,
+            "iss": cfg.app_id,
+        });
+        let key = jsonwebtoken::EncodingKey::from_ec_pem(
+            cfg.pem().map_err(GhError::BadShape)?.as_bytes(),
+        )
+        .map_err(|e| GhError::BadShape(format!("bad PEM key: {e}")))?;
+        let jwt = jsonwebtoken::encode(
+            &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256),
+            &claims,
+            &key,
+        )
+        .map_err(|e| GhError::BadShape(format!("jwt encode: {e}")))?;
+
+        let http = reqwest::Client::new();
+        let resp = http
+            .post(format!(
+                "https://api.github.com/app/installations/{installation_id}/access_tokens"
+            ))
+            .bearer_auth(&jwt)
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .send()
+            .await
+            .map_err(|e| GhError::BadShape(e.to_string()))?;
+        let status = resp.status().as_u16();
+        let v: Value = resp
+            .json()
+            .await
+            .map_err(|e| GhError::BadShape(e.to_string()))?;
+        if status < 200 || status >= 300 {
+            return Err(GhError::Api {
+                status,
+                message: v.to_string(),
+            });
+        }
+        v.get("token")
+            .and_then(|t| t.as_str())
+            .map(String::from)
+            .ok_or_else(|| GhError::BadShape("no token in response".into()))
     }
 
     // -------------------------------------------------------------------
@@ -352,16 +352,6 @@ impl Client {
             .collect())
     }
 
-    /// commits on the PR (for incremental review: what's new since last review)
-    pub async fn list_pr_commits(&self, repo: &str, number: i64) -> Result<Vec<Value>, GhError> {
-        let v = self
-            .get(&format!(
-                "/repos/{repo}/pulls/{number}/commits?per_page=100"
-            ))
-            .await?;
-        Ok(v.as_array().cloned().unwrap_or_default())
-    }
-
     /// post a review (COMMENT event) with optional inline comments;
     /// falls back to no-inline retry and finally a plain comment (Python bot behavior)
     pub async fn post_review(
@@ -424,6 +414,16 @@ impl Client {
         )
         .await?;
         Ok(())
+    }
+
+    /// commits on the PR (for incremental review: what's new since last review)
+    pub async fn list_pr_commits(&self, repo: &str, number: i64) -> Result<Vec<Value>, GhError> {
+        let v = self
+            .get(&format!(
+                "/repos/{repo}/pulls/{number}/commits?per_page=100"
+            ))
+            .await?;
+        Ok(v.as_array().cloned().unwrap_or_default())
     }
 
     // -------------------------------------------------------------------
