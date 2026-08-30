@@ -4,6 +4,154 @@
 //! Flow: fetch diff → parse added lines → build prompt → call AI → parse
 //! verdict → post review (with inline comments, degrading gracefully).
 
+use serde_json::{json, Value};
+
+use crate::config::Config;
+
+// ---------------------------------------------------------------------------
+// AI call — three formats
+// ---------------------------------------------------------------------------
+
+pub async fn call_ai(
+    cfg: &Config,
+    system_prompt: &str,
+    user_prompt: &str,
+) -> Result<String, String> {
+    let base = cfg.ai_base_url.trim_end_matches('/');
+    let fmt = cfg.api_format.to_lowercase();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(300))
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let url;
+    let mut headers = reqwest::header::HeaderMap::new();
+    let body: Value;
+
+    if fmt == "chat" {
+        url = format!("{base}/chat/completions");
+        headers.insert(
+            reqwest::header::AUTHORIZATION,
+            format!("Bearer {}", cfg.ai_api_key).parse().unwrap(),
+        );
+        body = json!({
+            "model": cfg.ai_model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "temperature": 0.2,
+            "response_format": {"type": "json_object"},
+        });
+    } else if fmt == "responses" {
+        url = format!("{base}/responses");
+        headers.insert(
+            reqwest::header::AUTHORIZATION,
+            format!("Bearer {}", cfg.ai_api_key).parse().unwrap(),
+        );
+        body = json!({
+            "model": cfg.ai_model,
+            "input": user_prompt,
+            "instructions": system_prompt,
+            "text": {"format": {"type": "json_object"}},
+        });
+    } else if fmt == "anthropic" {
+        url = format!("{base}/v1/messages");
+        headers.insert(
+            reqwest::header::HeaderName::from_static("x-api-key"),
+            cfg.ai_api_key.parse().unwrap(),
+        );
+        headers.insert(
+            reqwest::header::HeaderName::from_static("anthropic-version"),
+            "2023-06-01".parse().unwrap(),
+        );
+        body = json!({
+            "model": cfg.ai_model,
+            "max_tokens": 4096,
+            "system": system_prompt,
+            "messages": [{"role": "user", "content": user_prompt}],
+        });
+    } else {
+        return Err(format!("unknown api_format: {}", cfg.api_format));
+    }
+
+    headers.insert(
+        reqwest::header::CONTENT_TYPE,
+        "application/json".parse().unwrap(),
+    );
+
+    let resp = client
+        .post(&url)
+        .headers(headers)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("AI request failed to {url}: {e}"))?;
+    let status = resp.status();
+    let text = resp
+        .text()
+        .await
+        .map_err(|e| format!("AI read failed: {e}"))?;
+    if !status.is_success() {
+        return Err(format!(
+            "AI request failed ({}) to {url}: {}",
+            status,
+            &text.chars().take(400).collect::<String>()
+        ));
+    }
+    let out: Value =
+        serde_json::from_str(&text).map_err(|e| format!("AI response not JSON: {e}"))?;
+
+    extract_ai_text(&fmt, &out)
+}
+
+fn extract_ai_text(fmt: &str, out: &Value) -> Result<String, String> {
+    match fmt {
+        "chat" => out
+            .pointer("/choices/0/message/content")
+            .and_then(|c| c.as_str())
+            .map(String::from)
+            .ok_or_else(|| format!("chat API: no content in {out}")),
+        "responses" => {
+            if let Some(t) = out.get("output_text").and_then(|t| t.as_str()) {
+                return Ok(t.to_string());
+            }
+            // fallback: walk output array backwards
+            if let Some(arr) = out.get("output").and_then(|o| o.as_array()) {
+                for item in arr.iter().rev() {
+                    if let Some(content) = item.get("content").and_then(|c| c.as_array()) {
+                        for c in content {
+                            if c.get("type").and_then(|t| t.as_str()) == Some("output_text") {
+                                if let Some(t) = c.get("text").and_then(|t| t.as_str()) {
+                                    if !t.is_empty() {
+                                        return Ok(t.to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Err(format!("responses API: no text in {out}"))
+        }
+        "anthropic" => {
+            if let Some(content) = out.get("content").and_then(|c| c.as_array()) {
+                for block in content {
+                    if block.get("type").and_then(|t| t.as_str()) == Some("text") {
+                        if let Some(t) = block.get("text").and_then(|t| t.as_str()) {
+                            if !t.is_empty() {
+                                return Ok(t.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            Err(format!("anthropic API: no text in {out}"))
+        }
+        _ => Err("unknown format".into()),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Diff parsing — per-file added line numbers (RIGHT side)
 // ---------------------------------------------------------------------------
