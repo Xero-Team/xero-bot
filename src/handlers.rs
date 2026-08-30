@@ -119,6 +119,77 @@ async fn handle_one(gh: &Client, cfg: &Config, ctx: &CommentContext, cmd: Comman
                 "error".into()
             }
         }
+        Command::Assign { user } => match gh
+            .add_assignees(&ctx.repo, ctx.pr_number, &[user.clone()])
+            .await
+        {
+            Ok(()) => {
+                let _ = gh
+                    .post_issue_comment(&ctx.repo, ctx.pr_number, &format!("已指派给 @{user}。"))
+                    .await;
+                "ok".into()
+            }
+            Err(e) => {
+                let _ = gh
+                    .post_issue_comment(&ctx.repo, ctx.pr_number, &format!("⚠️ 指派失败: `{e}`"))
+                    .await;
+                format!("error: {e}")
+            }
+        },
+        Command::Claim => {
+            match gh
+                .add_assignees(&ctx.repo, ctx.pr_number, &[ctx.commenter.clone()])
+                .await
+            {
+                Ok(()) => {
+                    let _ = gh
+                        .post_issue_comment(
+                            &ctx.repo,
+                            ctx.pr_number,
+                            &format!("@{} 已认领。", ctx.commenter),
+                        )
+                        .await;
+                    "ok".into()
+                }
+                Err(e) => {
+                    let _ = gh
+                        .post_issue_comment(
+                            &ctx.repo,
+                            ctx.pr_number,
+                            &format!("⚠️ 认领失败: `{e}`"),
+                        )
+                        .await;
+                    format!("error: {e}")
+                }
+            }
+        }
+        Command::Unclaim => {
+            match gh
+                .remove_assignees(&ctx.repo, ctx.pr_number, &[ctx.commenter.clone()])
+                .await
+            {
+                Ok(()) => {
+                    let _ = gh
+                        .post_issue_comment(
+                            &ctx.repo,
+                            ctx.pr_number,
+                            &format!("@{} 已释放指派。", ctx.commenter),
+                        )
+                        .await;
+                    "ok".into()
+                }
+                Err(e) => {
+                    let _ = gh
+                        .post_issue_comment(
+                            &ctx.repo,
+                            ctx.pr_number,
+                            &format!("⚠️ 释放失败: `{e}`"),
+                        )
+                        .await;
+                    format!("error: {e}")
+                }
+            }
+        }
         Command::Ready | Command::Author | Command::Blocked => {
             set_status_label(gh, cfg, ctx, cmd).await
         }

@@ -34,6 +34,14 @@ pub enum Command {
         add: Vec<String>,
         remove: Vec<String>,
     },
+    /// assign @user
+    Assign {
+        user: String,
+    },
+    /// claim (assign to commenter)
+    Claim,
+    /// unclaim / release-assignment (remove commenter from assignees)
+    Unclaim,
 }
 
 /// One parsed command plus where it appeared (for ordered execution).
@@ -192,6 +200,15 @@ fn parse_verb(bot_name: &str, rest: &str) -> Option<Command> {
                 Some(Command::Label { add, remove })
             }
         }
+        "assign" => {
+            let users = parse_users(args);
+            users
+                .into_iter()
+                .next()
+                .map(|user| Command::Assign { user })
+        }
+        "claim" => Some(Command::Claim),
+        "unclaim" | "release-assignment" | "release" => Some(Command::Unclaim),
         _ => {
             // `r? @user` also valid right after mention: `@xero r? @user`
             if word == "r?" {
@@ -369,6 +386,18 @@ mod tests {
             }
             other => panic!("expected Label, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_assign_claim() {
+        let cmds = parse_commands("xero-review", "@xero-review assign @octocat");
+        assert!(matches!(&cmds[0].command, Command::Assign { user } if user == "octocat"));
+        let cmds = parse_commands("xero-review", "@xero-review claim");
+        assert!(matches!(cmds[0].command, Command::Claim));
+        let cmds = parse_commands("xero-review", "@xero-review unclaim");
+        assert!(matches!(cmds[0].command, Command::Unclaim));
+        let cmds = parse_commands("xero-review", "@xero-review release-assignment");
+        assert!(matches!(cmds[0].command, Command::Unclaim));
     }
 
     #[test]
