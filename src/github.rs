@@ -242,4 +242,160 @@ impl Client {
             .map(String::from)
             .ok_or_else(|| GhError::BadShape("no permission field".into()))
     }
+
+    // -------------------------------------------------------------------
+    // Pull requests
+    // -------------------------------------------------------------------
+
+    pub async fn get_pr(&self, repo: &str, number: i64) -> Result<Value, GhError> {
+        self.get(&format!("/repos/{repo}/pulls/{number}")).await
+    }
+
+    /// unified diff text
+    pub async fn get_pr_diff(&self, repo: &str, number: i64) -> Result<String, GhError> {
+        self.get_raw(
+            &format!("/repos/{repo}/pulls/{number}"),
+            "application/vnd.github.v3.diff",
+        )
+        .await
+    }
+
+    /// files changed in the PR: [{filename, status, additions, ...}]
+    pub async fn list_pr_files(&self, repo: &str, number: i64) -> Result<Vec<Value>, GhError> {
+        let v = self
+            .get(&format!("/repos/{repo}/pulls/{number}/files?per_page=100"))
+            .await?;
+        Ok(v.as_array().cloned().unwrap_or_default())
+    }
+
+    /// reviews on a PR
+    pub async fn list_pr_reviews(&self, repo: &str, number: i64) -> Result<Vec<Value>, GhError> {
+        let v = self
+            .get(&format!(
+                "/repos/{repo}/pulls/{number}/reviews?per_page=100"
+            ))
+            .await?;
+        Ok(v.as_array().cloned().unwrap_or_default())
+    }
+
+    /// previous reviews left by this bot (incremental review memory)
+    pub async fn own_previous_reviews(
+        &self,
+        repo: &str,
+        number: i64,
+    ) -> Result<Vec<Value>, GhError> {
+        let reviews = self.list_pr_reviews(repo, number).await?;
+        let slug = self.app_slug.to_lowercase();
+        Ok(reviews
+            .into_iter()
+            .filter(|r| {
+                r.get("user")
+                    .and_then(|u| u.get("login"))
+                    .and_then(|l| l.as_str())
+                    .map(|l| l.to_lowercase() == slug)
+                    .unwrap_or(false)
+            })
+            .collect())
+    }
+
+    /// commits on the PR (for incremental review: what's new since last review)
+    pub async fn list_pr_commits(&self, repo: &str, number: i64) -> Result<Vec<Value>, GhError> {
+        let v = self
+            .get(&format!(
+                "/repos/{repo}/pulls/{number}/commits?per_page=100"
+            ))
+            .await?;
+        Ok(v.as_array().cloned().unwrap_or_default())
+    }
+
+    // -------------------------------------------------------------------
+    // Repo content (agent tools)
+    // -------------------------------------------------------------------
+
+    /// file content at ref (decoded from base64), or None if it's a directory
+    pub async fn get_file_content(
+        &self,
+        repo: &str,
+        path: &str,
+        reference: &str,
+    ) -> Result<Option<String>, GhError> {
+        let route = format!("/repos/{repo}/contents/{path}?ref={reference}");
+        let v = self.get(&route).await?;
+        if v.get("type").and_then(|t| t.as_str()) == Some("dir") {
+            return Ok(None);
+        }
+        let b64 = v
+            .get("content")
+            .and_then(|c| c.as_str())
+            .ok_or_else(|| GhError::BadShape("no content".into()))?;
+        let b64 = b64.replace('\n', "");
+        use base64::Engine;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .map_err(|e| GhError::BadShape(format!("bad base64: {e}")))?;
+        Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
+    }
+
+    /// directory listing at ref: [{name, type, path}]
+    pub async fn list_dir(
+        &self,
+        repo: &str,
+        path: &str,
+        reference: &str,
+    ) -> Result<Vec<Value>, GhError> {
+        let route = if path.is_empty() {
+            format!("/repos/{repo}/contents?ref={reference}")
+        } else {
+            format!("/repos/{repo}/contents/{path}?ref={reference}")
+        };
+        let v = self.get(&route).await?;
+        Ok(v.as_array().cloned().unwrap_or_default())
+    }
+
+    // -------------------------------------------------------------------
+    // Code scanning (CodeQL reports)
+    // -------------------------------------------------------------------
+
+    /// open code-scanning alerts; Err(Api{403/404}) when not enabled
+    pub async fn code_scanning_alerts(&self, repo: &str) -> Result<Vec<Value>, GhError> {
+        let v = self
+            .get(&format!(
+                "/repos/{repo}/code-scanning/alerts?state=open&per_page=100"
+            ))
+            .await?;
+        Ok(v.as_array().cloned().unwrap_or_default())
+    }
+
+    // -------------------------------------------------------------------
+    // Installations / repositories (sweep)
+    // -------------------------------------------------------------------
+
+    /// All installation repositories reachable via an installation client
+    /// (GET /installation/repositories), first page (100 repos).
+    pub async fn installation_repositories_via(client: &Client) -> Result<Vec<String>, GhError> {
+        let v: Value = client
+            .crab
+            .get("/installation/repositories?per_page=100", None::<&()>)
+            .await?;
+        Ok(v.get("repositories")
+            .and_then(|r| r.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|r| {
+                        r.get("full_name")
+                            .and_then(|f| f.as_str())
+                            .map(String::from)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
+    /// All open PRs for a repo.
+    pub async fn open_prs(&self, repo: &str) -> Result<Vec<Value>, GhError> {
+        let v = self
+            .get(&format!("/repos/{repo}/pulls?state=open&per_page=100"))
+            .await?;
+        Ok(v.as_array().cloned().unwrap_or_default())
+    }
 }
