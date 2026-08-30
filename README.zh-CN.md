@@ -1,0 +1,191 @@
+# xero-bot
+
+[English](README.md) | [简体中文](README.zh-CN.md)
+
+Xero-Team 的组织级 GitHub App 机器人。Rust 实现,单二进制,双部署模式(Vercel serverless / Docker 自托管)。
+
+功能:
+- **bors/triagebot 风格评论命令** — `r?`、`?r cc`、label 管理、assign/claim、`r+` 代审批等
+- **增量 AI 代码审查** — 先了解项目、结合上一轮审查意见,而非孤立地看 diff
+- **rebase 提醒** — PR 与目标分支冲突时自动打 `needs-rebase` 标签并提醒,解决后自动清除
+- **CodeQL 质量报告** — 读取仓库存量 code scanning 告警,映射到 PR 变更文件
+
+## 命令参考
+
+评论中发出(大小写不敏感,一条评论可含多条命令,代码块内的内容会被忽略):
+
+| 命令 | 说明 |
+|---|---|
+| `@xero-review review` | AI 代码审查(增量:结合上一轮审查与新提交) |
+| `@xero-review codeql` | CodeQL 质量报告 |
+| `@xero-review ping` | 健康检查 |
+| `@xero-review help` | 命令帮助 |
+| `r? @user` | 请求 @user 审查(自动指派;`r? user` 不带 @ 也可以;可在评论任意位置) |
+| `@xero-review cc @u1 @u2` | 抄送/通知用户 |
+| `?r` 或 `@xero-review ready` | 标记等待审查(打 `waiting-on-review`,摘掉另外两个状态标签) |
+| `?r cc @user` | ready + cc 组合(triagebot 快捷风格) |
+| `@xero-review author` | 标记等待作者(`waiting-on-author`) |
+| `@xero-review blocked` | 标记受阻(`blocked`) |
+| `@xero-review label +bug -wip` | 添加/移除标签 |
+| `@xero-review assign @user` | 指派给 @user |
+| `@xero-review claim` / `unclaim` | 认领/释放(指派给自己/移除自己) |
+| `@xero-review r+` | 代审批:bot 校验评论者有 write 权限后,以其名义提交 APPROVE review |
+| `@xero-review r+ as @user` | 以 @user 名义代审批(用于转发在其他渠道给出的批准,即 bors 的 `r=`) |
+| `@xero-review r-` | 撤回 bot 之前的 APPROVE(dismiss) |
+
+自动行为(无需命令):
+- PR push/reopen 后检测冲突 → 打 `needs-rebase` + 提醒评论;冲突解决 → 摘标签
+- 周期 sweep(Vercel Cron 每日 / 自托管默认 6h)兜底检测
+- 给 PR 打 `codeql` 标签(若配置了 `CODEQL_LABEL`)→ 自动生成 CodeQL 报告
+
+## AI 审查引擎
+
+`REVIEW_ENGINE` 选择:
+
+| 引擎 | 机制 | 增量能力 | 平台 |
+|---|---|---|---|
+| `agent`(默认) | tool-calling 循环,工具=GitHub API(列目录/读文件/搜代码),先探索项目再审查 | 注入本 PR 上一轮 bot 审查 + 其后的新提交列表 | Vercel + 自托管 |
+| `builtin` | 单次 HTTP 调用(OpenAI chat/responses/Anthropic 三种格式) | 同上(上下文注入) | Vercel + 自托管 |
+| `pi` | 子进程 `pi -p --session-dir`,只读工具集 | **会话延续**:per-repo 会话文件记住项目理解 | 仅自托管(Docker 已预装) |
+| `codex` | 子进程 `codex exec --sandbox read-only -o` | 同上(可 `codex exec resume`) | 仅自托管 |
+| `auto` | 依次探测:pi → codex → agent → builtin | - | - |
+
+agent 超时/失败自动回退 builtin。所有引擎共用同一发布管线:风险分级表 + 新增行内联评论 + 发布降级链(带内联 → 去内联 → 普通评论)。
+
+## 部署
+
+两种模式跑的是同一套代码,区别只在运维方式:
+
+| | Vercel | Docker |
+|---|---|---|
+| 运维 | 零运维 | 自管服务器 |
+| 单次调用时长 | 300 s(Hobby)/ 800 s(Pro) | 无限制 |
+| `pi` / `codex` 引擎 | 不可用 | `pi` 预装,`codex` 需手动 |
+| 定时 sweep | Vercel Cron(每日,托管) | 内置 sweep 循环(默认 6h) |
+| Webhook 路径 | `/api/webhook` | `/webhook` |
+| 私钥 | `PRIVATE_KEY_B64` | `PRIVATE_KEY_PATH` 或 `PRIVATE_KEY_B64` |
+
+### 0. 创建 GitHub App(两种模式都需要)
+
+GitHub → Settings → Developer settings → GitHub Apps → **New GitHub App**:
+
+| 项 | 值 |
+|---|---|
+| Webhook URL | `https://<host>/api/webhook`(Vercel)或 `https://<host>/webhook`(自托管) |
+| Webhook secret | 任意随机字符串 — 必须与 `WEBHOOK_SECRET` 一致 |
+| 订阅事件 | **Issue comment** + **Pull request** |
+| 权限 | Contents: R · Pull requests: RW · Issues: RW · **Code scanning alerts: R** |
+
+然后:**生成私钥**(会下载 `.pem` 文件),记下数字 **App ID** 与 bot 的 @-名(填 `BOT_NAME`),并把 App 安装到目标组织/仓库。
+
+### 1. Vercel(推荐,零运维)
+
+1. **部署项目** — 把本仓库推到 GitHub 后在 Vercel 导入(Add New… → Project),Vercel Rust runtime 会自动构建 `api/*.rs` 各入口,`vercel.json` 已配好函数超时与 cron 计划。CLI 方式亦可:
+   ```bash
+   npm i -g vercel && vercel link && vercel --prod
+   ```
+2. **配置环境变量** — Project → Settings → Environment Variables,或 `vercel env add <KEY> production`:
+
+   | 变量 | 说明 |
+   |---|---|
+   | `APP_ID` | 数字 App ID |
+   | `PRIVATE_KEY_B64` | `.pem` 文件的 base64 — serverless 没有文件系统,`PRIVATE_KEY_PATH` 在 Vercel 上**不可用** |
+   | `WEBHOOK_SECRET` | 与 App 设置中一致 |
+   | `BOT_NAME` | 如 `xero-review` |
+   | `AI_BASE_URL` / `AI_API_KEY` / `AI_MODEL` / `API_FORMAT` | LLM 服务配置;见 [.env.example](.env.example) |
+   | `REVIEW_ENGINE` | `auto`(默认)— Vercel 上自动落到 `agent`/`builtin` |
+   | `CRON_SECRET` | 任意随机字符串;Vercel Cron 会自动以 Bearer 头携带 |
+
+   私钥转 base64(只取值,不要换行):
+   ```bash
+   base64 -w0 app.pem        # Linux / Git Bash
+   base64 -i app.pem         # macOS(默认单行输出)
+   ```
+   **增改环境变量后必须重新部署**(`vercel --prod` 或 Deployments → Redeploy)— 已运行的函数不会热加载新变量。
+
+3. **Cron** — `vercel.json` 已声明每日任务(`0 3 * * *`,Hobby 计划的最小粒度)打到 `/api/cron`。只要配置了 `CRON_SECRET`,Vercel 会自动附上 `Authorization: Bearer $CRON_SECRET`,无需额外鉴权设置。
+4. **验证**:
+   ```bash
+   curl https://<your-app>.vercel.app/api/health
+   # {"status":"ok","configured":true,...}
+   ```
+   并到 App 设置页的 *Recent Deliveries* 检查 webhook ping 是否绿勾。
+
+**Vercel 限制(已核实):** 函数最长 300 s(Hobby)/ 800 s(Pro)(`vercel.json` 当前设 300,Pro 上若审查被截断可调高)。`pi`/`codex` 子进程引擎在 Vercel 不可用 — `REVIEW_ENGINE=auto` 会回退到 `agent`。冷启动会给闲置后的首个请求增加几秒延迟。
+
+### 2. Docker 自托管(功能全量)
+
+1. **准备配置**:
+   ```bash
+   cp .env.example .env   # 填好所有配置
+   ```
+   私钥二选一:
+   - 在 `.env` 里直接设 `PRIVATE_KEY_B64`(`.pem` 的 base64 — 到处可用,无需挂载),**或**
+   - 挂载密钥文件并把 `PRIVATE_KEY_PATH` 指到容器内路径 — 在 `docker-compose.yml` 中加:
+     ```yaml
+     volumes:
+       - xero-data:/data
+       - ./xero-review-bot.pem:/keys/bot.pem:ro
+     ```
+     并设 `PRIVATE_KEY_PATH=/keys/bot.pem`。
+2. **启动**:
+   ```bash
+   docker compose up -d --build
+   docker compose logs -f     # 观察启动;配置校验失败会立刻退出
+   ```
+3. **Webhook URL**:`https://<your-host>/webhook` — 必须能被公网访问(GitHub 要向它推送事件;家用服务器需反代或内网穿透)。
+
+容器内的既有能力:
+- `/data` 具名卷(`xero-data`)缓存仓库 checkout 与 `pi` 会话 — 这是 bot 的**增量记忆**,删掉就丢审查上下文,不要轻易清理。
+- 已预装 `pi` coding agent,`pi` 引擎开箱即用。`codex` **未**预装 — 想用 `codex` 引擎需扩展镜像(或 `docker exec` 后 `npm i -g @openai/codex`)。
+- 内置 rebase sweep 循环(`REBASE_SWEEP_ENABLED=true`,默认每 `REBASE_SWEEP_INTERVAL_SECS`=6h 一轮),无需外部 cron。也可在宿主机 crontab 里再加一道兜底:
+  ```bash
+  curl -H "Authorization: Bearer $CRON_SECRET" http://localhost:8080/cron
+  ```
+
+端点:`POST /webhook`(GitHub)、`GET /health`、`GET /cron`(受 `CRON_SECRET` 保护)。
+
+## 配置
+
+全部环境变量见 [.env.example](.env.example)。要点:
+- `PRIVATE_KEY_PATH`(自托管)或 `PRIVATE_KEY_B64`(Vercel)二选一
+- 真实环境变量永远优先于 `.env` 值(Vercel 控制台配置因此生效)
+- 标签名可配(`LABEL_*`),默认 `needs-rebase` / `waiting-on-review` / `waiting-on-author` / `blocked`
+- `CODEQL_LABEL` 非空时,打该标签自动触发 CodeQL 报告;默认空=仅命令触发
+- CodeQL 报告要求仓库已启用 code scanning(CodeQL default setup 或 codeql.yml workflow);私有仓库需 GitHub Advanced Security
+
+## 本地开发
+
+```bash
+cargo test                    # 45 单元 + 7 集成(wiremock mock GitHub API)
+cargo run                     # 自托管模式跑在 :8080
+cargo run --example send_webhook -- issue-comment "@xero-review ping"
+cargo run --example send_webhook -- issue-comment "r? @octocat"
+cargo run --example send_webhook -- pr-synchronize
+```
+
+`send_webhook` 用 `WEBHOOK_SECRET`(默认 `dev-secret`)对 payload 签名后 POST 到本地服务器,模拟 GitHub 侧。
+
+## 架构
+
+```
+src/
+├── config.rs          env 配置(.env 加载,真实环境变量优先)
+├── webhook.rs         HMAC-SHA256 验签 + 事件分类
+├── commands.rs        命令解析器(多命令/代码块忽略/r? 任意位置/?短命令)
+├── handlers.rs        命令执行(权限校验、回复渲染)
+├── github.rs          octocrab 封装(唯一 GitHub API 出口)
+├── review.rs          builtin 引擎 + 共享发布管线(diff 解析/verdict 解析/渲染/降级链)
+├── agent.rs           原生 review agent(tool-calling 循环,工具=GitHub API)
+├── engines_subproc.rs pi/codex 子进程引擎 + git checkout 缓存(仅自托管)
+├── codeql.rs          Code Scanning 告警 → PR 变更文件映射 → 报告
+├── rebase.rs          mergeable 检测 + needs-rebase 标签 + sweep
+├── dispatch.rs        事件 → 后台工作 路由(两种入口共用)
+└── main.rs            自托管 axum 服务器
+
+api/                   Vercel 入口(webhook/cron/health,AppState::wait_until 后台执行)
+```
+
+状态持久化:全部存 GitHub(标签 = 工作流状态,PR review = 上一轮审查记忆)——bot 本身无数据库、无外部存储。
+
+构建说明:`vercel_runtime` vendor 在 `vendor/vercel_runtime`,带一处 unix-only 编译问题的一行修复(见 `Cargo.toml` 的 `[patch.crates-io]`)— Docker 构建与 Vercel 构建都依赖 `vendor/` 目录存在。
