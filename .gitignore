@@ -3,14 +3,15 @@
 *.pem
 *.key
 
-# Python
-__pycache__/
-*.py[cod]
-*.egg-info/
-.venv/
-venv/
+# Rust
+/target/
+Cargo.lock
+
+# Data dir (self-hosted repos cache / pi sessions)
+/data/
 
 # OS / editor
 .DS_Store
 .idea/
 .vscode/
+.vercel/
