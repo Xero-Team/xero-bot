@@ -54,8 +54,27 @@ pub fn route_event(cfg: &Config, event_header: &str, payload: &Value) -> Routing
                 commands: commands.into_iter().map(|c| c.command).collect(),
             })
         }
-        // pull_request / labeled events: rebase + codeql wiring lands later
-        other => Routing::Respond(serde_json::json!({"ignored": format!("{other:?}")})),
+        // pull_request / labeled events: rebase wiring lands later
+        WebhookEvent::PrLabeled {
+            repo,
+            pr_number,
+            label,
+            installation_id,
+        } => {
+            if !cfg.codeql_label.is_empty() && label == cfg.codeql_label {
+                Routing::Act(Work::Codeql {
+                    repo,
+                    pr_number,
+                    installation_id,
+                })
+            } else {
+                Routing::Respond(serde_json::json!({"ignored": "label not configured"}))
+            }
+        }
+        // push events: rebase check wiring lands with the rebase feature
+        WebhookEvent::PullRequest { .. } => {
+            Routing::Respond(serde_json::json!({"ignored": "pull_request event not wired yet"}))
+        }
     }
 }
 
@@ -77,6 +96,11 @@ pub enum Work {
         commenter: String,
         pr_author: String,
         commands: Vec<crate::commands::Command>,
+    },
+    Codeql {
+        repo: String,
+        pr_number: i64,
+        installation_id: i64,
     },
 }
 
@@ -111,6 +135,17 @@ async fn execute_work_inner(cfg: &Config, work: Work) -> Result<(), String> {
             };
             let results = handle_comment(&gh, cfg, &ctx, commands).await;
             tracing::info!("comment commands on {repo}#{pr_number}: {results:?}");
+            Ok(())
+        }
+        Work::Codeql {
+            repo,
+            pr_number,
+            installation_id,
+        } => {
+            let gh = Client::installation(cfg, installation_id, "")
+                .map_err(|e| format!("installation client: {e}"))?;
+            let status = crate::codeql::run_codeql_report(&gh, cfg, &repo, pr_number).await;
+            tracing::info!("codeql report {repo}#{pr_number}: {status}");
             Ok(())
         }
     }
