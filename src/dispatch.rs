@@ -21,7 +21,6 @@ pub fn route_event(cfg: &Config, event_header: &str, payload: &Value) -> Routing
             comment_body,
             commenter,
             installation_id,
-            app_slug,
             via_app_id,
             commenter_is_bot,
             pr_author,
@@ -42,7 +41,9 @@ pub fn route_event(cfg: &Config, event_header: &str, payload: &Value) -> Routing
             }
             if commenter_is_bot && !commenter.is_empty() {
                 let own = normalize_login(&cfg.bot_name);
-                if normalize_login(&commenter) == own || normalize_login(&app_slug) == own {
+                let configured = normalize_login(&cfg.app_slug);
+                let me = normalize_login(&commenter);
+                if me == own || (!configured.is_empty() && me == configured) {
                     return Routing::Respond(serde_json::json!({"ignored": "self comment"}));
                 }
             }
@@ -77,7 +78,6 @@ pub fn route_event(cfg: &Config, event_header: &str, payload: &Value) -> Routing
                 repo,
                 pr_number,
                 installation_id,
-                app_slug,
                 commenter,
                 pr_author,
                 commands: commands.into_iter().map(|c| c.command).collect(),
@@ -127,7 +127,6 @@ pub enum Work {
         repo: String,
         pr_number: i64,
         installation_id: i64,
-        app_slug: String,
         commenter: String,
         pr_author: String,
         commands: Vec<crate::commands::Command>,
@@ -159,19 +158,18 @@ async fn execute_work_inner(cfg: &Config, work: Work) -> Result<(), String> {
             repo,
             pr_number,
             installation_id,
-            app_slug,
             commenter,
             pr_author,
             commands,
         } => {
-            let gh = Client::installation(cfg, installation_id, &app_slug)
+            let gh = Client::installation_resolved(cfg, installation_id)
+                .await
                 .map_err(|e| format!("installation client: {e}"))?;
             let ctx = CommentContext {
                 repo: repo.clone(),
                 pr_number,
                 commenter,
                 pr_author,
-                app_slug,
                 installation_id,
             };
             let results = handle_comment(&gh, cfg, &ctx, commands).await;

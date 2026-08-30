@@ -82,17 +82,21 @@ f3dqYBjNIT+/oq4iaJ5a96EG
 /// the real token endpoint (octocrab is redirected to the mock), the exact
 /// key contents don't matter as long as the PEM parses. If it doesn't parse
 /// on some platform, tests are skipped by nature of the assertion failing.
+/// Shaped like a real `issue_comment` delivery: the `installation` property is
+/// GitHub's *simple installation* object, so it carries no `app_slug`. Earlier
+/// fixtures fabricated one, which hid the bugs that came from it always being
+/// empty in production.
 fn make_payload(action: &str, body: &str, commenter: &str, pr_author: &str) -> Value {
     json!({
         "action": action,
-        "installation": {"id": 42, "app_slug": "xero-review"},
+        "installation": {"id": 42, "node_id": "MDIzOkludGVncmF0aW9u"},
         "repository": {"full_name": "octocat/hello"},
         "issue": {
             "number": 7,
             "pull_request": {"url": "https://api.github.com/repos/octocat/hello/pulls/7"},
             "user": {"login": pr_author}
         },
-        "comment": {"body": body, "user": {"login": commenter}}
+        "comment": {"body": body, "user": {"login": commenter, "type": "User"}}
     })
 }
 
@@ -134,7 +138,6 @@ async fn test_ping_comment_replies_pong() {
         pr_number: 7,
         commenter: "alice".into(),
         pr_author: "bob".into(),
-        app_slug: "xero-review".into(),
         installation_id: 42,
     };
     let results = xero_bot::handlers::handle_comment(
@@ -185,7 +188,6 @@ async fn test_ready_label_flow_with_mock() {
         pr_number: 7,
         commenter: "alice".into(),
         pr_author: "bob".into(),
-        app_slug: "xero-review".into(),
         installation_id: 42,
     };
     let results = xero_bot::handlers::handle_comment(
@@ -233,7 +235,6 @@ async fn test_r_plus_permission_denied() {
         pr_number: 7,
         commenter: "alice".into(),
         pr_author: "bob".into(),
-        app_slug: "xero-review".into(),
         installation_id: 42,
     };
     let results = xero_bot::handlers::handle_comment(
@@ -286,7 +287,6 @@ async fn test_r_plus_approves_with_write() {
         pr_number: 7,
         commenter: "alice".into(),
         pr_author: "bob".into(),
-        app_slug: "xero-review".into(),
         installation_id: 42,
     };
     let results = xero_bot::handlers::handle_comment(

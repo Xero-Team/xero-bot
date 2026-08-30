@@ -13,6 +13,9 @@ pub struct Config {
     pub private_key_pem: Option<String>,
     pub webhook_secret: String,
     pub bot_name: String,
+    /// Optional override for the App's own login (without `[bot]`). Empty means
+    /// resolve it via `GET /app`; set it on serverless to skip that round trip.
+    pub app_slug: String,
 
     // AI provider (builtin engine)
     pub ai_base_url: String,
@@ -146,6 +149,7 @@ impl Config {
             private_key_pem: read_key_pem(),
             webhook_secret: cfg("WEBHOOK_SECRET", ""),
             bot_name: cfg("BOT_NAME", "xero-review"),
+            app_slug: cfg("APP_SLUG", ""),
 
             ai_base_url: cfg("AI_BASE_URL", ""),
             ai_api_key: cfg("AI_API_KEY", ""),

@@ -49,6 +49,53 @@ pub fn normalize_login(login: &str) -> String {
     lower.strip_suffix("[bot]").unwrap_or(&lower).to_string()
 }
 
+/// Cache for [`resolve_app_slug`]. Resolving costs an API round trip and the
+/// answer can't change for a given key, so do it once per process.
+static APP_SLUG: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Fetch the App's own slug via `GET /app`, which only accepts an app JWT.
+async fn app_slug_via_jwt(cfg: &Config) -> Result<String, GhError> {
+    let app = Client::app_client(cfg)?;
+    let v: Value = app
+        .get("/app", None::<&()>)
+        .await
+        .map_err(classify_octo_error)?;
+    v.get("slug")
+        .and_then(|s| s.as_str())
+        .filter(|s| !s.is_empty())
+        .map(normalize_login)
+        .ok_or_else(|| GhError::BadShape("no slug in GET /app".into()))
+}
+
+/// Resolve the login this App comments and reviews as, without the `[bot]`
+/// suffix. Order: process cache, `APP_SLUG` override, `GET /app`, then
+/// `BOT_NAME` as a last resort.
+///
+/// The override exists for serverless, where every invocation builds a fresh
+/// process and the cache never warms — setting `APP_SLUG` skips the round trip.
+pub async fn resolve_app_slug(cfg: &Config) -> String {
+    if let Some(s) = APP_SLUG.get() {
+        return s.clone();
+    }
+    if !cfg.app_slug.trim().is_empty() {
+        let s = normalize_login(&cfg.app_slug);
+        let _ = APP_SLUG.set(s.clone());
+        return s;
+    }
+    let resolved = match app_slug_via_jwt(cfg).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(
+                "could not resolve app slug via GET /app ({e}); \
+                 falling back to BOT_NAME — set APP_SLUG if they differ"
+            );
+            normalize_login(&cfg.bot_name)
+        }
+    };
+    let _ = APP_SLUG.set(resolved.clone());
+    resolved
+}
+
 fn chrono_now_secs() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -89,6 +136,10 @@ impl Client {
     }
 
     /// Build an installation-scoped client.
+    ///
+    /// `app_slug` identifies our own comments and reviews; pass it normalized
+    /// (no `[bot]` suffix). Prefer [`Client::installation_resolved`], which
+    /// looks the slug up instead of requiring callers to have it.
     pub fn installation(
         cfg: &Config,
         installation_id: i64,
@@ -98,8 +149,22 @@ impl Client {
         let crab = app.installation(InstallationId(installation_id as u64))?;
         Ok(Client {
             crab,
-            app_slug: app_slug.to_string(),
+            app_slug: normalize_login(app_slug),
         })
+    }
+
+    /// Build an installation-scoped client with the app slug resolved.
+    ///
+    /// Callers used to pass `installation.app_slug` from the webhook payload,
+    /// but that property is GitHub's *simple installation* object — id and
+    /// node_id only — so it was always empty, and every "is this mine?" check
+    /// silently compared against "".
+    pub async fn installation_resolved(
+        cfg: &Config,
+        installation_id: i64,
+    ) -> Result<Client, GhError> {
+        let slug = resolve_app_slug(cfg).await;
+        Self::installation(cfg, installation_id, &slug)
     }
 
     // -------------------------------------------------------------------
@@ -363,14 +428,21 @@ impl Client {
         number: i64,
     ) -> Result<Vec<Value>, GhError> {
         let reviews = self.list_pr_reviews(repo, number).await?;
-        let slug = self.app_slug.to_lowercase();
+        // `app_slug` is already normalized; the review author is `slug[bot]`, so
+        // normalize that side too or this never matches and the incremental
+        // review silently has no memory.
+        let slug = normalize_login(&self.app_slug);
+        if slug.is_empty() {
+            tracing::warn!("app_slug is empty; cannot identify own reviews on {repo}#{number}");
+            return Ok(Vec::new());
+        }
         Ok(reviews
             .into_iter()
             .filter(|r| {
                 r.get("user")
                     .and_then(|u| u.get("login"))
                     .and_then(|l| l.as_str())
-                    .map(|l| l.to_lowercase() == slug)
+                    .map(|l| normalize_login(l) == slug)
                     .unwrap_or(false)
             })
             .collect())

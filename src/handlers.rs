@@ -10,7 +10,6 @@ pub struct CommentContext {
     pub pr_number: i64,
     pub commenter: String,
     pub pr_author: String,
-    pub app_slug: String,
     pub installation_id: i64,
 }
 
@@ -443,14 +442,27 @@ async fn handle_reject(gh: &Client, _cfg: &Config, ctx: &CommentContext) -> Stri
             return format!("error: {e}");
         }
     };
-    let slug = gh.app_slug.to_lowercase();
+    // A review authored by this App has login `slug[bot]`; comparing that to a
+    // bare slug never matched, so `r-` always claimed there was nothing to
+    // withdraw — even right after a successful `r+`.
+    let slug = crate::github::normalize_login(&gh.app_slug);
+    if slug.is_empty() {
+        let _ = gh
+            .post_issue_comment(
+                &ctx.repo,
+                ctx.pr_number,
+                "⚠️ 无法确定 bot 自身身份,无法撤回审批(请检查 APP_SLUG / BOT_NAME)。",
+            )
+            .await;
+        return "no-app-slug".into();
+    }
     let mine: Vec<i64> = reviews
         .iter()
         .filter(|r| {
             r.get("user")
                 .and_then(|u| u.get("login"))
                 .and_then(|l| l.as_str())
-                .map(|l| l.to_lowercase() == slug)
+                .map(|l| crate::github::normalize_login(l) == slug)
                 .unwrap_or(false)
                 && r.get("state").and_then(|s| s.as_str()) == Some("APPROVED")
         })

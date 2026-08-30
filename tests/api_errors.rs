@@ -100,7 +100,6 @@ async fn failing_ping_still_labeled_error() {
         pr_number: 7,
         commenter: "alice".into(),
         pr_author: "bob".into(),
-        app_slug: "xero-review".into(),
         installation_id: 42,
     };
     let results = xero_bot::handlers::handle_comment(

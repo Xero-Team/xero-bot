@@ -76,7 +76,6 @@ pub enum WebhookEvent {
         comment_body: String,
         commenter: String,
         installation_id: i64,
-        app_slug: String,
         /// `comment.performed_via_github_app.id` — set when an App authored the
         /// comment. Unlike `installation.app_slug` this is genuinely present on
         /// real payloads, so it's the reliable way to recognize our own output.
@@ -129,7 +128,6 @@ pub fn classify(event_header: &str, payload: &Value) -> WebhookEvent {
                 .is_some();
             let comment_body = jstr_or(payload, &["comment", "body"], "");
             let commenter = jstr_or(payload, &["comment", "user", "login"], "");
-            let app_slug = jstr_or(payload, &["installation", "app_slug"], "");
             let pr_author = jstr_or(payload, &["issue", "user", "login"], "");
             let via_app_id = ji64(payload, &["comment", "performed_via_github_app", "id"]);
             let commenter_is_bot = jstr(payload, &["comment", "user", "type"]) == Some("Bot");
@@ -139,7 +137,6 @@ pub fn classify(event_header: &str, payload: &Value) -> WebhookEvent {
                 comment_body: comment_body.to_string(),
                 commenter: commenter.to_string(),
                 installation_id,
-                app_slug: app_slug.to_string(),
                 via_app_id,
                 commenter_is_bot,
                 pr_author: pr_author.to_string(),

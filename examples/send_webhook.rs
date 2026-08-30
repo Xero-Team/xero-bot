@@ -41,7 +41,7 @@ fn main() {
             "issue_comment",
             serde_json::json!({
                 "action": "created",
-                "installation": {"id": 1, "app_slug": bot_name},
+                "installation": {"id": 1, "node_id": "MDIzOkludGVncmF0aW9u"},
                 "repository": {"full_name": "octocat/hello-world"},
                 "issue": {
                     "number": 1,
@@ -55,7 +55,7 @@ fn main() {
             "pull_request",
             serde_json::json!({
                 "action": "synchronize",
-                "installation": {"id": 1, "app_slug": bot_name},
+                "installation": {"id": 1, "node_id": "MDIzOkludGVncmF0aW9u"},
                 "repository": {"full_name": "octocat/hello-world"},
                 "pull_request": {"number": 1}
             }),

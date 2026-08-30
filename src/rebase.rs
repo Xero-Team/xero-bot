@@ -153,12 +153,9 @@ pub async fn sweep(cfg: &Config) -> String {
         let Some(inst_id) = inst.get("id").and_then(|i| i.as_i64()) else {
             continue;
         };
-        let slug = inst
-            .get("app_slug")
-            .and_then(|s| s.as_str())
-            .unwrap_or("")
-            .to_string();
-        let Ok(gh) = crate::github::Client::installation(cfg, inst_id, &slug) else {
+        // `/app/installations` does carry app_slug, but resolve it centrally so
+        // every code path agrees on our identity.
+        let Ok(gh) = crate::github::Client::installation_resolved(cfg, inst_id).await else {
             errors += 1;
             continue;
         };
