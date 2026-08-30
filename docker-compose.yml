@@ -8,6 +8,7 @@ services:
       - XERO_DATA_DIR=/data
     volumes:
       - xero-data:/data
+      - ./xero-review-bot.pem:/keys/bot.pem:ro
     restart: unless-stopped
 
 volumes:
