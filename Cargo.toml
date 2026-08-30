@@ -21,6 +21,10 @@ regex = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 base64 = "0.22"
+# Already in the tree at 2.3.2 via octocrab -> url, so this adds nothing to the
+# dependency graph or the build. octocrab does not re-export it, so a direct
+# dependency is the only way to reach it.
+percent-encoding = "2"
 futures = "0.3"
 thiserror = "2"
 http = "1"

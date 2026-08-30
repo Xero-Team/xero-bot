@@ -39,6 +39,56 @@ fn classify_octo_error(e: octocrab::Error) -> GhError {
     GhError::Http(e)
 }
 
+/// RFC 3986 unreserved set — everything else in a path gets percent-encoded.
+/// Deliberately a deny-by-default set: an allow-list of "characters that seem
+/// fine" is how escaping code gets it wrong, and this crate already carries one
+/// hand-rolled encoder (`agent.rs::urlencode`, kept because GitHub's search
+/// syntax needs `+`/`:`/`"` to survive).
+const UNRESERVED: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'_')
+    .remove(b'.')
+    .remove(b'~');
+
+/// Same, but `/` survives as the path separator.
+const UNRESERVED_PATH: &percent_encoding::AsciiSet = &UNRESERVED.remove(b'/');
+
+/// Percent-encode one path segment. `/` is encoded too, so a label named
+/// `needs/rebase` addresses one segment instead of splitting into two.
+fn enc_seg(s: &str) -> String {
+    percent_encoding::utf8_percent_encode(s, UNRESERVED).to_string()
+}
+
+/// Percent-encode a repo-relative path, keeping `/` as the separator.
+///
+/// The failure this prevents is a path containing `?` ending the path early —
+/// see [`Client::get_file_content`]. Non-ASCII is a weaker case than it looks:
+/// `http::Uri` accepts high bytes, so `文档/说明.md` reached the wire as raw
+/// UTF-8 in the request line. That isn't valid HTTP and only worked because
+/// the server tolerated it; encoding makes it correct rather than lucky.
+fn enc_path(s: &str) -> String {
+    percent_encoding::utf8_percent_encode(s, UNRESERVED_PATH).to_string()
+}
+
+/// GET every page of a paginated route, on any octocrab instance.
+///
+/// `Page<Value>` deserializes both a bare JSON array and GitHub's wrapped
+/// shapes (`{"repositories": [...]}`, `{"installations": [...]}`), so one
+/// helper covers every paginated endpoint here. Errors go through
+/// [`classify_octo_error`], which the hand-rolled `crab.get` calls this
+/// replaces did not — so their 403/404 arrived as `GhError::Http` and every
+/// `Api { status }` branch downstream quietly failed to match.
+///
+/// Against wiremock there is no `Link` header, so the first response is also
+/// the last and no extra request is made.
+pub async fn paginate(crab: &Octocrab, route: &str) -> Result<Vec<Value>, GhError> {
+    let first: octocrab::Page<Value> = crab
+        .get(route, None::<&()>)
+        .await
+        .map_err(classify_octo_error)?;
+    crab.all_pages(first).await.map_err(classify_octo_error)
+}
+
 /// Normalize a GitHub login for comparison.
 ///
 /// A GitHub App authors comments and reviews as `name[bot]`, so any equality
@@ -176,6 +226,26 @@ impl Client {
             .get(route, None::<&()>)
             .await
             .map_err(classify_octo_error)
+    }
+
+    /// GET with query parameters serialized by octocrab.
+    ///
+    /// Prefer this over interpolating a value into the query of a format
+    /// string: octocrab appends the parameters *after* the route, so a value
+    /// containing `?` or `&` can no longer be read as part of the query.
+    async fn get_with<P>(&self, route: &str, params: &P) -> Result<Value, GhError>
+    where
+        P: serde::Serialize + ?Sized,
+    {
+        self.crab
+            .get(route, Some(params))
+            .await
+            .map_err(classify_octo_error)
+    }
+
+    /// GET every page of a paginated route. See [`paginate`].
+    async fn get_all(&self, route: &str) -> Result<Vec<Value>, GhError> {
+        paginate(&self.crab, route).await
     }
 
     pub async fn post(&self, route: &str, body: Option<Value>) -> Result<Value, GhError> {
@@ -316,9 +386,16 @@ impl Client {
         Ok(())
     }
 
+    /// Labels on an issue or PR.
+    ///
+    /// `per_page` was absent, so GitHub applied its default of 30 — a repo with
+    /// more labels than that on one PR would drop the rest, and `has_label`
+    /// checks would read as false. A single page of 100 is enough; nothing here
+    /// puts a hundred labels on one issue, and full pagination would cost a
+    /// request per sweep for no benefit.
     pub async fn list_labels(&self, repo: &str, issue: i64) -> Result<Vec<String>, GhError> {
         let v = self
-            .get(&format!("/repos/{repo}/issues/{issue}/labels"))
+            .get(&format!("/repos/{repo}/issues/{issue}/labels?per_page=100"))
             .await?;
         Ok(v.as_array()
             .map(|arr| {
@@ -343,9 +420,17 @@ impl Client {
         Ok(())
     }
 
+    /// Remove one label.
+    ///
+    /// The label name is a path segment and labels routinely contain spaces
+    /// (`good first issue`) — unencoded that fails the `http::Uri` parse and
+    /// surfaced in production as a bare `http error: Uri`.
     pub async fn remove_label(&self, repo: &str, issue: i64, label: &str) -> Result<(), GhError> {
-        self.delete(&format!("/repos/{repo}/issues/{issue}/labels/{label}"))
-            .await
+        self.delete(&format!(
+            "/repos/{repo}/issues/{issue}/labels/{}",
+            enc_seg(label)
+        ))
+        .await
     }
 
     pub async fn add_assignees(
@@ -376,9 +461,16 @@ impl Client {
     }
 
     /// GET /repos/{repo}/collaborators/{user}/permission → permission field.
+    ///
+    /// A valid login can't contain anything needing escaping, and the parser
+    /// validates one before building this call — the encoding is here so that
+    /// stays true by construction rather than by a caller remembering to check.
     pub async fn collaborator_permission(&self, repo: &str, user: &str) -> Result<String, GhError> {
         let v = self
-            .get(&format!("/repos/{repo}/collaborators/{user}/permission"))
+            .get(&format!(
+                "/repos/{repo}/collaborators/{}/permission",
+                enc_seg(user)
+            ))
             .await?;
         v.get("permission")
             .and_then(|p| p.as_str())
@@ -404,21 +496,25 @@ impl Client {
     }
 
     /// files changed in the PR: [{filename, status, additions, ...}]
+    ///
+    /// GitHub caps this endpoint at 3000 files regardless of pagination, so a
+    /// enormous PR is still truncated — that ceiling is theirs, not ours.
     pub async fn list_pr_files(&self, repo: &str, number: i64) -> Result<Vec<Value>, GhError> {
-        let v = self
-            .get(&format!("/repos/{repo}/pulls/{number}/files?per_page=100"))
-            .await?;
-        Ok(v.as_array().cloned().unwrap_or_default())
+        self.get_all(&format!("/repos/{repo}/pulls/{number}/files?per_page=100"))
+            .await
     }
 
     /// reviews on a PR
+    ///
+    /// Paginated in full: `own_previous_reviews` reads this to find the bot's
+    /// last review, and on a long PR that review is on a later page — stopping
+    /// at page one made `r-` answer "nothing to withdraw" and made incremental
+    /// review start from scratch.
     pub async fn list_pr_reviews(&self, repo: &str, number: i64) -> Result<Vec<Value>, GhError> {
-        let v = self
-            .get(&format!(
-                "/repos/{repo}/pulls/{number}/reviews?per_page=100"
-            ))
-            .await?;
-        Ok(v.as_array().cloned().unwrap_or_default())
+        self.get_all(&format!(
+            "/repos/{repo}/pulls/{number}/reviews?per_page=100"
+        ))
+        .await
     }
 
     /// previous reviews left by this bot (incremental review memory)
@@ -513,18 +609,36 @@ impl Client {
     }
 
     /// commits on the PR (for incremental review: what's new since last review)
+    ///
+    /// GitHub caps this endpoint at 250 commits regardless of pagination; past
+    /// that the list is theirs to truncate.
     pub async fn list_pr_commits(&self, repo: &str, number: i64) -> Result<Vec<Value>, GhError> {
-        let v = self
-            .get(&format!(
-                "/repos/{repo}/pulls/{number}/commits?per_page=100"
-            ))
-            .await?;
-        Ok(v.as_array().cloned().unwrap_or_default())
+        self.get_all(&format!(
+            "/repos/{repo}/pulls/{number}/commits?per_page=100"
+        ))
+        .await
     }
 
     // -------------------------------------------------------------------
     // Repo content (agent tools)
     // -------------------------------------------------------------------
+
+    /// Route for the contents API, with the path encoded as a path.
+    ///
+    /// `ref` is *not* in here: it goes through [`Client::get_with`] so octocrab
+    /// appends it. Interpolating it into the format string was the worse half
+    /// of the same bug — for `a?b.md` the route became
+    /// `…/contents/a?b.md?ref=main`, whose query is the single key
+    /// `b.md?ref`, so GitHub saw no `ref` at all and served the default
+    /// branch. That failure *succeeds*: the agent gets a file, just the wrong
+    /// revision of it, and nothing anywhere reports a problem.
+    fn contents_route(repo: &str, path: &str) -> String {
+        if path.is_empty() {
+            format!("/repos/{repo}/contents")
+        } else {
+            format!("/repos/{repo}/contents/{}", enc_path(path))
+        }
+    }
 
     /// file content at ref (decoded from base64), or None if it's a directory
     pub async fn get_file_content(
@@ -533,10 +647,31 @@ impl Client {
         path: &str,
         reference: &str,
     ) -> Result<Option<String>, GhError> {
-        let route = format!("/repos/{repo}/contents/{path}?ref={reference}");
-        let v = self.get(&route).await?;
+        let v = self
+            .get_with(
+                &Self::contents_route(repo, path),
+                &[("ref", reference)] as &[(&str, &str)],
+            )
+            .await?;
+        // A directory comes back as a JSON *array*, so `get("type")` is None and
+        // this fell through to `BadShape("no content")` — a plain "is it a
+        // directory?" question answered as a malformed response.
+        if v.is_array() {
+            return Ok(None);
+        }
         if v.get("type").and_then(|t| t.as_str()) == Some("dir") {
             return Ok(None);
+        }
+        // Over 1 MB, GitHub returns `content: ""` with `encoding: "none"`. That
+        // decodes to an empty string, so the file read as empty and the agent
+        // reasoned from that. Anything but base64 is a refusal, not a file.
+        let encoding = v.get("encoding").and_then(|e| e.as_str()).unwrap_or("");
+        if encoding != "base64" {
+            let size = v.get("size").and_then(|s| s.as_u64()).unwrap_or(0);
+            return Err(GhError::BadShape(format!(
+                "{path}: contents API returned encoding {encoding:?} ({size} bytes) — \
+                 too large to read inline, not empty"
+            )));
         }
         let b64 = v
             .get("content")
@@ -557,12 +692,12 @@ impl Client {
         path: &str,
         reference: &str,
     ) -> Result<Vec<Value>, GhError> {
-        let route = if path.is_empty() {
-            format!("/repos/{repo}/contents?ref={reference}")
-        } else {
-            format!("/repos/{repo}/contents/{path}?ref={reference}")
-        };
-        let v = self.get(&route).await?;
+        let v = self
+            .get_with(
+                &Self::contents_route(repo, path),
+                &[("ref", reference)] as &[(&str, &str)],
+            )
+            .await?;
         Ok(v.as_array().cloned().unwrap_or_default())
     }
 
@@ -571,45 +706,78 @@ impl Client {
     // -------------------------------------------------------------------
 
     /// open code-scanning alerts; Err(Api{403/404}) when not enabled
+    ///
+    /// Paginated in full, and the most important of the set to get right: a
+    /// truncated alert list makes the report claim a changed file has no
+    /// findings when it has some, which is worse than no report at all.
     pub async fn code_scanning_alerts(&self, repo: &str) -> Result<Vec<Value>, GhError> {
-        let v = self
-            .get(&format!(
-                "/repos/{repo}/code-scanning/alerts?state=open&per_page=100"
-            ))
-            .await?;
-        Ok(v.as_array().cloned().unwrap_or_default())
+        self.get_all(&format!(
+            "/repos/{repo}/code-scanning/alerts?state=open&per_page=100"
+        ))
+        .await
     }
 
     // -------------------------------------------------------------------
     // Installations / repositories (sweep)
     // -------------------------------------------------------------------
 
-    /// All installation repositories reachable via an installation client
-    /// (GET /installation/repositories), first page (100 repos).
+    /// Every repository reachable via an installation client.
+    ///
+    /// The response wraps its list in `{"repositories": [...]}`, which
+    /// `Page<Value>` unwraps — so an org past 100 repos no longer has its tail
+    /// silently skipped by the sweep.
     pub async fn installation_repositories_via(client: &Client) -> Result<Vec<String>, GhError> {
-        let v: Value = client
-            .crab
-            .get("/installation/repositories?per_page=100", None::<&()>)
+        let repos = client
+            .get_all("/installation/repositories?per_page=100")
             .await?;
-        Ok(v.get("repositories")
-            .and_then(|r| r.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|r| {
-                        r.get("full_name")
-                            .and_then(|f| f.as_str())
-                            .map(String::from)
-                    })
-                    .collect()
+        Ok(repos
+            .iter()
+            .filter_map(|r| {
+                r.get("full_name")
+                    .and_then(|f| f.as_str())
+                    .map(String::from)
             })
-            .unwrap_or_default())
+            .collect())
     }
 
     /// All open PRs for a repo.
     pub async fn open_prs(&self, repo: &str) -> Result<Vec<Value>, GhError> {
-        let v = self
-            .get(&format!("/repos/{repo}/pulls?state=open&per_page=100"))
-            .await?;
-        Ok(v.as_array().cloned().unwrap_or_default())
+        self.get_all(&format!("/repos/{repo}/pulls?state=open&per_page=100"))
+            .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{enc_path, enc_seg};
+
+    /// Pins the escaping set. The two functions must differ in exactly one
+    /// character — `/` — because that is the whole reason both exist.
+    #[test]
+    fn encoders_escape_everything_but_the_unreserved_set() {
+        // Unreserved characters pass through untouched (RFC 3986 §2.3).
+        for s in ["needs-rebase", "a_b", "v1.2.3", "a~b", "Zz09"] {
+            assert_eq!(enc_seg(s), s, "{s} should not be escaped");
+            assert_eq!(enc_path(s), s, "{s} should not be escaped");
+        }
+
+        // The production failure: a label with a space failed the Uri parse.
+        assert_eq!(enc_seg("good first issue"), "good%20first%20issue");
+
+        // `?` must not survive, or it ends the path and turns the rest of the
+        // route into a query string.
+        assert_eq!(enc_seg("a?b.md"), "a%3Fb.md");
+        assert_eq!(enc_path("a?b.md"), "a%3Fb.md");
+
+        // Non-ASCII is percent-encoded per UTF-8 byte.
+        assert_eq!(enc_seg("说明"), "%E8%AF%B4%E6%98%8E");
+
+        // The one difference: a segment escapes `/`, a path keeps it.
+        assert_eq!(enc_seg("docs/a.md"), "docs%2Fa.md");
+        assert_eq!(enc_path("docs/a.md"), "docs/a.md");
+
+        // Nothing an encoder does should ever be re-encodable into a different
+        // string — % itself has to be escaped for that to hold.
+        assert_eq!(enc_seg("100%"), "100%25");
     }
 }

@@ -9,7 +9,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use xero_bot::commands::parse_commands;
 use xero_bot::config::Config;
-use xero_bot::dispatch::{execute_work, route_event, Routing, Work};
+use xero_bot::dispatch::{route_event, Routing, Work};
 use xero_bot::github::Client;
 
 /// A Config pointed at nothing (API base overridden per-test via octocrab env).
@@ -98,17 +98,6 @@ fn make_payload(action: &str, body: &str, commenter: &str, pr_author: &str) -> V
         },
         "comment": {"body": body, "user": {"login": commenter, "type": "User"}}
     })
-}
-
-/// Route + execute the work synchronously against a mock.
-async fn route_and_run(cfg: &Config, event: &str, payload: &Value) -> Option<Value> {
-    match route_event(cfg, event, payload) {
-        Routing::Respond(v) => Some(v),
-        Routing::Act(work) => {
-            execute_work(cfg, work).await;
-            None
-        }
-    }
 }
 
 #[tokio::test]

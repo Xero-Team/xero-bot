@@ -152,14 +152,15 @@ pub async fn sweep(cfg: &Config) -> String {
         Err(e) => return format!("app-client-error: {e}"),
     };
 
-    // list installations
-    let installations: Vec<Value> = match app
-        .get::<Value, _, _>("/app/installations?per_page=100", None::<&()>)
-        .await
-    {
-        Ok(v) => v.as_array().cloned().unwrap_or_default(),
-        Err(e) => return format!("installations-error: {e}"),
-    };
+    // List installations. Paginated and classified via the shared helper: this
+    // call used to bypass `classify_octo_error`, so a 401 from a bad key was
+    // reported as an opaque transport error, and an App on more than 100
+    // installations swept only the first page.
+    let installations: Vec<Value> =
+        match crate::github::paginate(&app, "/app/installations?per_page=100").await {
+            Ok(v) => v,
+            Err(e) => return format!("installations-error: {e}"),
+        };
 
     let mut checked = 0usize;
     let mut flagged = 0usize;
