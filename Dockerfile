@@ -1,5 +1,8 @@
 # ---- build stage ----
-FROM rust:1-slim AS builder
+# pinned to bookworm to match the runtime stage's glibc (the floating
+# `rust:1-slim` tag now tracks Debian trixie / glibc 2.39, which fails to
+# run on bookworm with "GLIBC_2.39 not found")
+FROM rust:1-slim-bookworm AS builder
 WORKDIR /build
 # cache deps
 COPY Cargo.toml Cargo.lock ./
@@ -14,8 +17,10 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates git curl nodejs npm \
     && rm -rf /var/lib/apt/lists/*
-# optional: pi coding agent for the subprocess review engine
-RUN npm install -g @mariozechner/pi-coding-agent || echo "pi install failed (engine disabled)"
+# subprocess review engines: pi + codex CLIs (both degrade gracefully —
+# engine selection just falls through to agent/builtin if an install fails)
+RUN npm install -g @mariozechner/pi-coding-agent @openai/codex \
+    || echo "WARN: engine CLI install failed; auto engine falls back to agent/builtin"
 
 COPY --from=builder /build/target/release/server /usr/local/bin/server
 
