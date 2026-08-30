@@ -154,4 +154,92 @@ impl Client {
             })
         }
     }
+
+    // -------------------------------------------------------------------
+    // Comments / labels / assignees
+    // -------------------------------------------------------------------
+
+    pub async fn post_issue_comment(
+        &self,
+        repo: &str,
+        issue: i64,
+        body: &str,
+    ) -> Result<(), GhError> {
+        self.post(
+            &format!("/repos/{repo}/issues/{issue}/comments"),
+            Some(json!({"body": body})),
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub async fn list_labels(&self, repo: &str, issue: i64) -> Result<Vec<String>, GhError> {
+        let v = self
+            .get(&format!("/repos/{repo}/issues/{issue}/labels"))
+            .await?;
+        Ok(v.as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|l| l.get("name").and_then(|n| n.as_str()).map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
+    pub async fn add_labels(
+        &self,
+        repo: &str,
+        issue: i64,
+        labels: &[String],
+    ) -> Result<(), GhError> {
+        self.post(
+            &format!("/repos/{repo}/issues/{issue}/labels"),
+            Some(json!({ "labels": labels })),
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub async fn remove_label(&self, repo: &str, issue: i64, label: &str) -> Result<(), GhError> {
+        self.delete(&format!("/repos/{repo}/issues/{issue}/labels/{label}"))
+            .await
+    }
+
+    pub async fn add_assignees(
+        &self,
+        repo: &str,
+        issue: i64,
+        users: &[String],
+    ) -> Result<(), GhError> {
+        self.post(
+            &format!("/repos/{repo}/issues/{issue}/assignees"),
+            Some(json!({ "assignees": users })),
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub async fn remove_assignees(
+        &self,
+        repo: &str,
+        issue: i64,
+        users: &[String],
+    ) -> Result<(), GhError> {
+        self.delete_with_body(
+            &format!("/repos/{repo}/issues/{issue}/assignees"),
+            json!({ "assignees": users }),
+        )
+        .await
+    }
+
+    /// GET /repos/{repo}/collaborators/{user}/permission → permission field.
+    pub async fn collaborator_permission(&self, repo: &str, user: &str) -> Result<String, GhError> {
+        let v = self
+            .get(&format!("/repos/{repo}/collaborators/{user}/permission"))
+            .await?;
+        v.get("permission")
+            .and_then(|p| p.as_str())
+            .map(String::from)
+            .ok_or_else(|| GhError::BadShape("no permission field".into()))
+    }
 }
