@@ -13,7 +13,12 @@ Features:
 
 ## Command reference
 
-Issued in comments (case-insensitive; one comment may contain several commands; content inside code blocks is ignored):
+Issued in comments (case-insensitive; one comment may contain several commands; content inside code blocks is ignored).
+
+Most commands work in issues as well as pull requests — GitHub serves labels, assignees and
+comments from the same API for both. The four that need a PR are `review`, `codeql`, `r+` and
+`r-`; used in an issue they say so rather than failing silently. In an issue `r? @user` is an
+assignment, since an issue has no reviewers.
 
 | Command | Description |
 |---|---|

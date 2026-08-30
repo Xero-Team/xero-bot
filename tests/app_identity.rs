@@ -90,7 +90,11 @@ async fn own_previous_reviews_matches_bot_suffixed_author() {
         .await
         .expect("listing reviews");
 
-    assert_eq!(mine.len(), 1, "must find the bot's own review, got {mine:?}");
+    assert_eq!(
+        mine.len(),
+        1,
+        "must find the bot's own review, got {mine:?}"
+    );
     assert_eq!(mine[0].get("id").and_then(|i| i.as_i64()), Some(2));
 }
 
@@ -108,7 +112,10 @@ async fn own_previous_reviews_with_empty_slug_matches_nothing() {
 
     let gh = client_for(&server, "");
     let mine = gh.own_previous_reviews("octocat/hello", 7).await.unwrap();
-    assert!(mine.is_empty(), "empty slug must match nothing, got {mine:?}");
+    assert!(
+        mine.is_empty(),
+        "empty slug must match nothing, got {mine:?}"
+    );
 }
 
 /// `r-` must find and dismiss the approval the bot posted for `r+`. Before the
@@ -145,6 +152,7 @@ async fn reject_dismisses_bot_approval() {
         commenter: "alice".into(),
         pr_author: "bob".into(),
         installation_id: 42,
+        is_pr: true,
         lang: xero_bot::lang::Lang::Zh,
     };
     let results = xero_bot::handlers::handle_comment(
@@ -155,7 +163,11 @@ async fn reject_dismisses_bot_approval() {
         vec![],
     )
     .await;
-    assert_eq!(results, vec!["ok"], "r- must dismiss, not report nothing found");
+    assert_eq!(
+        results,
+        vec!["ok"],
+        "r- must dismiss, not report nothing found"
+    );
     // wiremock verifies .expect(1) on drop
 }
 

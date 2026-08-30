@@ -139,6 +139,7 @@ async fn test_ping_comment_replies_pong() {
         commenter: "alice".into(),
         pr_author: "bob".into(),
         installation_id: 42,
+        is_pr: true,
         lang: xero_bot::lang::Lang::Zh,
     };
     let results = xero_bot::handlers::handle_comment(
@@ -191,6 +192,7 @@ async fn test_ready_label_flow_with_mock() {
         commenter: "alice".into(),
         pr_author: "bob".into(),
         installation_id: 42,
+        is_pr: true,
         lang: xero_bot::lang::Lang::Zh,
     };
     let results = xero_bot::handlers::handle_comment(
@@ -240,6 +242,7 @@ async fn test_r_plus_permission_denied() {
         commenter: "alice".into(),
         pr_author: "bob".into(),
         installation_id: 42,
+        is_pr: true,
         lang: xero_bot::lang::Lang::Zh,
     };
     let results = xero_bot::handlers::handle_comment(
@@ -294,6 +297,7 @@ async fn test_r_plus_approves_with_write() {
         commenter: "alice".into(),
         pr_author: "bob".into(),
         installation_id: 42,
+        is_pr: true,
         lang: xero_bot::lang::Lang::Zh,
     };
     let results = xero_bot::handlers::handle_comment(
@@ -441,6 +445,7 @@ async fn test_diagnostics_are_posted_once() {
         commenter: "alice".into(),
         pr_author: "bob".into(),
         installation_id: 42,
+        is_pr: true,
         lang: xero_bot::lang::Lang::Zh,
     };
     let results = xero_bot::handlers::handle_comment(
@@ -486,6 +491,7 @@ async fn test_no_diagnostics_means_no_comment() {
         commenter: "alice".into(),
         pr_author: "bob".into(),
         installation_id: 42,
+        is_pr: true,
         lang: xero_bot::lang::Lang::Zh,
     };
     let results = xero_bot::handlers::handle_comment(&gh, &cfg, &ctx, vec![], vec![]).await;
@@ -548,6 +554,7 @@ async fn claim_reply_body(
         commenter: "alice".into(),
         pr_author: "bob".into(),
         installation_id: 42,
+        is_pr: true,
         lang,
     };
     let results = xero_bot::handlers::handle_comment(
@@ -627,6 +634,196 @@ async fn test_commits_error_still_replies_in_english() {
     assert_eq!(
         xero_bot::lang::for_pr(&gh, "octocat/hello", 7, Some(xero_bot::lang::Lang::Zh)).await,
         xero_bot::lang::Lang::Zh
+    );
+}
+
+/// `claim` in an issue does exactly what it does in a PR — same endpoints.
+#[tokio::test]
+async fn test_claim_works_on_an_issue() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/repos/octocat/hello/issues/7/assignees"))
+        .respond_with(
+            ResponseTemplate::new(201).set_body_json(json!({"assignees": [{"login": "alice"}]})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/repos/octocat/hello/issues/7/comments"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({"id": 1})))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let crab = octocrab::OctocrabBuilder::new()
+        .personal_token("ghp_test")
+        .base_uri(server.uri())
+        .unwrap()
+        .build()
+        .unwrap();
+    let gh = Client {
+        crab,
+        app_slug: "xero-review".into(),
+    };
+    let cfg = test_cfg();
+    let ctx = xero_bot::handlers::CommentContext {
+        repo: "octocat/hello".into(),
+        pr_number: 7,
+        commenter: "alice".into(),
+        pr_author: "bob".into(),
+        installation_id: 42,
+        is_pr: false,
+        lang: xero_bot::lang::Lang::En,
+    };
+    let results = xero_bot::handlers::handle_comment(
+        &gh,
+        &cfg,
+        &ctx,
+        vec![xero_bot::commands::Command::Claim],
+        vec![],
+    )
+    .await;
+    assert_eq!(results, vec!["ok"]);
+}
+
+/// A PR-only command in an issue says so, in one comment, and touches nothing
+/// else. Before this it was dropped at the dispatch layer with no reply at all.
+#[tokio::test]
+async fn test_pr_only_commands_on_an_issue_explain_themselves() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/repos/octocat/hello/issues/7/comments"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({"id": 1})))
+        .expect(4)
+        .mount(&server)
+        .await;
+
+    let crab = octocrab::OctocrabBuilder::new()
+        .personal_token("ghp_test")
+        .base_uri(server.uri())
+        .unwrap()
+        .build()
+        .unwrap();
+    let gh = Client {
+        crab,
+        app_slug: "xero-review".into(),
+    };
+    let cfg = test_cfg();
+    let ctx = xero_bot::handlers::CommentContext {
+        repo: "octocat/hello".into(),
+        pr_number: 7,
+        commenter: "alice".into(),
+        pr_author: "bob".into(),
+        installation_id: 42,
+        is_pr: false,
+        lang: xero_bot::lang::Lang::En,
+    };
+    let results = xero_bot::handlers::handle_comment(
+        &gh,
+        &cfg,
+        &ctx,
+        vec![
+            xero_bot::commands::Command::Review,
+            xero_bot::commands::Command::Codeql,
+            xero_bot::commands::Command::Approve { on_behalf_of: None },
+            xero_bot::commands::Command::Reject,
+        ],
+        vec![],
+    )
+    .await;
+    assert_eq!(results, vec!["not-a-pr"; 4]);
+
+    // Each names the command the user actually typed, and no `/pulls/` or
+    // permission endpoint was touched on the way — the gate is before the work.
+    let requests = server.received_requests().await.unwrap();
+    let bodies: Vec<String> = requests
+        .iter()
+        .map(|r| {
+            assert!(
+                r.url.path().starts_with("/repos/octocat/hello/issues/"),
+                "unexpected request to {}",
+                r.url.path()
+            );
+            serde_json::from_slice::<Value>(&r.body).unwrap()["body"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect();
+    for verb in ["`review`", "`codeql`", "`r+`", "`r-`"] {
+        assert!(
+            bodies.iter().any(|b| b.contains(verb)),
+            "no reply mentioned {verb}: {bodies:?}"
+        );
+    }
+}
+
+/// `r? @user` degrades honestly: an issue has no reviewers, so the reply says
+/// assignment rather than claiming a review was requested.
+#[tokio::test]
+async fn test_review_request_on_an_issue_is_called_an_assignment() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/repos/octocat/hello/issues/7/assignees"))
+        .respond_with(
+            ResponseTemplate::new(201).set_body_json(json!({"assignees": [{"login": "carol"}]})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/repos/octocat/hello/issues/7/comments"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({"id": 1})))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let crab = octocrab::OctocrabBuilder::new()
+        .personal_token("ghp_test")
+        .base_uri(server.uri())
+        .unwrap()
+        .build()
+        .unwrap();
+    let gh = Client {
+        crab,
+        app_slug: "xero-review".into(),
+    };
+    let cfg = test_cfg();
+    let ctx = xero_bot::handlers::CommentContext {
+        repo: "octocat/hello".into(),
+        pr_number: 7,
+        commenter: "alice".into(),
+        pr_author: "bob".into(),
+        installation_id: 42,
+        is_pr: false,
+        lang: xero_bot::lang::Lang::En,
+    };
+    let results = xero_bot::handlers::handle_comment(
+        &gh,
+        &cfg,
+        &ctx,
+        vec![xero_bot::commands::Command::RequestReview {
+            user: "carol".into(),
+        }],
+        vec![],
+    )
+    .await;
+    assert_eq!(results, vec!["ok"]);
+
+    let requests = server.received_requests().await.unwrap();
+    let posted = requests
+        .iter()
+        .find(|r| r.url.path().ends_with("/comments"))
+        .expect("a reply should have been posted");
+    let body = serde_json::from_slice::<Value>(&posted.body).unwrap()["body"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(body.contains("@carol"), "{body}");
+    assert!(
+        !body.contains("as reviewer") && body.contains("assignment"),
+        "the reply must not claim a reviewer was set: {body}"
     );
 }
 

@@ -79,6 +79,37 @@ pub enum Command {
     Codeql,
 }
 
+impl Command {
+    /// Whether this command is meaningless outside a pull request.
+    ///
+    /// GitHub's issues and PRs share the issues API, so labels, assignees and
+    /// comments work identically on both — only the four commands that reach a
+    /// `/pulls/` endpoint or a diff genuinely need a PR. Deciding it here rather
+    /// than at the dispatch site keeps the list next to the enum it describes,
+    /// so a new command has to answer the question to compile.
+    pub fn requires_pr(&self) -> bool {
+        match self {
+            // reads the diff
+            Command::Review => true,
+            // maps code-scanning alerts onto the PR's changed files
+            Command::Codeql => true,
+            // submit / dismiss a pull request review
+            Command::Approve { .. } | Command::Reject => true,
+            Command::Ping
+            | Command::Help
+            | Command::RequestReview { .. }
+            | Command::Cc { .. }
+            | Command::Ready
+            | Command::Author
+            | Command::Blocked
+            | Command::Label { .. }
+            | Command::Assign { .. }
+            | Command::Claim
+            | Command::Unclaim => false,
+        }
+    }
+}
+
 /// Commands, plus any complaints about what couldn't be understood.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ParseOutput {
@@ -118,7 +149,10 @@ mod tests {
 
     #[test]
     fn test_review_command() {
-        assert_eq!(cmds("xero-review", "@xero-review review"), vec![Command::Review]);
+        assert_eq!(
+            cmds("xero-review", "@xero-review review"),
+            vec![Command::Review]
+        );
     }
 
     #[test]
@@ -131,13 +165,22 @@ mod tests {
 
     #[test]
     fn test_bot_suffix() {
-        assert_eq!(cmds("xero-review", "@xero-review[bot] ping"), vec![Command::Ping]);
+        assert_eq!(
+            cmds("xero-review", "@xero-review[bot] ping"),
+            vec![Command::Ping]
+        );
     }
 
     #[test]
     fn test_ping_help() {
-        assert_eq!(cmds("xero-review", "@xero-review ping"), vec![Command::Ping]);
-        assert_eq!(cmds("xero-review", "@xero-review help"), vec![Command::Help]);
+        assert_eq!(
+            cmds("xero-review", "@xero-review ping"),
+            vec![Command::Ping]
+        );
+        assert_eq!(
+            cmds("xero-review", "@xero-review help"),
+            vec![Command::Help]
+        );
     }
 
     #[test]
@@ -197,8 +240,14 @@ mod tests {
                 user: "octocat".into()
             }]
         );
-        assert_eq!(cmds("xero-review", "@xero-review claim"), vec![Command::Claim]);
-        assert_eq!(cmds("xero-review", "@xero-review unclaim"), vec![Command::Unclaim]);
+        assert_eq!(
+            cmds("xero-review", "@xero-review claim"),
+            vec![Command::Claim]
+        );
+        assert_eq!(
+            cmds("xero-review", "@xero-review unclaim"),
+            vec![Command::Unclaim]
+        );
         assert_eq!(
             cmds("xero-review", "@xero-review release-assignment"),
             vec![Command::Unclaim]
@@ -217,12 +266,18 @@ mod tests {
                 on_behalf_of: Some("octocat".into())
             }]
         );
-        assert_eq!(cmds("xero-review", "@xero-review r-"), vec![Command::Reject]);
+        assert_eq!(
+            cmds("xero-review", "@xero-review r-"),
+            vec![Command::Reject]
+        );
     }
 
     #[test]
     fn test_codeql() {
-        assert_eq!(cmds("xero-review", "@xero-review codeql"), vec![Command::Codeql]);
+        assert_eq!(
+            cmds("xero-review", "@xero-review codeql"),
+            vec![Command::Codeql]
+        );
     }
 
     #[test]
@@ -247,7 +302,10 @@ mod tests {
     #[test]
     fn args_bounded_to_line() {
         assert_eq!(
-            cmds("bot", "@bot cc @alice\nsomething about @bob and @carol later"),
+            cmds(
+                "bot",
+                "@bot cc @alice\nsomething about @bob and @carol later"
+            ),
             vec![Command::Cc {
                 users: vec!["alice".into()]
             }]
@@ -579,11 +637,9 @@ mod tests {
     #[test]
     fn mention_in_a_sentence_acts_but_stays_quiet() {
         assert_eq!(cmds("bot", "please cc @bot review"), vec![Command::Review]);
-        assert!(
-            parse_commands("bot", "please ask @bot about this")
-                .diagnostics
-                .is_empty()
-        );
+        assert!(parse_commands("bot", "please ask @bot about this")
+            .diagnostics
+            .is_empty());
     }
 
     /// A list bullet doesn't stop a line from being addressed to the bot.
@@ -603,14 +659,17 @@ mod tests {
     /// the user clearly meant to command the bot.
     #[test]
     fn missing_argument_is_named() {
-        for (text, verb) in [("@bot assign", "assign"), ("@bot label", "label"), ("@bot cc", "cc")]
-        {
+        for (text, verb) in [
+            ("@bot assign", "assign"),
+            ("@bot label", "label"),
+            ("@bot cc", "cc"),
+        ] {
             let out = parse_commands("bot", text);
             assert!(out.commands.is_empty(), "{text} should run nothing");
             assert!(
-                out.diagnostics
-                    .iter()
-                    .any(|d| matches!(d, Diagnostic::MissingArgument { verb: v, .. } if *v == verb)),
+                out.diagnostics.iter().any(
+                    |d| matches!(d, Diagnostic::MissingArgument { verb: v, .. } if *v == verb)
+                ),
                 "expected MissingArgument({verb}) for {text:?}, got {:?}",
                 out.diagnostics
             );
@@ -628,6 +687,52 @@ mod tests {
             "{:?}",
             out.diagnostics
         );
+    }
+
+    /// Only the four commands that reach a `/pulls/` endpoint or read a diff
+    /// need a pull request. Spelled out as a list rather than derived, so this
+    /// fails if `requires_pr` is widened without a decision being made.
+    #[test]
+    fn only_four_commands_need_a_pull_request() {
+        let pr_only = [
+            Command::Review,
+            Command::Codeql,
+            Command::Approve { on_behalf_of: None },
+            Command::Approve {
+                on_behalf_of: Some("alice".into()),
+            },
+            Command::Reject,
+        ];
+        for c in &pr_only {
+            assert!(c.requires_pr(), "{c:?} should be PR-only");
+        }
+        let issue_ok = [
+            Command::Ping,
+            Command::Help,
+            Command::RequestReview {
+                user: "alice".into(),
+            },
+            Command::Cc {
+                users: vec!["alice".into()],
+            },
+            Command::Ready,
+            Command::Author,
+            Command::Blocked,
+            Command::Label {
+                add: vec!["bug".into()],
+                remove: vec![],
+            },
+            Command::Assign {
+                user: "alice".into(),
+            },
+            Command::Claim,
+            Command::Unclaim,
+        ];
+        for c in &issue_ok {
+            assert!(!c.requires_pr(), "{c:?} works on an issue");
+        }
+        // and every variant is accounted for above
+        assert_eq!(pr_only.len() - 1 + issue_ok.len(), 15);
     }
 
     /// The input that started all of this. The help table lists every command,

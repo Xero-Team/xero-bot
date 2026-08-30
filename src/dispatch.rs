@@ -78,9 +78,13 @@ pub fn route_event(cfg: &Config, event_header: &str, payload: &Value) -> Routing
             if parsed.commands.is_empty() && diagnostics.is_empty() {
                 return Routing::Respond(serde_json::json!({"ignored": "no command"}));
             }
-            if !is_pr {
-                // commands other than review/label work on issues too; keep it
-                // simple and require a PR (matching the Python bot)
+            // Issues used to be rejected wholesale, which is how `@bot claim`
+            // in an issue came back as `{"ignored":"not a PR"}` — the comment
+            // right here said labels and assignees work on issues too, and
+            // they do: GitHub serves both from the issues API. Only turn the
+            // delivery away when there is nothing on it that an issue can do;
+            // otherwise dispatch, and let each command answer for itself.
+            if !is_pr && diagnostics.is_empty() && parsed.commands.iter().all(|c| c.requires_pr()) {
                 return Routing::Respond(serde_json::json!({"ignored": "not a PR"}));
             }
 
@@ -90,6 +94,7 @@ pub fn route_event(cfg: &Config, event_header: &str, payload: &Value) -> Routing
                 installation_id,
                 commenter,
                 pr_author,
+                is_pr,
                 commands: parsed.commands,
                 diagnostics,
                 comment_lang,
@@ -141,6 +146,10 @@ pub enum Work {
         installation_id: i64,
         commenter: String,
         pr_author: String,
+        /// False for an issue. `pr_number` is the issue number either way —
+        /// GitHub numbers them from one sequence and serves both from the
+        /// issues API.
+        is_pr: bool,
         commands: Vec<crate::commands::Command>,
         /// What couldn't be understood; may be non-empty even when `commands`
         /// is empty. Carried unrendered because the wording depends on a
@@ -179,6 +188,7 @@ async fn execute_work_inner(cfg: &Config, work: Work) -> Result<(), String> {
             installation_id,
             commenter,
             pr_author,
+            is_pr,
             commands,
             diagnostics,
             comment_lang,
@@ -186,13 +196,20 @@ async fn execute_work_inner(cfg: &Config, work: Work) -> Result<(), String> {
             let gh = Client::installation_resolved(cfg, installation_id)
                 .await
                 .map_err(|e| format!("installation client: {e}"))?;
-            let lang = crate::lang::for_pr(&gh, &repo, pr_number, comment_lang).await;
+            // An issue has no commits, and asking for them is a guaranteed 404
+            // per comment, so the comment is the only signal there is.
+            let lang = if is_pr {
+                crate::lang::for_pr(&gh, &repo, pr_number, comment_lang).await
+            } else {
+                comment_lang.unwrap_or_default()
+            };
             let ctx = CommentContext {
                 repo: repo.clone(),
                 pr_number,
                 commenter,
                 pr_author,
                 installation_id,
+                is_pr,
                 lang,
             };
             // Rendered here, not at routing time: `handle_comment` takes plain
@@ -253,12 +270,20 @@ mod tests {
         })
     }
 
+    /// The same, on an issue: GitHub omits `issue.pull_request` entirely.
+    fn issue_payload(body: &str) -> serde_json::Value {
+        json!({
+            "action": "created",
+            "installation": {"id": 42},
+            "repository": {"full_name": "Xero-Team/xero-bot"},
+            "issue": {"number": 1, "user": {"login": "alice"}},
+            "comment": {"body": body, "user": {"login": "bob", "type": "User"}}
+        })
+    }
+
     fn ignored_reason(r: &Routing) -> Option<String> {
         match r {
-            Routing::Respond(v) => v
-                .get("ignored")
-                .and_then(|s| s.as_str())
-                .map(String::from),
+            Routing::Respond(v) => v.get("ignored").and_then(|s| s.as_str()).map(String::from),
             Routing::Act(_) => None,
         }
     }
@@ -351,6 +376,98 @@ mod tests {
                 "for {body:?}"
             );
         }
+    }
+
+    /// Reported by a user: `@bot claim` in an issue came back
+    /// `{"ignored":"not a PR"}`. Labels, assignees and comments are the issues
+    /// API — the same endpoints either way — so these belong on an issue.
+    #[test]
+    fn issue_commands_are_dispatched() {
+        for body in [
+            "@xero-team-bot claim",
+            "@xero-team-bot unclaim",
+            "@xero-team-bot assign @alice",
+            "@xero-team-bot label +bug -wip",
+            "@xero-team-bot cc @alice",
+            "@xero-team-bot ready",
+            "@xero-team-bot author",
+            "@xero-team-bot blocked",
+            "@xero-team-bot ping",
+            "@xero-team-bot help",
+            "r? @alice",
+            "?r @alice",
+        ] {
+            let r = route_event(&cfg(), "issue_comment", &issue_payload(body));
+            match r {
+                Routing::Act(Work::Comment { is_pr, .. }) => {
+                    assert!(!is_pr, "the handler must know it's an issue: {body}")
+                }
+                other => panic!("expected Act(Comment) for {body:?}, got {other:?}"),
+            }
+        }
+    }
+
+    /// A comment with nothing an issue can do is still turned away at the door,
+    /// so no installation token is minted to say so.
+    #[test]
+    fn pr_only_commands_on_an_issue_are_still_refused() {
+        for body in [
+            "@xero-team-bot review",
+            "@xero-team-bot codeql",
+            "@xero-team-bot r+",
+            "@xero-team-bot r-",
+            "@xero-team-bot review; codeql",
+        ] {
+            let r = route_event(&cfg(), "issue_comment", &issue_payload(body));
+            assert_eq!(
+                ignored_reason(&r).as_deref(),
+                Some("not a PR"),
+                "for {body:?}"
+            );
+        }
+    }
+
+    /// One runnable command carries the delivery; the PR-only ones then get
+    /// their own reply from the handler rather than taking the rest down.
+    #[test]
+    fn mixed_commands_on_an_issue_are_dispatched() {
+        let r = route_event(
+            &cfg(),
+            "issue_comment",
+            &issue_payload("@xero-team-bot claim; review"),
+        );
+        match r {
+            Routing::Act(Work::Comment { commands, .. }) => assert_eq!(commands.len(), 2),
+            other => panic!("expected Act(Comment), got {other:?}"),
+        }
+    }
+
+    /// A typo in an issue deserves the same answer as a typo in a PR — the
+    /// diagnostic needs no PR to be worth posting.
+    #[test]
+    fn diagnostics_alone_are_dispatched_on_an_issue() {
+        let r = route_event(
+            &cfg(),
+            "issue_comment",
+            &issue_payload("@xero-team-bot reviwe"),
+        );
+        match r {
+            Routing::Act(Work::Comment { diagnostics, .. }) => {
+                assert_eq!(diagnostics.len(), 1, "{diagnostics:?}")
+            }
+            other => panic!("expected Act(Comment), got {other:?}"),
+        }
+    }
+
+    /// Prose is still dropped, PR or issue.
+    #[test]
+    fn prose_in_an_issue_is_ignored() {
+        let r = route_event(
+            &cfg(),
+            "issue_comment",
+            &issue_payload("@xero-team-bot 谢谢!"),
+        );
+        assert_eq!(ignored_reason(&r).as_deref(), Some("no command"));
     }
 
     /// Bodies that used to panic the parser mid-codepoint must route cleanly.

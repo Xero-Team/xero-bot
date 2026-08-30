@@ -18,6 +18,10 @@ pub struct CommentContext {
     pub commenter: String,
     pub pr_author: String,
     pub installation_id: i64,
+    /// False when this is an issue rather than a pull request. Most commands
+    /// don't care — issues and PRs share the issues API — but the four that
+    /// reach a `/pulls/` endpoint have to say so instead of failing obscurely.
+    pub is_pr: bool,
     /// Which language to answer in, decided from the PR's commits.
     pub lang: Lang,
 }
@@ -121,6 +125,35 @@ pub async fn handle_comment(
 
 async fn handle_one(gh: &Client, cfg: &Config, ctx: &CommentContext, cmd: Command) -> String {
     let lang = ctx.lang;
+
+    // One gate for all four PR-only commands, where `review` used to have the
+    // only ad-hoc check — and that check could never fire, because the context
+    // flag it read was hardcoded `true`. Saying so is the point: the dispatch
+    // layer used to drop the whole delivery, so the comment got no answer.
+    if !ctx.is_pr && cmd.requires_pr() {
+        let verb = match &cmd {
+            Command::Review => "review",
+            Command::Codeql => "codeql",
+            Command::Approve { .. } => "r+",
+            Command::Reject => "r-",
+            // `requires_pr` is exhaustive over the enum, so reaching here means
+            // it and this list have drifted apart.
+            other => unreachable!("{other:?} is PR-only but unnamed here"),
+        };
+        let _ = gh
+            .post_issue_comment(
+                &ctx.repo,
+                ctx.pr_number,
+                &t!(
+                    lang,
+                    "⚠️ `{verb}` only works on a pull request.",
+                    "⚠️ `{verb}` 命令只在 PR 上有效。"
+                ),
+            )
+            .await;
+        return "not-a-pr".into();
+    }
+
     match cmd {
         Command::Ping => labeled(
             "ping reply",
@@ -133,19 +166,6 @@ async fn handle_one(gh: &Client, cfg: &Config, ctx: &CommentContext, cmd: Comman
                 .await,
         ),
         Command::Review => {
-            if !ctx_is_pr(ctx) {
-                let _ = gh
-                    .post_issue_comment(
-                        &ctx.repo,
-                        ctx.pr_number,
-                        lang.pick(
-                            "⚠️ `review` only works on a pull request.",
-                            "⚠️ review 命令只在 PR 上有效。",
-                        ),
-                    )
-                    .await;
-                return "not-a-pr".into();
-            }
             if !cfg.ai_ready() && cfg.review_engine == "builtin" {
                 let _ = gh
                     .post_issue_comment(
@@ -164,7 +184,8 @@ async fn handle_one(gh: &Client, cfg: &Config, ctx: &CommentContext, cmd: Comman
                 .installation_token(cfg, ctx.installation_id)
                 .await
                 .unwrap_or_default();
-            crate::engines_subproc::run_review(gh, cfg, &ctx.repo, ctx.pr_number, &token, lang).await
+            crate::engines_subproc::run_review(gh, cfg, &ctx.repo, ctx.pr_number, &token, lang)
+                .await
         }
         Command::Codeql => {
             crate::codeql::run_codeql_report(gh, cfg, &ctx.repo, ctx.pr_number, lang).await
@@ -176,25 +197,30 @@ async fn handle_one(gh: &Client, cfg: &Config, ctx: &CommentContext, cmd: Comman
                 .await
             {
                 Ok(()) => {
-                    let _ = gh
-                        .post_issue_comment(
-                            &ctx.repo,
-                            ctx.pr_number,
-                            &t!(
-                                lang,
-                                "Assigned @{user} as reviewer — please take a look 🙏",
-                                "已指派 @{user} 为 reviewer,请审查 🙏"
-                            ),
+                    // An issue has no reviewers, so on one this is an
+                    // assignment and the reply must not call it anything else.
+                    let msg = if ctx.is_pr {
+                        t!(
+                            lang,
+                            "Assigned @{user} as reviewer — please take a look 🙏",
+                            "已指派 @{user} 为 reviewer,请审查 🙏"
                         )
-                        .await;
+                    } else {
+                        t!(
+                            lang,
+                            "Assigned @{user} — an issue has no reviewers, so this is an assignment 🙏",
+                            "已指派 @{user} —— issue 没有 reviewer,这里只是指派 🙏"
+                        )
+                    };
+                    let _ = gh.post_issue_comment(&ctx.repo, ctx.pr_number, &msg).await;
                     "ok".into()
                 }
                 Err(e) => {
                     let msg = match &e {
                         GhError::Api { status, .. } if *status == 403 || *status == 422 => t!(
                             lang,
-                            "⚠️ Cannot assign @{user}: they need write access to the repo, or org membership, or a prior comment on this PR.",
-                            "⚠️ 无法指派 @{user}:用户需要有仓库写权限、或是组织成员、或曾在该 PR 留言。"
+                            "⚠️ Cannot assign @{user}: they need write access to the repo, or org membership, or a prior comment here.",
+                            "⚠️ 无法指派 @{user}:用户需要有仓库写权限、或是组织成员、或曾在此留言。"
                         ),
                         _ => t!(lang, "⚠️ Assignment failed: `{e}`", "⚠️ 指派失败: `{e}`"),
                     };
@@ -399,12 +425,6 @@ async fn handle_one(gh: &Client, cfg: &Config, ctx: &CommentContext, cmd: Comman
         Command::Approve { on_behalf_of } => handle_approve(gh, cfg, ctx, on_behalf_of).await,
         Command::Reject => handle_reject(gh, cfg, ctx).await,
     }
-}
-
-fn ctx_is_pr(_ctx: &CommentContext) -> bool {
-    // classify() only produces PrComment for issues with a pull_request
-    // pointer; issue comments are filtered earlier. Always true here.
-    true
 }
 
 /// ready/author/blocked: add one status label, remove its siblings.
