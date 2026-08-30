@@ -28,6 +28,15 @@ struct AppState {
 
 #[tokio::main]
 async fn main() {
+    // initialize tracing so background-work errors actually show in logs
+    // (without this, tracing::error!/info! calls are silently dropped)
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "info,xero_bot=debug".into()),
+        )
+        .init();
+
     load_dotenv(".env");
     let cfg = Config::from_env();
     if let Err(e) = cfg.validate() {

@@ -11,6 +11,14 @@ use xero_bot::config::{load_dotenv, Config};
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
+    // initialize tracing so sweep errors show in function logs
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "info,xero_bot=debug".into()),
+        )
+        .with_ansi(false)
+        .try_init();
     run(service_fn(handler)).await
 }
 
