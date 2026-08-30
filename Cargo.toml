@@ -34,3 +34,13 @@ bytes = "1"
 [[bin]]
 name = "server"
 path = "src/main.rs"
+
+[dependencies.vercel_runtime]
+version = "2.4"
+features = ["axum"]
+
+# vendored vercel_runtime 2.4.0: upstream compiles on unix only (std::env
+# imported under #[cfg(unix)] but env::var used unconditionally). One-line
+# fix; behaviour otherwise identical. See vendor/vercel_runtime/src/lib.rs.
+[patch.crates-io]
+vercel_runtime = { path = "vendor/vercel_runtime" }
