@@ -47,7 +47,7 @@ Selected via `REVIEW_ENGINE`:
 | `agent` (default) | tool-calling loop, tools = GitHub API (list/read/search code); explores the project before reviewing | Injects the previous bot review on this PR + the list of newer commits | Vercel + self-hosted |
 | `builtin` | single HTTP call (OpenAI chat/responses/Anthropic formats) | Same (context injection) | Vercel + self-hosted |
 | `pi` | subprocess `pi -p --session-dir`, read-only toolset | **Session continuity**: per-repo session files remember project understanding | Self-hosted only (preinstalled in Docker) |
-| `codex` | subprocess `codex exec --sandbox read-only -o` | Same (`codex exec resume`) | Self-hosted only |
+| `codex` | subprocess `codex exec --sandbox read-only -o` | Same (`codex exec resume`) | Self-hosted only (preinstalled in Docker) |
 | `auto` | probes in order: pi → codex → agent → builtin | - | - |
 
 `agent` automatically falls back to `builtin` on timeout/failure. All engines share the same publishing pipeline: risk-tiered summary table + inline comments on added lines + a publishing fallback chain (with inline → without inline → plain comment).
@@ -60,7 +60,7 @@ Both modes run the exact same code — the difference is only in how you operate
 |---|---|---|
 | Maintenance | zero ops | you own the host |
 | Time limit per invocation | 300 s (Hobby) / 800 s (Pro) | none |
-| `pi` / `codex` engines | unavailable | `pi` preinstalled, `codex` manual |
+| `pi` / `codex` engines | unavailable | both preinstalled |
 | Scheduled sweep | Vercel Cron (daily, managed) | built-in sweep loop (default 6h) |
 | Webhook path | `/api/webhook` | `/webhook` |
 | Private key | `PRIVATE_KEY_B64` | `PRIVATE_KEY_PATH` or `PRIVATE_KEY_B64` |
@@ -117,33 +117,45 @@ Then: **generate a private key** (downloads a `.pem` file), note the numeric **A
 
 1. **Prepare the config**:
    ```bash
-   cp .env.example .env   # fill in everything
+   cp .env.example .env
    ```
-   For the private key, either:
-   - set `PRIVATE_KEY_B64` in `.env` (base64 of the `.pem` — works everywhere, nothing to mount), **or**
-   - mount the key file and point `PRIVATE_KEY_PATH` at the in-container path — add to `docker-compose.yml`:
-     ```yaml
-     volumes:
-       - xero-data:/data
-       - ./xero-review-bot.pem:/keys/bot.pem:ro
+   Open `.env` and fill in every field — each has a detailed comment saying where its value comes from (App ID, webhook secret, AI provider, …). The two things people trip over most:
+   - **Private key — recommended: `PRIVATE_KEY_B64`.** Convert the `.pem` downloaded from the App settings page and paste the single-line output as the value:
+     ```bash
+     base64 -w0 xero-review-bot.private-key.pem   # Linux / Git Bash
+     base64 -i xero-review-bot.private-key.pem    # macOS
      ```
-     and set `PRIVATE_KEY_PATH=/keys/bot.pem`.
-2. **Start**:
+     Works in Docker and on Vercel alike; nothing to mount. (Alternative: mount the file — add `- ./xero-review-bot.pem:/keys/bot.pem:ro` to the compose `volumes` and set `PRIVATE_KEY_PATH=/keys/bot.pem`.)
+   - **`WEBHOOK_SECRET` must be byte-identical** to the secret saved in the App's settings — a mismatch makes GitHub reject every delivery with 401.
+2. **Subprocess engines need their own AI key.** The container preinstalls both `pi` and `codex`; they authenticate via `OPENAI_API_KEY` (separate from the bot's `AI_API_KEY`). Just add it to `.env` — compose's `env_file` injects the whole file into the container. Skip it and `REVIEW_ENGINE=auto` falls back to the `agent` engine; the bot keeps working either way.
+3. **Start**:
    ```bash
    docker compose up -d --build
    docker compose logs -f     # watch startup; config validation errors exit fast
    ```
-3. **Webhook URL**: `https://<your-host>/webhook` — must be reachable from the internet (GitHub delivers events to it; for a home server use a reverse proxy or tunnel).
+4. **Webhook URL**: `https://<your-host>/webhook` — must be reachable from the internet (GitHub delivers events to it; for a home server use a reverse proxy or tunnel).
 
 What you get in the container:
 - A `/data` named volume (`xero-data`) caches repo checkouts and `pi` sessions — this is the bot's **incremental memory**; wiping it loses review context. Leave it alone or back it up.
-- The `pi` coding agent is preinstalled, so the `pi` engine works out of the box. `codex` is **not** preinstalled — extend the image (or `docker exec` + `npm i -g @openai/codex`) if you want the `codex` engine.
+- Both `pi` and `codex` CLIs are preinstalled, so all five engines work out of the box (`REVIEW_ENGINE=auto` probes pi → codex → agent → builtin). If an npm install fails during the image build, that engine is skipped gracefully and selection falls through.
 - A built-in rebase sweep loop (`REBASE_SWEEP_ENABLED=true`, every `REBASE_SWEEP_INTERVAL_SECS` = 6h by default) — no external cron required. Optionally, belt-and-braces via host crontab:
   ```bash
   curl -H "Authorization: Bearer $CRON_SECRET" http://localhost:8080/cron
   ```
 
 Endpoints: `POST /webhook` (GitHub), `GET /health`, `GET /cron` (protected by `CRON_SECRET`).
+
+<details>
+<summary><b>Docker quick-check — from zero to a working bot</b></summary>
+
+```bash
+git clone https://github.com/Xero-Team/xero-bot.git && cd xero-bot
+cp .env.example .env && edit .env        # APP_ID, PRIVATE_KEY_B64, WEBHOOK_SECRET, BOT_NAME, AI_*, OPENAI_API_KEY
+docker compose up -d --build
+curl http://localhost:8080/health        # {"status":"ok",...}
+# then set the App's Webhook URL to https://<your-host>/webhook and install the App on your org
+```
+</details>
 
 ## Configuration
 

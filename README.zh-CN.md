@@ -47,7 +47,7 @@ Xero-Team 的组织级 GitHub App 机器人。Rust 实现,单二进制,双部署
 | `agent`(默认) | tool-calling 循环,工具=GitHub API(列目录/读文件/搜代码),先探索项目再审查 | 注入本 PR 上一轮 bot 审查 + 其后的新提交列表 | Vercel + 自托管 |
 | `builtin` | 单次 HTTP 调用(OpenAI chat/responses/Anthropic 三种格式) | 同上(上下文注入) | Vercel + 自托管 |
 | `pi` | 子进程 `pi -p --session-dir`,只读工具集 | **会话延续**:per-repo 会话文件记住项目理解 | 仅自托管(Docker 已预装) |
-| `codex` | 子进程 `codex exec --sandbox read-only -o` | 同上(可 `codex exec resume`) | 仅自托管 |
+| `codex` | 子进程 `codex exec --sandbox read-only -o` | 同上(可 `codex exec resume`) | 仅自托管(Docker 已预装) |
 | `auto` | 依次探测:pi → codex → agent → builtin | - | - |
 
 agent 超时/失败自动回退 builtin。所有引擎共用同一发布管线:风险分级表 + 新增行内联评论 + 发布降级链(带内联 → 去内联 → 普通评论)。
@@ -117,33 +117,46 @@ GitHub → Settings → Developer settings → GitHub Apps → **New GitHub App*
 
 1. **准备配置**:
    ```bash
-   cp .env.example .env   # 填好所有配置
+   cp .env.example .env
    ```
-   私钥二选一:
-   - 在 `.env` 里直接设 `PRIVATE_KEY_B64`(`.pem` 的 base64 — 到处可用,无需挂载),**或**
-   - 挂载密钥文件并把 `PRIVATE_KEY_PATH` 指到容器内路径 — 在 `docker-compose.yml` 中加:
-     ```yaml
-     volumes:
-       - xero-data:/data
-       - ./xero-review-bot.pem:/keys/bot.pem:ro
+   打开 `.env` 逐项填写 — 模板里每一项都写了详细注释说明值从哪来(App ID 在哪、webhook secret 怎么生成、AI 怎么配……)。最容易踩坑的两处:
+   - **私钥 — 推荐 `PRIVATE_KEY_B64`。** 把 App 设置页下载的 `.pem` 转成单行 base64 粘贴进去:
+     ```bash
+     base64 -w0 xero-review-bot.private-key.pem   # Linux / Git Bash
+     base64 -i xero-review-bot.private-key.pem    # macOS
      ```
-     并设 `PRIVATE_KEY_PATH=/keys/bot.pem`。
-2. **启动**:
+     Docker 和 Vercel 通用,无需挂载文件。(备选:挂载文件 — 在 compose 的 `volumes` 加一行
+     `- ./xero-review-bot.pem:/keys/bot.pem:ro`,并设 `PRIVATE_KEY_PATH=/keys/bot.pem`。)
+   - **`WEBHOOK_SECRET` 必须与 App 设置里存的完全一致** — 不一致的话 GitHub 每次推送都会被 401 拒绝。
+2. **子进程引擎要有自己的 AI key。** 容器已预装 `pi` 和 `codex`,它们用 `OPENAI_API_KEY` 认证(与 bot 的 `AI_API_KEY` 是两回事)。直接写进 `.env` 即可 — compose 的 `env_file` 会把整个文件注入容器。不填也不会坏 — `REVIEW_ENGINE=auto` 会回退到 `agent` 引擎,bot 照常工作。
+3. **启动**:
    ```bash
    docker compose up -d --build
    docker compose logs -f     # 观察启动;配置校验失败会立刻退出
    ```
-3. **Webhook URL**:`https://<your-host>/webhook` — 必须能被公网访问(GitHub 要向它推送事件;家用服务器需反代或内网穿透)。
+4. **Webhook URL**:`https://<your-host>/webhook` — 必须能被公网访问(GitHub 要向它推送事件;家用服务器需反代或内网穿透)。
 
 容器内的既有能力:
 - `/data` 具名卷(`xero-data`)缓存仓库 checkout 与 `pi` 会话 — 这是 bot 的**增量记忆**,删掉就丢审查上下文,不要轻易清理。
-- 已预装 `pi` coding agent,`pi` 引擎开箱即用。`codex` **未**预装 — 想用 `codex` 引擎需扩展镜像(或 `docker exec` 后 `npm i -g @openai/codex`)。
+- `pi` 和 `codex` 两个 CLI 都已预装,五个引擎开箱即用(`REVIEW_ENGINE=auto` 依次探测 pi → codex → agent → builtin)。若镜像构建时某个 npm 安装失败,对应引擎会被优雅跳过,探测链继续往下走。
 - 内置 rebase sweep 循环(`REBASE_SWEEP_ENABLED=true`,默认每 `REBASE_SWEEP_INTERVAL_SECS`=6h 一轮),无需外部 cron。也可在宿主机 crontab 里再加一道兜底:
   ```bash
   curl -H "Authorization: Bearer $CRON_SECRET" http://localhost:8080/cron
   ```
 
 端点:`POST /webhook`(GitHub)、`GET /health`、`GET /cron`(受 `CRON_SECRET` 保护)。
+
+<details>
+<summary><b>Docker 快速上手 — 从零到跑通</b></summary>
+
+```bash
+git clone https://github.com/Xero-Team/xero-bot.git && cd xero-bot
+cp .env.example .env && edit .env        # 填 APP_ID、PRIVATE_KEY_B64、WEBHOOK_SECRET、BOT_NAME、AI_*、OPENAI_API_KEY
+docker compose up -d --build
+curl http://localhost:8080/health        # {"status":"ok",...}
+# 然后把 App 的 Webhook URL 设为 https://<your-host>/webhook,并把 App 安装到你的组织
+```
+</details>
 
 ## 配置
 
