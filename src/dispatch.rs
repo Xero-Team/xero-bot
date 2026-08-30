@@ -65,7 +65,16 @@ pub fn route_event(cfg: &Config, event_header: &str, payload: &Value) -> Routing
                     return Routing::Respond(serde_json::json!({"ignored": "parse error"}));
                 }
             };
-            if parsed.is_empty() {
+            // Rendered here, so `Work` carries plain strings and the background
+            // task needn't know the parser's types.
+            let diagnostics: Vec<String> =
+                parsed.diagnostics.iter().map(|d| d.message()).collect();
+
+            // A comment can be worth answering without containing a command:
+            // `@bot reviwe` produces nothing to run and one thing to say. Saying
+            // it is the point — silently dropping near-misses is what left users
+            // believing a mistyped command had worked.
+            if parsed.commands.is_empty() && diagnostics.is_empty() {
                 return Routing::Respond(serde_json::json!({"ignored": "no command"}));
             }
             if !is_pr {
@@ -81,6 +90,7 @@ pub fn route_event(cfg: &Config, event_header: &str, payload: &Value) -> Routing
                 commenter,
                 pr_author,
                 commands: parsed.commands,
+                diagnostics,
             })
         }
         WebhookEvent::PullRequest {
@@ -130,6 +140,9 @@ pub enum Work {
         commenter: String,
         pr_author: String,
         commands: Vec<crate::commands::Command>,
+        /// Pre-rendered complaints about what couldn't be understood; may be
+        /// non-empty even when `commands` is empty.
+        diagnostics: Vec<String>,
     },
     RebaseCheck {
         repo: String,
@@ -161,6 +174,7 @@ async fn execute_work_inner(cfg: &Config, work: Work) -> Result<(), String> {
             commenter,
             pr_author,
             commands,
+            diagnostics,
         } => {
             let gh = Client::installation_resolved(cfg, installation_id)
                 .await
@@ -172,7 +186,7 @@ async fn execute_work_inner(cfg: &Config, work: Work) -> Result<(), String> {
                 pr_author,
                 installation_id,
             };
-            let results = handle_comment(&gh, cfg, &ctx, commands).await;
+            let results = handle_comment(&gh, cfg, &ctx, commands, diagnostics).await;
             tracing::info!("comment commands on {repo}#{pr_number}: {results:?}");
             Ok(())
         }
@@ -277,6 +291,47 @@ mod tests {
             assert!(
                 matches!(r, Routing::Act(_)),
                 "{login} must not be treated as the bot itself, got {r:?}"
+            );
+        }
+    }
+
+    /// A comment with nothing to run but something to say must still be
+    /// dispatched, or the diagnostic never reaches the PR.
+    #[test]
+    fn typo_only_comment_is_dispatched_to_be_answered() {
+        let p = payload(json!({
+            "body": "@xero-team-bot reviwe",
+            "user": {"login": "alice", "type": "User"}
+        }));
+        match route_event(&cfg(), "issue_comment", &p) {
+            Routing::Act(Work::Comment {
+                commands,
+                diagnostics,
+                ..
+            }) => {
+                assert!(commands.is_empty(), "nothing should run");
+                assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+                assert!(diagnostics[0].contains("review"), "{diagnostics:?}");
+            }
+            other => panic!("expected Act(Comment), got {other:?}"),
+        }
+    }
+
+    /// Prose is still dropped without a round trip to GitHub.
+    #[test]
+    fn prose_comment_is_ignored_without_work() {
+        for body in [
+            "@xero-team-bot 谢谢!🎉",
+            "@xero-team-bot 这个 PR 很好",
+            "cc @xero-team-bot about this",
+            "看起来不错",
+        ] {
+            let p = payload(json!({"body": body, "user": {"login": "alice", "type": "User"}}));
+            let r = route_event(&cfg(), "issue_comment", &p);
+            assert_eq!(
+                ignored_reason(&r).as_deref(),
+                Some("no command"),
+                "for {body:?}"
             );
         }
     }

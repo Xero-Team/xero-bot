@@ -145,6 +145,7 @@ async fn test_ping_comment_replies_pong() {
         &cfg,
         &ctx,
         vec![xero_bot::commands::Command::Ping],
+        vec![],
     )
     .await;
     assert_eq!(results, vec!["ok"]);
@@ -195,6 +196,7 @@ async fn test_ready_label_flow_with_mock() {
         &cfg,
         &ctx,
         vec![xero_bot::commands::Command::Ready],
+        vec![],
     )
     .await;
     assert_eq!(results, vec!["ok"]);
@@ -242,6 +244,7 @@ async fn test_r_plus_permission_denied() {
         &cfg,
         &ctx,
         vec![xero_bot::commands::Command::Approve { on_behalf_of: None }],
+        vec![],
     )
     .await;
     assert_eq!(results, vec!["denied"]);
@@ -294,6 +297,7 @@ async fn test_r_plus_approves_with_write() {
         &cfg,
         &ctx,
         vec![xero_bot::commands::Command::Approve { on_behalf_of: None }],
+        vec![],
     )
     .await;
     assert_eq!(results, vec!["ok"]);
@@ -393,6 +397,86 @@ async fn test_codeql_report_posts_findings() {
     let cfg = test_cfg();
     let status = xero_bot::codeql::run_codeql_report(&gh, &cfg, "octocat/hello", 7).await;
     assert_eq!(status, "ok");
+}
+
+/// Diagnostics reach the PR as exactly one consolidated comment, even with no
+/// commands to run. Before this, a mistyped command produced no reply at all
+/// and the author had no way to tell it hadn't worked.
+#[tokio::test]
+async fn test_diagnostics_are_posted_once() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/repos/octocat/hello/issues/7/comments"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({"id": 1})))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let crab = octocrab::OctocrabBuilder::new()
+        .personal_token("ghp_test")
+        .base_uri(server.uri())
+        .unwrap()
+        .build()
+        .unwrap();
+    let gh = Client {
+        crab,
+        app_slug: "xero-review".into(),
+    };
+    let cfg = test_cfg();
+    let ctx = xero_bot::handlers::CommentContext {
+        repo: "octocat/hello".into(),
+        pr_number: 7,
+        commenter: "alice".into(),
+        pr_author: "bob".into(),
+        installation_id: 42,
+    };
+    let results = xero_bot::handlers::handle_comment(
+        &gh,
+        &cfg,
+        &ctx,
+        vec![],
+        vec![
+            "`reviwe` 不是命令,是否想用 `review`?".into(),
+            "`label` 需要至少一个 `+标签` 或 `-标签`。".into(),
+        ],
+    )
+    .await;
+    assert_eq!(results, vec!["diagnostics:ok"]);
+    // wiremock verifies .expect(1) on drop: two complaints, one comment
+}
+
+/// Nothing to say means nothing posted — silence is the default for prose.
+#[tokio::test]
+async fn test_no_diagnostics_means_no_comment() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/repos/octocat/hello/issues/7/comments"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({"id": 1})))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let crab = octocrab::OctocrabBuilder::new()
+        .personal_token("ghp_test")
+        .base_uri(server.uri())
+        .unwrap()
+        .build()
+        .unwrap();
+    let gh = Client {
+        crab,
+        app_slug: "xero-review".into(),
+    };
+    let cfg = test_cfg();
+    let ctx = xero_bot::handlers::CommentContext {
+        repo: "octocat/hello".into(),
+        pr_number: 7,
+        commenter: "alice".into(),
+        pr_author: "bob".into(),
+        installation_id: 42,
+    };
+    let results = xero_bot::handlers::handle_comment(&gh, &cfg, &ctx, vec![], vec![]).await;
+    assert!(results.is_empty(), "{results:?}");
 }
 
 #[test]

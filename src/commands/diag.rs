@@ -105,13 +105,22 @@ impl Diagnostic {
 
 /// Render diagnostics as one comment, or None when there's nothing to say.
 pub fn render(diags: &[Diagnostic], bot_name: &str) -> Option<String> {
-    if diags.is_empty() {
+    let messages: Vec<String> = diags.iter().map(Diagnostic::message).collect();
+    render_messages(&messages, bot_name)
+}
+
+/// Assemble already-rendered messages into one comment body.
+///
+/// Separate from [`render`] so the dispatch layer can carry plain strings —
+/// `Work` stays free of parser types — while the wording lives in one place.
+pub fn render_messages(messages: &[String], bot_name: &str) -> Option<String> {
+    if messages.is_empty() {
         return None;
     }
-    let mut out = String::from("⚠️ 有几处没看懂:\n\n");
-    for d in diags {
+    let mut out = format!("⚠️ 有 {} 处没看懂:\n\n", messages.len());
+    for m in messages {
         out.push_str("- ");
-        out.push_str(&d.message());
+        out.push_str(m);
         out.push('\n');
     }
     out.push_str(&format!("\n完整命令表: `@{bot_name} help`"));
@@ -185,6 +194,15 @@ mod tests {
     #[test]
     fn render_is_none_when_there_is_nothing_to_say() {
         assert_eq!(render(&[], "bot"), None);
+    }
+
+    #[test]
+    fn render_counts_what_it_found() {
+        let one = render_messages(&["a".to_string()], "bot").expect("some");
+        assert!(one.contains("有 1 处"), "{one}");
+        let two = render_messages(&["a".to_string(), "b".to_string()], "bot").expect("some");
+        assert!(two.contains("有 2 处"), "{two}");
+        assert_eq!(render_messages(&[], "bot"), None);
     }
 
     #[test]

@@ -107,6 +107,7 @@ async fn failing_ping_still_labeled_error() {
         &cfg,
         &ctx,
         vec![xero_bot::commands::Command::Ping],
+        vec![],
     )
     .await;
     assert_eq!(results, vec!["error"]);

@@ -151,6 +151,7 @@ async fn reject_dismisses_bot_approval() {
         &cfg,
         &ctx,
         vec![xero_bot::commands::Command::Reject],
+        vec![],
     )
     .await;
     assert_eq!(results, vec!["ok"], "r- must dismiss, not report nothing found");

@@ -54,13 +54,30 @@ fn labeled(what: &str, result: Result<(), GhError>) -> String {
 }
 
 /// Execute all parsed commands from one comment, in order.
+///
+/// `diagnostics` are pre-rendered messages about parts of the comment that
+/// couldn't be understood; they may be present with no commands at all, which
+/// is the whole point — a mistyped command used to vanish without a word.
 pub async fn handle_comment(
     gh: &Client,
     cfg: &Config,
     ctx: &CommentContext,
     commands: Vec<Command>,
+    diagnostics: Vec<String>,
 ) -> Vec<String> {
     let mut results = Vec::new();
+
+    // Posted before the commands run: `review` can take minutes, and a note
+    // saying half the comment was misunderstood is only useful while the author
+    // is still looking.
+    if let Some(body) = crate::commands::diag::render_messages(&diagnostics, &cfg.bot_name) {
+        let r = labeled(
+            "diagnostics reply",
+            gh.post_issue_comment(&ctx.repo, ctx.pr_number, &body).await,
+        );
+        results.push(format!("diagnostics:{r}"));
+    }
+
     for cmd in commands {
         let r = handle_one(gh, cfg, ctx, cmd).await;
         results.push(r);

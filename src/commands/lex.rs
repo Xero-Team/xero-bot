@@ -39,9 +39,26 @@ pub enum Tok {
     Semi,
     /// end of line; ends a mention's scope
     Newline,
-    /// CJK text, punctuation, emoji — anything that can't start or continue a
-    /// command. Adjacent runs collapse into one token.
-    Other,
+    /// A run of punctuation or symbols: `,` `:` `。` `🎉`. Ordinary between a
+    /// mention and its verb, so `@bot, ping` is not a mistake.
+    Punct,
+    /// A run containing words — CJK, accented letters, anything alphanumeric
+    /// that isn't a bare ASCII word. Distinguished from [`Tok::Punct`] only so
+    /// the parser can tell `@bot, reviwe` (a typo worth naming) from
+    /// `@bot 这个 PR 很好` (a sentence that happens to mention the bot).
+    Prose,
+}
+
+/// Classify a run of non-command characters.
+///
+/// ASCII alphanumerics never reach here — they lex as words — so this asks
+/// whether the run holds a letter or ideograph from anywhere else.
+fn other_kind(run: &str) -> Tok {
+    if run.chars().any(char::is_alphanumeric) {
+        Tok::Prose
+    } else {
+        Tok::Punct
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -184,7 +201,7 @@ impl<'a> Lexer<'a> {
         let end = self.take_while(|c| !c.is_whitespace() && c != ';' && c != ',');
         let value = &self.text[val_start..end];
         if value.is_empty() {
-            self.push(Tok::Other, start..val_start);
+            self.push(Tok::Punct, start..val_start);
             return;
         }
         let tok = if sign == '+' {
@@ -250,7 +267,9 @@ impl<'a> Lexer<'a> {
                 && c != '?'
                 && !c.is_ascii_alphanumeric()
         });
-        self.push(Tok::Other, start..end.max(start + first_len));
+        let span = start..end.max(start + first_len);
+        let kind = other_kind(&self.text[span.clone()]);
+        self.push(kind, span);
     }
 
     fn peek_at(&self, byte: usize) -> Option<char> {
@@ -335,16 +354,28 @@ mod tests {
     fn trailing_punctuation_does_not_swallow_the_login() {
         assert_eq!(
             kinds("b", "@alice。"),
-            vec![Tok::User("alice".into()), Tok::Other]
+            vec![Tok::User("alice".into()), Tok::Punct]
         );
         assert_eq!(
             kinds("b", "@alice, @bob"),
             vec![
                 Tok::User("alice".into()),
-                Tok::Other,
+                Tok::Punct,
                 Tok::User("bob".into())
             ]
         );
+    }
+
+    /// The parser reports an unknown verb next to a mention but stays quiet when
+    /// the mention sits in a sentence, so the two cases must be separate tokens.
+    #[test]
+    fn punctuation_and_prose_are_different_tokens() {
+        assert_eq!(kinds("b", ",:。、"), vec![Tok::Punct]);
+        assert_eq!(kinds("b", "🎉"), vec![Tok::Punct]);
+        assert_eq!(kinds("b", "这个"), vec![Tok::Prose]);
+        assert_eq!(kinds("b", "谢谢!🎉"), vec![Tok::Prose]);
+        // a run is prose if any part of it is
+        assert_eq!(kinds("b", "(很好)"), vec![Tok::Prose]);
     }
 
     #[test]

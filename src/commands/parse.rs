@@ -132,6 +132,21 @@ impl<'a> Parser<'a> {
             .unwrap_or(0..0)
     }
 
+    /// True when the mention at `mention` opens its line, ignoring punctuation
+    /// such as a list bullet.
+    ///
+    /// This is what separates an address to the bot from a reference to it. Both
+    /// execute verbs — `@bot cc @a @bot assign @b` has always worked — but only
+    /// an address may be told off for an unrecognised word. Otherwise
+    /// `cc @bot about this` answers "`about` 不是命令".
+    fn addressed_at(&self, mention: usize) -> bool {
+        self.toks[..mention]
+            .iter()
+            .rev()
+            .take_while(|t| !matches!(t.tok, Tok::Newline))
+            .all(|t| matches!(t.tok, Tok::Punct))
+    }
+
     /// True at a hard command boundary: a new mention, a `;`, or end of line.
     fn at_boundary(&self) -> bool {
         matches!(
@@ -142,10 +157,17 @@ impl<'a> Parser<'a> {
 
     /// Skip filler inside a command's arguments. Punctuation between arguments
     /// is not meaningful, so `cc @a, @b` works.
-    fn skip_filler(&mut self) {
-        while matches!(self.peek(), Some(Tok::Other)) {
+    ///
+    /// Returns whether any of it was prose. Callers that report a mistake use
+    /// that to stay quiet: an unknown word is a typo when it sits right after
+    /// the mention and just a word when a sentence got there first.
+    fn skip_filler(&mut self) -> bool {
+        let mut prose = false;
+        while let Some(t @ (Tok::Punct | Tok::Prose)) = self.peek() {
+            prose |= matches!(t, Tok::Prose);
             self.pos += 1;
         }
+        prose
     }
 
     fn emit(&mut self, command: Command, start: usize) {
@@ -210,10 +232,10 @@ impl<'a> Parser<'a> {
     /// A mention's scope covers the rest of its line; `;` starts another
     /// command inside it, so one mention can carry several.
     fn mention_command(&mut self) {
-        let mention_start = self.span().start;
+        let addressed = self.addressed_at(self.pos);
         self.pos += 1; // Bot
         loop {
-            self.verb_tail(mention_start);
+            self.verb_tail(addressed);
             if matches!(self.peek(), Some(Tok::Semi)) {
                 self.pos += 1;
                 // A trailing `;` with nothing after it is harmless.
@@ -226,16 +248,18 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn verb_tail(&mut self, mention_start: usize) {
+    fn verb_tail(&mut self, addressed: bool) {
         // Leading punctuation after the mention is not an error: `@bot, ping`
-        // and `@bot: ping` are what people actually type.
-        self.skip_filler();
+        // and `@bot: ping` are what people actually type. Prose is skipped too —
+        // `@bot 请 review 一下` should still run — but it's remembered, because
+        // it decides whether an unrecognised word counts as a typo.
+        let after_prose = self.skip_filler();
         let start = self.span().start;
 
         match self.peek().cloned() {
             Some(Tok::Word(word)) => {
                 self.pos += 1;
-                self.verb_with_args(&word, start);
+                self.verb_with_args(&word, start, addressed && !after_prose);
             }
             Some(Tok::ReviewReq) => {
                 self.pos += 1;
@@ -255,13 +279,14 @@ impl<'a> Parser<'a> {
             // is deliberate: `@bot 谢谢!` must not draw a reply. Only a word
             // that looks like a verb attempt earns a diagnostic, which is
             // decided in `verb_with_args`.
-            _ => {
-                let _ = mention_start;
-            }
+            _ => {}
         }
     }
 
-    fn verb_with_args(&mut self, word: &str, start: usize) {
+    /// `may_complain` gates only the unknown-word diagnostic. A verb the parser
+    /// does recognise is a clear enough signal on its own, so its own problems
+    /// (a missing argument, a bad login) are always reported.
+    fn verb_with_args(&mut self, word: &str, start: usize, may_complain: bool) {
         if let Some(cmd) = nullary(word) {
             self.reject_extra_args(word, start);
             self.emit(cmd, start);
@@ -287,11 +312,16 @@ impl<'a> Parser<'a> {
             }
             "label" | "relabel" => self.label_args(start),
             other => {
-                // Unknown verb directly after a mention: a typo worth naming.
-                self.diagnostics.push(Diagnostic::unknown_verb(
-                    other.to_string(),
-                    self.toks[self.pos.saturating_sub(1)].span.clone(),
-                ));
+                // An unknown word directly after a mention that opens the line
+                // is a typo worth naming. Anything looser is noise:
+                // `@bot 这个 PR 很好` must not be answered with
+                // "`pr` 不是命令,是否想用 `cc`?".
+                if may_complain {
+                    self.diagnostics.push(Diagnostic::unknown_verb(
+                        other.to_string(),
+                        self.toks[self.pos.saturating_sub(1)].span.clone(),
+                    ));
+                }
             }
         }
     }

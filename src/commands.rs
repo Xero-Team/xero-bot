@@ -506,6 +506,143 @@ mod tests {
         );
     }
 
+    // ---- diagnostics vs silence -------------------------------------------
+
+    /// The class of bug this whole module exists to end: a near-miss command
+    /// used to vanish, leaving the user certain it had worked.
+    #[test]
+    fn typo_after_mention_is_named_with_a_suggestion() {
+        let out = parse_commands("bot", "@bot reviwe");
+        assert!(out.commands.is_empty());
+        assert_eq!(
+            out.diagnostics,
+            vec![Diagnostic::UnknownVerb {
+                verb: "reviwe".into(),
+                suggestion: Some("review"),
+                span: 5..11,
+            }]
+        );
+    }
+
+    /// Punctuation between the mention and the typo doesn't change that.
+    #[test]
+    fn typo_after_punctuation_is_still_named() {
+        for text in ["@bot, reviwe", "@bot: reviwe", "@bot、reviwe"] {
+            let out = parse_commands("bot", text);
+            assert!(
+                out.diagnostics
+                    .iter()
+                    .any(|d| matches!(d, Diagnostic::UnknownVerb { .. })),
+                "expected a complaint for {text:?}, got {:?}",
+                out.diagnostics
+            );
+        }
+    }
+
+    /// Noise suppression. A mention inside a sentence is not a failed command,
+    /// and answering it would make the bot something people mute. Without the
+    /// prose check, `@bot 这个 PR 很好` draws "`pr` 不是命令,是否想用 `cc`?".
+    #[test]
+    fn prose_around_a_mention_stays_silent() {
+        for text in [
+            "@bot 谢谢!🎉",
+            "@bot 这个 PR 很好",
+            "@bot 我觉得这里可以 merge 了",
+            "cc @bot about this",
+            "@bot",
+        ] {
+            let out = parse_commands("bot", text);
+            assert!(
+                out.commands.is_empty() && out.diagnostics.is_empty(),
+                "must stay silent for {text:?}, got {out:?}"
+            );
+        }
+    }
+
+    /// Silence about unknown words must not cost the known ones: a verb still
+    /// runs when it's embedded in Chinese prose, which is how this audience
+    /// writes.
+    #[test]
+    fn known_verb_after_prose_still_runs() {
+        assert_eq!(cmds("bot", "@bot 请 review 一下"), vec![Command::Review]);
+        assert_eq!(
+            cmds("bot", "@bot 麻烦 r? @alice"),
+            vec![Command::RequestReview {
+                user: "alice".into()
+            }]
+        );
+    }
+
+    /// The two roles of a mention. Mid-sentence it still commands the bot —
+    /// `@bot cc @a @bot assign @b` has always relied on that — but it is no
+    /// longer treated as an attempt worth correcting.
+    #[test]
+    fn mention_in_a_sentence_acts_but_stays_quiet() {
+        assert_eq!(cmds("bot", "please cc @bot review"), vec![Command::Review]);
+        assert!(
+            parse_commands("bot", "please ask @bot about this")
+                .diagnostics
+                .is_empty()
+        );
+    }
+
+    /// A list bullet doesn't stop a line from being addressed to the bot.
+    #[test]
+    fn list_bullet_before_a_mention_still_addresses() {
+        let out = parse_commands("bot", "- @bot reviwe");
+        assert!(
+            out.diagnostics
+                .iter()
+                .any(|d| matches!(d, Diagnostic::UnknownVerb { .. })),
+            "{:?}",
+            out.diagnostics
+        );
+    }
+
+    /// A recognised verb missing its argument is worth naming even in prose —
+    /// the user clearly meant to command the bot.
+    #[test]
+    fn missing_argument_is_named() {
+        for (text, verb) in [("@bot assign", "assign"), ("@bot label", "label"), ("@bot cc", "cc")]
+        {
+            let out = parse_commands("bot", text);
+            assert!(out.commands.is_empty(), "{text} should run nothing");
+            assert!(
+                out.diagnostics
+                    .iter()
+                    .any(|d| matches!(d, Diagnostic::MissingArgument { verb: v, .. } if *v == verb)),
+                "expected MissingArgument({verb}) for {text:?}, got {:?}",
+                out.diagnostics
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_login_is_named() {
+        let out = parse_commands("bot", "@bot assign @-bad");
+        assert!(out.commands.is_empty());
+        assert!(
+            out.diagnostics
+                .iter()
+                .any(|d| matches!(d, Diagnostic::InvalidLogin { raw, .. } if raw == "-bad")),
+            "{:?}",
+            out.diagnostics
+        );
+    }
+
+    /// The input that started all of this. The help table lists every command,
+    /// so the bot used to execute six of them on its own output — and must not
+    /// now answer itself with a wall of diagnostics either.
+    #[test]
+    fn own_help_text_produces_nothing_at_all() {
+        let help = crate::handlers::help_text("bot");
+        let out = parse_commands("bot", &help);
+        assert!(
+            out.commands.is_empty() && out.diagnostics.is_empty(),
+            "help text must be inert, got {out:?}"
+        );
+    }
+
     #[test]
     fn utf8_input_never_panics() {
         for s in [
