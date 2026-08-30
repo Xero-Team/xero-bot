@@ -31,9 +31,8 @@ pub enum GhError {
 /// the failure came from GitHub (404/403 detection relies on this).
 fn classify_octo_error(e: octocrab::Error) -> GhError {
     if let octocrab::Error::GitHub { source, .. } = &e {
-        // try to extract the status code from the inner GitHubError
         return GhError::Api {
-            status: 0,
+            status: source.status_code.as_u16(),
             message: source.message.clone(),
         };
     }

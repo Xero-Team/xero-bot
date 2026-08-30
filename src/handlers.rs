@@ -38,6 +38,22 @@ _冲突的 PR 会被自动打上 `needs-rebase` 标签并提醒。_"
     )
 }
 
+/// Collapse a GitHub call into the short result label that `dispatch` logs,
+/// recording the underlying error first.
+///
+/// The label alone can't distinguish a missing App permission from a bad
+/// installation token, so the `GhError` — which carries the HTTP status — must
+/// reach the log or a failure is undiagnosable from the outside.
+fn labeled(what: &str, result: Result<(), GhError>) -> String {
+    match result {
+        Ok(()) => "ok".into(),
+        Err(e) => {
+            tracing::warn!("{what} failed: {e}");
+            "error".into()
+        }
+    }
+}
+
 /// Execute all parsed commands from one comment, in order.
 pub async fn handle_comment(
     gh: &Client,
@@ -55,18 +71,16 @@ pub async fn handle_comment(
 
 async fn handle_one(gh: &Client, cfg: &Config, ctx: &CommentContext, cmd: Command) -> String {
     match cmd {
-        Command::Ping => gh
-            .post_issue_comment(&ctx.repo, ctx.pr_number, "pong 🏓")
-            .await
-            .is_ok()
-            .then_some("ok".into())
-            .unwrap_or_else(|| "error".into()),
-        Command::Help => gh
-            .post_issue_comment(&ctx.repo, ctx.pr_number, &help_text(&cfg.bot_name))
-            .await
-            .is_ok()
-            .then_some("ok".into())
-            .unwrap_or_else(|| "error".into()),
+        Command::Ping => labeled(
+            "ping reply",
+            gh.post_issue_comment(&ctx.repo, ctx.pr_number, "pong 🏓")
+                .await,
+        ),
+        Command::Help => labeled(
+            "help reply",
+            gh.post_issue_comment(&ctx.repo, ctx.pr_number, &help_text(&cfg.bot_name))
+                .await,
+        ),
         Command::Review => {
             if !ctx_is_pr(ctx) {
                 let _ = gh
@@ -142,6 +156,7 @@ async fn handle_one(gh: &Client, cfg: &Config, ctx: &CommentContext, cmd: Comman
             let mut ok = true;
             if !add.is_empty() {
                 if let Err(e) = gh.add_labels(&ctx.repo, ctx.pr_number, &add).await {
+                    tracing::warn!("add labels {add:?} on {}#{}: {e}", ctx.repo, ctx.pr_number);
                     let _ = gh
                         .post_issue_comment(
                             &ctx.repo,
@@ -156,6 +171,11 @@ async fn handle_one(gh: &Client, cfg: &Config, ctx: &CommentContext, cmd: Comman
                 if let Err(e) = gh.remove_label(&ctx.repo, ctx.pr_number, label).await {
                     // 404 = label not present; not an error worth reporting
                     if !matches!(&e, GhError::Api { status: 404, .. }) {
+                        tracing::warn!(
+                            "remove label {label} on {}#{}: {e}",
+                            ctx.repo,
+                            ctx.pr_number
+                        );
                         let _ = gh
                             .post_issue_comment(
                                 &ctx.repo,
@@ -307,6 +327,7 @@ async fn set_status_label(gh: &Client, cfg: &Config, ctx: &CommentContext, cmd: 
         .add_labels(&ctx.repo, ctx.pr_number, &[add.clone()])
         .await
     {
+        tracing::warn!("add label {add} on {}#{}: {e}", ctx.repo, ctx.pr_number);
         let _ = gh
             .post_issue_comment(&ctx.repo, ctx.pr_number, &format!("⚠️ 打标签失败: `{e}`"))
             .await;
