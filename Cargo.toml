@@ -57,3 +57,6 @@ path = "api/cron.rs"
 [[bin]]
 name = "health"
 path = "api/health.rs"
+
+[dev-dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking"] }
