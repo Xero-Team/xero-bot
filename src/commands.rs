@@ -29,6 +29,11 @@ pub enum Command {
     Author,
     /// blocked — set blocked, clear siblings
     Blocked,
+    /// label +a -b
+    Label {
+        add: Vec<String>,
+        remove: Vec<String>,
+    },
 }
 
 /// One parsed command plus where it appeared (for ordered execution).
@@ -179,6 +184,14 @@ fn parse_verb(bot_name: &str, rest: &str) -> Option<Command> {
         "ready" | "reviewer" => Some(Command::Ready),
         "author" => Some(Command::Author),
         "blocked" => Some(Command::Blocked),
+        "label" | "relabel" => {
+            let (add, remove) = parse_label_args(args);
+            if add.is_empty() && remove.is_empty() {
+                None
+            } else {
+                Some(Command::Label { add, remove })
+            }
+        }
         _ => {
             // `r? @user` also valid right after mention: `@xero r? @user`
             if word == "r?" {
@@ -217,6 +230,32 @@ fn is_valid_login(s: &str) -> bool {
         && s.len() <= 39
         && !s.starts_with('-')
         && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+}
+
+/// `+label -label` tokens (also `label: +x` style not supported; keep triagebot's).
+fn parse_label_args(args: &str) -> (Vec<String>, Vec<String>) {
+    let mut add = Vec::new();
+    let mut remove = Vec::new();
+    for token in args.split_whitespace() {
+        if let Some(name) = token.strip_prefix('+') {
+            if is_valid_label(name) {
+                add.push(name.to_string());
+            }
+        } else if let Some(name) = token.strip_prefix('-') {
+            if is_valid_label(name) {
+                remove.push(name.to_string());
+            }
+        }
+    }
+    (add, remove)
+}
+
+fn is_valid_label(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 100
+        && !s
+            .chars()
+            .any(|c| ['"', ',', ';', ':', '\\', '<', '>', '|'].contains(&c))
 }
 
 #[cfg(test)]
@@ -318,6 +357,30 @@ mod tests {
             }
             other => panic!("expected Cc, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_labels() {
+        let cmds = parse_commands("xero-review", "@xero-review label +bug +A-compiler -wip");
+        match &cmds[0].command {
+            Command::Label { add, remove } => {
+                assert_eq!(add, &vec!["bug".to_string(), "A-compiler".to_string()]);
+                assert_eq!(remove, &vec!["wip".to_string()]);
+            }
+            other => panic!("expected Label, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_multiple_commands() {
+        let cmds = parse_commands(
+            "xero-review",
+            "r? @alice and @xero-review label +bug -wip then @xero-review ping",
+        );
+        assert_eq!(cmds.len(), 3);
+        assert!(matches!(cmds[0].command, Command::RequestReview { .. }));
+        assert!(matches!(cmds[1].command, Command::Label { .. }));
+        assert!(matches!(cmds[2].command, Command::Ping));
     }
 
     #[test]

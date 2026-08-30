@@ -53,6 +53,72 @@ async fn handle_one(gh: &Client, cfg: &Config, ctx: &CommentContext, cmd: Comman
             .is_ok()
             .then_some("ok".into())
             .unwrap_or_else(|| "error".into()),
+        Command::Label { add, remove } => {
+            // permission gate: label changes require at least triage access —
+            // GitHub enforces this API-side; we just try and report.
+            let mut ok = true;
+            if !add.is_empty() {
+                if let Err(e) = gh.add_labels(&ctx.repo, ctx.pr_number, &add).await {
+                    let _ = gh
+                        .post_issue_comment(
+                            &ctx.repo,
+                            ctx.pr_number,
+                            &format!("⚠️ 添加标签失败: `{e}`"),
+                        )
+                        .await;
+                    ok = false;
+                }
+            }
+            for label in &remove {
+                if let Err(e) = gh.remove_label(&ctx.repo, ctx.pr_number, label).await {
+                    // 404 = label not present; not an error worth reporting
+                    if !matches!(&e, GhError::Api { status: 404, .. }) {
+                        let _ = gh
+                            .post_issue_comment(
+                                &ctx.repo,
+                                ctx.pr_number,
+                                &format!("⚠️ 移除标签失败: `{e}`"),
+                            )
+                            .await;
+                        ok = false;
+                    }
+                }
+            }
+            if ok {
+                let mut parts: Vec<String> = Vec::new();
+                if !add.is_empty() {
+                    parts.push(format!(
+                        "+{}",
+                        add.iter()
+                            .map(|l| format!("`{l}`"))
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    ));
+                }
+                if !remove.is_empty() {
+                    parts.push(format!(
+                        "-{}",
+                        remove
+                            .iter()
+                            .map(|l| format!("`{l}`"))
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    ));
+                }
+                let _ = gh
+                    .post_issue_comment(
+                        &ctx.repo,
+                        ctx.pr_number,
+                        &format!("已更新标签: {}", parts.join(" ")),
+                    )
+                    .await;
+            }
+            if ok {
+                "ok".into()
+            } else {
+                "error".into()
+            }
+        }
         Command::Ready | Command::Author | Command::Blocked => {
             set_status_label(gh, cfg, ctx, cmd).await
         }
