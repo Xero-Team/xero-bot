@@ -308,6 +308,40 @@ impl Client {
         Ok(v.as_array().cloned().unwrap_or_default())
     }
 
+    /// post a review (COMMENT event) with optional inline comments;
+    /// falls back to no-inline retry and finally a plain comment (Python bot behavior)
+    pub async fn post_review(
+        &self,
+        repo: &str,
+        number: i64,
+        body: &str,
+        inline: Vec<Value>,
+    ) -> Result<(), GhError> {
+        let route = format!("/repos/{repo}/pulls/{number}/reviews");
+        let payload = json!({
+            "body": body,
+            "event": "COMMENT",
+            "comments": inline,
+        });
+        match self.post(&route, Some(payload.clone())).await {
+            Ok(_) => return Ok(()),
+            Err(e) => tracing::warn!("review post failed: {e}"),
+        }
+        if !inline.is_empty() {
+            let payload = json!({
+                "body": body,
+                "event": "COMMENT",
+                "comments": [],
+            });
+            match self.post(&route, Some(payload)).await {
+                Ok(_) => return Ok(()),
+                Err(e) => tracing::warn!("review post (no inline) failed: {e}"),
+            }
+        }
+        // last resort: plain issue comment
+        self.post_issue_comment(repo, number, body).await
+    }
+
     // -------------------------------------------------------------------
     // Repo content (agent tools)
     // -------------------------------------------------------------------
