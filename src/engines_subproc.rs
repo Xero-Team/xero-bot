@@ -8,7 +8,13 @@
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
+use serde_json::Value;
+
 use crate::config::Config;
+use crate::github::Client;
+use crate::review::{
+    build_inline_comments, parse_added_lines, parse_verdict, render_summary, truncate,
+};
 
 /// Where the repo checkout lives for a given repository full name.
 fn repo_dir(cfg: &Config, repo: &str) -> PathBuf {
@@ -98,4 +104,76 @@ pub async fn ensure_checkout(
         ));
     }
     Ok(dir)
+}
+
+fn build_review_prompt(
+    repo: &str,
+    pr_number: i64,
+    meta: &Value,
+    previous_review: Option<&str>,
+    new_commits: Option<&str>,
+) -> String {
+    let title = meta.get("title").and_then(|t| t.as_str()).unwrap_or("");
+    let body: String = meta
+        .get("body")
+        .and_then(|b| b.as_str())
+        .unwrap_or("")
+        .chars()
+        .take(2000)
+        .collect();
+    let prev = previous_review
+        .map(|p| format!("\n## 上一轮审查意见(核对是否已修复,避免重复):\n{p}\n"))
+        .unwrap_or_default();
+    let commits = new_commits
+        .map(|c| format!("\n## 自上一轮审查以来的新提交:\n{c}\n"))
+        .unwrap_or_default();
+    format!(
+        "请审查当前仓库中 PR #{pr_number} 的改动({repo})。\n\
+PR 标题: {title}\nPR 描述: {body}{prev}{commits}\n\
+改动内容: 本仓库工作区已检出该 PR 的最新提交,基准分支为 origin/{base}。请用 `git diff origin/main...HEAD` 或读取文件来查看改动。\n\n\
+要求:\n\
+1. 先快速了解项目结构(根目录、构建配置、相关模块),再审查改动。\n\
+2. 只报告真实问题,按风险分级。\n\
+3. 最终输出必须是严格的 JSON(无解释文字、无 markdown 围栏),schema:\n\
+{{\"summary\": \"一句话总体评价(中文)\", \"findings\": [{{\"severity\": \"critical|high|medium|low|info\", \"title\": \"简短标题\", \"file\": \"文件路径\", \"line\": 行号, \"description\": \"描述(中文)\", \"suggestion\": \"修复建议(中文)\"}}]}}\n\
+4. 若无问题, findings 为空数组。只输出 JSON。",
+        base = meta
+            .pointer("/base/ref")
+            .and_then(|r| r.as_str())
+            .unwrap_or("main")
+    )
+}
+
+/// Shared tail for subprocess engines: parse stdout as verdict, post review.
+async fn post_subproc_result(
+    gh: &Client,
+    cfg: &Config,
+    repo: &str,
+    pr_number: i64,
+    raw_output: &str,
+    engine_tag: &str,
+) -> String {
+    let Some(verdict) = parse_verdict(raw_output) else {
+        let body = format!(
+            "## 🤖 AI Code Review ({engine_tag})\n\n⚠️ 未能解析模型返回的 JSON,以下为原始输出(截断):\n\n```\n{}\n```",
+            raw_output.chars().take(4000).collect::<String>()
+        );
+        let _ = gh.post_issue_comment(repo, pr_number, &body).await;
+        return "parse-failed".into();
+    };
+    let summary = render_summary(&verdict, engine_tag);
+    let diff = gh.get_pr_diff(repo, pr_number).await.unwrap_or_default();
+    let added = parse_added_lines(&truncate(&diff, cfg.max_diff_chars).0);
+    let inline = build_inline_comments(&verdict, &added);
+    if let Err(e) = gh.post_review(repo, pr_number, &summary, inline).await {
+        let _ = gh
+            .post_issue_comment(
+                repo,
+                pr_number,
+                &format!("## 🤖 AI Code Review\n\n❌ 发布失败: `{e}`"),
+            )
+            .await;
+        return format!("error: {e}");
+    }
+    "ok".into()
 }
