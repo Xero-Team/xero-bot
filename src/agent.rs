@@ -474,21 +474,25 @@ pub async fn run_agent_review(
                 let full_diff = gh.get_pr_diff(repo, pr_number).await.unwrap_or_default();
                 let added = parse_added_lines(&truncate(&full_diff, cfg.max_diff_chars).0);
                 let inline = build_inline_comments(&verdict, &added);
-                if let Err(e) = gh.post_review(repo, pr_number, &summary, inline).await {
-                    let _ = gh
-                        .post_issue_comment(
-                            repo,
-                            pr_number,
-                            &t!(
-                                lang,
-                                "## 🤖 AI Code Review\n\n❌ Failed to publish: `{e}`",
-                                "## 🤖 AI Code Review\n\n❌ 发布失败: `{e}`"
-                            ),
-                        )
-                        .await;
-                    return format!("error: {e}");
+                // The mode is the status: "ok" hides that the inline comments
+                // were dropped or that this went out as a plain comment.
+                match gh.post_review(repo, pr_number, &summary, inline).await {
+                    Ok(mode) => mode.to_string(),
+                    Err(e) => {
+                        let _ = gh
+                            .post_issue_comment(
+                                repo,
+                                pr_number,
+                                &t!(
+                                    lang,
+                                    "## 🤖 AI Code Review\n\n❌ Failed to publish: `{e}`",
+                                    "## 🤖 AI Code Review\n\n❌ 发布失败: `{e}`"
+                                ),
+                            )
+                            .await;
+                        format!("error: {e}")
+                    }
                 }
-                "ok".into()
             } else if o.timed_out {
                 // timed out: fall back to builtin
                 let note = lang.pick(

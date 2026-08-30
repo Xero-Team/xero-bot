@@ -13,7 +13,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 use xero_bot::github::Client;
 
 fn client_for(server: &MockServer) -> Client {
-    let crab = octocrab::OctocrabBuilder::new()
+    let crab = xero_bot::github::client_builder()
         .personal_token("ghp_test")
         .base_uri(server.uri())
         .unwrap()

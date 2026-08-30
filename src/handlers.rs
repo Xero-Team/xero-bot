@@ -29,7 +29,7 @@ pub struct CommentContext {
 pub fn help_text(bot_name: &str, lang: Lang) -> String {
     match lang {
         Lang::En => format!(
-            "### 🤖 xero-bot commands\n\n\
+            "### xero-bot commands\n\n\
 | Command | What it does |\n|---|---|\n\
 | `@{bot_name} review` | AI code review (incremental: last review plus new commits) |\n\
 | `@{bot_name} codeql` | CodeQL quality report (existing repo alerts mapped onto this change) |\n\
@@ -50,7 +50,7 @@ pub fn help_text(bot_name: &str, lang: Lang) -> String {
 _Conflicted PRs are labelled `needs-rebase` automatically, with a reminder._"
         ),
         Lang::Zh => format!(
-            "### 🤖 xero-bot 命令参考\n\n\
+            "### xero-bot 命令参考\n\n\
 | 命令 | 说明 |\n|---|---|\n\
 | `@{bot_name} review` | AI 代码审查(增量:结合上一轮审查与新提交) |\n\
 | `@{bot_name} codeql` | CodeQL 质量报告(读取仓库存量告警并映射到本次变更) |\n\
@@ -179,56 +179,26 @@ async fn handle_one(gh: &Client, cfg: &Config, ctx: &CommentContext, cmd: Comman
                     .await;
                 return "ai-not-configured".into();
             }
-            // token for subprocess engines: installation token via REST
-            let token = gh
-                .installation_token(cfg, ctx.installation_id)
-                .await
-                .unwrap_or_default();
-            crate::engines_subproc::run_review(gh, cfg, &ctx.repo, ctx.pr_number, &token, lang)
-                .await
+            // The installation token is fetched by the engines that need one —
+            // only the subprocess engines do, and only they can report its
+            // failure usefully. Fetching it here meant `builtin` and `agent`
+            // paid for a token they never touch, and `unwrap_or_default()` fed
+            // an empty string into a clone URL, which fails as an
+            // authentication error with no hint that the token was the problem.
+            crate::engines_subproc::run_review(
+                gh,
+                cfg,
+                &ctx.repo,
+                ctx.pr_number,
+                ctx.installation_id,
+                lang,
+            )
+            .await
         }
         Command::Codeql => {
             crate::codeql::run_codeql_report(gh, cfg, &ctx.repo, ctx.pr_number, lang).await
         }
-        Command::RequestReview { user } => {
-            // triagebot: assignment is the review request
-            match gh
-                .add_assignees(&ctx.repo, ctx.pr_number, &[user.clone()])
-                .await
-            {
-                Ok(()) => {
-                    // An issue has no reviewers, so on one this is an
-                    // assignment and the reply must not call it anything else.
-                    let msg = if ctx.is_pr {
-                        t!(
-                            lang,
-                            "Assigned @{user} as reviewer — please take a look 🙏",
-                            "已指派 @{user} 为 reviewer,请审查 🙏"
-                        )
-                    } else {
-                        t!(
-                            lang,
-                            "Assigned @{user} — an issue has no reviewers, so this is an assignment 🙏",
-                            "已指派 @{user} —— issue 没有 reviewer,这里只是指派 🙏"
-                        )
-                    };
-                    let _ = gh.post_issue_comment(&ctx.repo, ctx.pr_number, &msg).await;
-                    "ok".into()
-                }
-                Err(e) => {
-                    let msg = match &e {
-                        GhError::Api { status, .. } if *status == 403 || *status == 422 => t!(
-                            lang,
-                            "⚠️ Cannot assign @{user}: they need write access to the repo, or org membership, or a prior comment here.",
-                            "⚠️ 无法指派 @{user}:用户需要有仓库写权限、或是组织成员、或曾在此留言。"
-                        ),
-                        _ => t!(lang, "⚠️ Assignment failed: `{e}`", "⚠️ 指派失败: `{e}`"),
-                    };
-                    let _ = gh.post_issue_comment(&ctx.repo, ctx.pr_number, &msg).await;
-                    format!("error: {e}")
-                }
-            }
-        }
+        Command::RequestReview { user } => request_review(gh, ctx, &user).await,
         Command::Cc { users } => {
             let mentions = users
                 .iter()
@@ -236,8 +206,13 @@ async fn handle_one(gh: &Client, cfg: &Config, ctx: &CommentContext, cmd: Comman
                 .collect::<Vec<_>>()
                 .join(" ");
             let commenter = &ctx.commenter;
-            let _ = gh
-                .post_issue_comment(
+            // An `@mention` in a comment *is* GitHub's notification mechanism,
+            // so posting one is the whole job — but the POST can still fail, and
+            // discarding its result reported a delivered `cc` for a comment that
+            // never existed.
+            labeled(
+                "cc reply",
+                gh.post_issue_comment(
                     &ctx.repo,
                     ctx.pr_number,
                     &t!(
@@ -246,8 +221,8 @@ async fn handle_one(gh: &Client, cfg: &Config, ctx: &CommentContext, cmd: Comman
                         "cc {mentions}(via @{commenter})"
                     ),
                 )
-                .await;
-            "ok".into()
+                .await,
+            )
         }
         Command::Ready | Command::Author | Command::Blocked => {
             set_status_label(gh, cfg, ctx, cmd).await
@@ -333,97 +308,239 @@ async fn handle_one(gh: &Client, cfg: &Config, ctx: &CommentContext, cmd: Comman
                 "error".into()
             }
         }
-        Command::Assign { user } => match gh
-            .add_assignees(&ctx.repo, ctx.pr_number, &[user.clone()])
+        Command::Assign { user } => {
+            assign(
+                gh,
+                ctx,
+                &user,
+                t!(lang, "Assigned to @{user}.", "已指派给 @{user}。"),
+            )
             .await
-        {
-            Ok(()) => {
-                let _ = gh
-                    .post_issue_comment(
-                        &ctx.repo,
-                        ctx.pr_number,
-                        &t!(lang, "Assigned to @{user}.", "已指派给 @{user}。"),
-                    )
-                    .await;
-                "ok".into()
-            }
-            Err(e) => {
-                let _ = gh
-                    .post_issue_comment(
-                        &ctx.repo,
-                        ctx.pr_number,
-                        &t!(lang, "⚠️ Assignment failed: `{e}`", "⚠️ 指派失败: `{e}`"),
-                    )
-                    .await;
-                format!("error: {e}")
-            }
-        },
+        }
         Command::Claim => {
-            let who = &ctx.commenter;
-            match gh
-                .add_assignees(&ctx.repo, ctx.pr_number, &[ctx.commenter.clone()])
-                .await
-            {
-                Ok(()) => {
-                    let _ = gh
-                        .post_issue_comment(
-                            &ctx.repo,
-                            ctx.pr_number,
-                            &t!(lang, "@{who} claimed this.", "@{who} 已认领。"),
-                        )
-                        .await;
-                    "ok".into()
-                }
-                Err(e) => {
-                    let _ = gh
-                        .post_issue_comment(
-                            &ctx.repo,
-                            ctx.pr_number,
-                            &t!(lang, "⚠️ Could not claim: `{e}`", "⚠️ 认领失败: `{e}`"),
-                        )
-                        .await;
-                    format!("error: {e}")
-                }
-            }
+            let who = ctx.commenter.clone();
+            assign(
+                gh,
+                ctx,
+                &who,
+                t!(lang, "@{who} claimed this.", "@{who} 已认领。"),
+            )
+            .await
         }
-        Command::Unclaim => {
-            let who = &ctx.commenter;
-            match gh
-                .remove_assignees(&ctx.repo, ctx.pr_number, &[ctx.commenter.clone()])
-                .await
-            {
-                Ok(()) => {
-                    let _ = gh
-                        .post_issue_comment(
-                            &ctx.repo,
-                            ctx.pr_number,
-                            &t!(
-                                lang,
-                                "@{who} released the assignment.",
-                                "@{who} 已释放指派。"
-                            ),
-                        )
-                        .await;
-                    "ok".into()
-                }
-                Err(e) => {
-                    let _ = gh
-                        .post_issue_comment(
-                            &ctx.repo,
-                            ctx.pr_number,
-                            &t!(
-                                lang,
-                                "⚠️ Could not release the assignment: `{e}`",
-                                "⚠️ 释放失败: `{e}`"
-                            ),
-                        )
-                        .await;
-                    format!("error: {e}")
-                }
-            }
-        }
+        Command::Unclaim => unclaim(gh, ctx).await,
         Command::Approve { on_behalf_of } => handle_approve(gh, cfg, ctx, on_behalf_of).await,
         Command::Reject => handle_reject(gh, cfg, ctx).await,
+    }
+}
+
+/// Did GitHub actually end up with this login in the list it echoed back?
+///
+/// Logins are ASCII, so an ASCII-case comparison is exact here.
+fn contains_login(list: &[String], who: &str) -> bool {
+    list.iter().any(|l| l.eq_ignore_ascii_case(who))
+}
+
+/// `assign` / `claim`: assign one user and check that it took.
+///
+/// `success` is the caller's wording for the happy path; everything else is the
+/// same three outcomes either way. The middle one is the point: the assignees
+/// endpoint answers 201 and quietly leaves out a login it won't assign, so both
+/// commands used to report success for an assignment that never happened.
+async fn assign(gh: &Client, ctx: &CommentContext, user: &str, success: String) -> String {
+    let lang = ctx.lang;
+    let (msg, status) = match gh
+        .add_assignees(&ctx.repo, ctx.pr_number, &[user.to_string()])
+        .await
+    {
+        Ok(after) if contains_login(&after, user) => (success, "ok".to_string()),
+        Ok(_) => (
+            t!(
+                lang,
+                "⚠️ GitHub ignored the assignment of @{user} — they need write access to the repo, org membership, or a prior comment here.",
+                "⚠️ GitHub 忽略了对 @{user} 的指派 —— 用户需要有仓库写权限、或是组织成员、或曾在此留言。"
+            ),
+            "ignored".to_string(),
+        ),
+        Err(e) => {
+            tracing::warn!("assign @{user} on {}#{}: {e}", ctx.repo, ctx.pr_number);
+            (
+                t!(lang, "⚠️ Assignment failed: `{e}`", "⚠️ 指派失败: `{e}`"),
+                format!("error: {e}"),
+            )
+        }
+    };
+    let _ = gh.post_issue_comment(&ctx.repo, ctx.pr_number, &msg).await;
+    status
+}
+
+/// `unclaim`: release the commenter's own assignment.
+///
+/// Reads the assignees first. GitHub answers a removal that changed nothing with
+/// the same 200 and the same list as a removal that worked, so "were you
+/// assigned?" cannot be answered from the response — and the old code told a
+/// user who had never been assigned that their assignment was released.
+async fn unclaim(gh: &Client, ctx: &CommentContext) -> String {
+    let lang = ctx.lang;
+    let who = &ctx.commenter;
+
+    match gh.list_assignees(&ctx.repo, ctx.pr_number).await {
+        Ok(before) if !contains_login(&before, who) => {
+            let _ = gh
+                .post_issue_comment(
+                    &ctx.repo,
+                    ctx.pr_number,
+                    &t!(
+                        lang,
+                        "@{who} wasn't assigned here, so there was nothing to release.",
+                        "@{who} 本来就未被指派,无需释放。"
+                    ),
+                )
+                .await;
+            return "not-assigned".into();
+        }
+        Ok(_) => {}
+        // A failed pre-check shouldn't block the removal; it only costs the
+        // ability to distinguish the two outcomes, so say less rather than
+        // refusing to act.
+        Err(e) => tracing::warn!(
+            "could not read assignees of {}#{} before unclaim: {e}",
+            ctx.repo,
+            ctx.pr_number
+        ),
+    }
+
+    let (msg, status) = match gh
+        .remove_assignees(&ctx.repo, ctx.pr_number, &[who.clone()])
+        .await
+    {
+        Ok(after) if !contains_login(&after, who) => (
+            t!(
+                lang,
+                "@{who} released the assignment.",
+                "@{who} 已释放指派。"
+            ),
+            "ok".to_string(),
+        ),
+        Ok(_) => (
+            t!(
+                lang,
+                "⚠️ GitHub accepted the request but @{who} is still assigned.",
+                "⚠️ GitHub 接受了请求,但 @{who} 仍在指派列表中。"
+            ),
+            "not-removed".to_string(),
+        ),
+        Err(e) => {
+            tracing::warn!("unclaim @{who} on {}#{}: {e}", ctx.repo, ctx.pr_number);
+            (
+                t!(
+                    lang,
+                    "⚠️ Could not release the assignment: `{e}`",
+                    "⚠️ 释放失败: `{e}`"
+                ),
+                format!("error: {e}"),
+            )
+        }
+    };
+    let _ = gh.post_issue_comment(&ctx.repo, ctx.pr_number, &msg).await;
+    status
+}
+
+/// `r? @user` — ask for a review, and report each half separately.
+///
+/// Two endpoints with two independent outcomes. The review *request* is what
+/// GitHub shows under "Reviewers" and what a required-review rule counts; the
+/// assignment is what appears in the sidebar. They fail independently — a user
+/// with only read access can be assigned but not requested — and the old code
+/// called only the assignment while the reply claimed the request.
+///
+/// Returns `ok` when every call that was attempted succeeded, `error` when none
+/// did, and `partial` in between, so the log distinguishes "half of it worked"
+/// from "none of it did".
+async fn request_review(gh: &Client, ctx: &CommentContext, user: &str) -> String {
+    let lang = ctx.lang;
+    let users = [user.to_string()];
+    let mut lines: Vec<String> = Vec::new();
+    let mut good = 0usize;
+    let mut total = 0usize;
+
+    // An issue has no reviewers at all, so there is nothing to request and the
+    // assignment is the whole action. Skipped rather than attempted: the
+    // endpoint is under `/pulls/`, so on an issue it is a guaranteed 404.
+    if ctx.is_pr {
+        total += 1;
+        match gh.request_reviewers(&ctx.repo, ctx.pr_number, &users).await {
+            Ok(after) if contains_login(&after, user) => {
+                good += 1;
+                lines.push(t!(
+                    lang,
+                    "✅ Requested a review from @{user}.",
+                    "✅ 已请求 @{user} 审查。"
+                ));
+            }
+            Ok(_) => lines.push(t!(
+                lang,
+                "⚠️ GitHub accepted the request but @{user} is not listed as a reviewer.",
+                "⚠️ GitHub 接受了请求,但 @{user} 未出现在 reviewer 列表中。"
+            )),
+            // 422 is GitHub's way of saying this user is not eligible, which is
+            // an answer rather than a malfunction — so it gets the explanation,
+            // not a raw error string.
+            Err(GhError::Api { status: 422, .. }) => lines.push(t!(
+                lang,
+                "⚠️ @{user} can't be a reviewer on this PR — they need read access to the repo, and they can't have authored it.",
+                "⚠️ @{user} 无法成为本 PR 的 reviewer —— 需要有仓库读权限,且不能是本 PR 作者。"
+            )),
+            Err(e) => {
+                tracing::warn!(
+                    "request review from @{user} on {}#{}: {e}",
+                    ctx.repo,
+                    ctx.pr_number
+                );
+                lines.push(t!(
+                    lang,
+                    "⚠️ Review request failed: `{e}`",
+                    "⚠️ 请求审查失败: `{e}`"
+                ));
+            }
+        }
+    }
+
+    total += 1;
+    match gh.add_assignees(&ctx.repo, ctx.pr_number, &users).await {
+        Ok(after) if contains_login(&after, user) => {
+            good += 1;
+            lines.push(if ctx.is_pr {
+                t!(lang, "✅ Assigned @{user} 🙏", "✅ 已指派 @{user} 🙏")
+            } else {
+                t!(
+                    lang,
+                    "✅ Assigned @{user} — an issue has no reviewers, so this is an assignment 🙏",
+                    "✅ 已指派 @{user} —— issue 没有 reviewer,这里只是指派 🙏"
+                )
+            });
+        }
+        Ok(_) => lines.push(t!(
+            lang,
+            "⚠️ GitHub ignored the assignment of @{user} — they need write access to the repo, org membership, or a prior comment here.",
+            "⚠️ GitHub 忽略了对 @{user} 的指派 —— 用户需要有仓库写权限、或是组织成员、或曾在此留言。"
+        )),
+        Err(e) => {
+            tracing::warn!("assign @{user} on {}#{}: {e}", ctx.repo, ctx.pr_number);
+            lines.push(t!(
+                lang,
+                "⚠️ Assignment failed: `{e}`",
+                "⚠️ 指派失败: `{e}`"
+            ));
+        }
+    }
+
+    let _ = gh
+        .post_issue_comment(&ctx.repo, ctx.pr_number, &lines.join("\n"))
+        .await;
+    match good {
+        0 => "error".into(),
+        g if g == total => "ok".into(),
+        _ => "partial".into(),
     }
 }
 
@@ -659,7 +776,9 @@ async fn handle_reject(gh: &Client, _cfg: &Config, ctx: &CommentContext) -> Stri
         return "nothing-to-dismiss".into();
     }
 
-    let mut dismissed = 0;
+    let found = mine.len();
+    let mut dismissed = 0usize;
+    let mut last_err: Option<String> = None;
     for id in &mine {
         if let Err(e) = gh
             .dismiss_review(
@@ -670,22 +789,55 @@ async fn handle_reject(gh: &Client, _cfg: &Config, ctx: &CommentContext) -> Stri
             )
             .await
         {
-            tracing::warn!("dismiss review {id}: {e}");
+            tracing::warn!("dismiss review {id} on {}: {e}", ctx.repo);
+            last_err = Some(e.to_string());
         } else {
             dismissed += 1;
         }
     }
+
     let who = &ctx.commenter;
+    // Every dismissal failing used to be reported as "withdrew 0 approval(s)"
+    // with status `ok` — the approval was still standing and both the user and
+    // the log said the command had worked.
+    if dismissed == 0 {
+        let e = last_err.unwrap_or_else(|| "unknown".into());
+        let _ = gh
+            .post_issue_comment(
+                &ctx.repo,
+                ctx.pr_number,
+                &t!(
+                    lang,
+                    "❌ Could not withdraw the approval ({found} found, none dismissed): `{e}`. It is still standing.",
+                    "❌ 撤回审批失败(找到 {found} 个,全部失败): `{e}`。审批仍然有效。"
+                ),
+            )
+            .await;
+        return format!("error: {e}");
+    }
+
     let _ = gh
         .post_issue_comment(
             &ctx.repo,
             ctx.pr_number,
-            &t!(
-                lang,
-                "Withdrew {dismissed} bot approval(s) (r- by @{who}).",
-                "已撤回 {dismissed} 个 bot 审批(r- by @{who})。"
-            ),
+            &if dismissed == found {
+                t!(
+                    lang,
+                    "Withdrew {dismissed} bot approval(s) (r- by @{who}).",
+                    "已撤回 {dismissed} 个 bot 审批(r- by @{who})。"
+                )
+            } else {
+                t!(
+                    lang,
+                    "⚠️ Withdrew {dismissed} of {found} bot approval(s) (r- by @{who}); the rest failed.",
+                    "⚠️ 已撤回 {found} 个 bot 审批中的 {dismissed} 个(r- by @{who}),其余失败。"
+                )
+            },
         )
         .await;
-    "ok".into()
+    if dismissed == found {
+        "ok".into()
+    } else {
+        "partial".into()
+    }
 }

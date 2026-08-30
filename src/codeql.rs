@@ -18,7 +18,9 @@ pub async fn run_codeql_report(
     pr_number: i64,
     lang: Lang,
 ) -> String {
-    let _ = gh
+    // The placeholder is courtesy, not the deliverable: if it fails the report
+    // itself may still land, so log and carry on rather than aborting.
+    if let Err(e) = gh
         .post_issue_comment(
             repo,
             pr_number,
@@ -27,7 +29,10 @@ pub async fn run_codeql_report(
                 "🔍 正在生成 CodeQL 质量报告,稍候…",
             ),
         )
-        .await;
+        .await
+    {
+        tracing::warn!("codeql placeholder comment on {repo}#{pr_number}: {e}");
+    }
 
     match run_inner(gh, cfg, repo, pr_number, lang).await {
         Ok(status) => status,
@@ -59,8 +64,13 @@ async fn run_inner(
     let alerts = match gh.code_scanning_alerts(repo).await {
         Ok(a) => a,
         Err(GhError::Api { status: 403, .. }) | Err(GhError::Api { status: 404, .. }) => {
+            // Propagated, not swallowed: the setup instructions *are* the whole
+            // answer in this branch, and dropping them left the user watching
+            // the "one moment…" placeholder forever.
             let body = not_enabled_message(repo, lang);
-            let _ = gh.post_issue_comment(repo, pr_number, &body).await;
+            gh.post_issue_comment(repo, pr_number, &body)
+                .await
+                .map_err(|e| e.to_string())?;
             return Ok("not-enabled".into());
         }
         Err(e) => return Err(e.to_string()),
@@ -94,9 +104,12 @@ async fn run_inner(
         }
     }
 
-    // 4. render + post
+    // 4. render + post — the report is the deliverable, so a failed post is a
+    // failed command. Discarding it reported `ok` for a report nobody received.
     let report = render_report(&alerts, &relevant, &changed, lang);
-    let _ = gh.post_issue_comment(repo, pr_number, &report).await;
+    gh.post_issue_comment(repo, pr_number, &report)
+        .await
+        .map_err(|e| e.to_string())?;
     Ok("ok".into())
 }
 

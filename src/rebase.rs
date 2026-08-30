@@ -66,18 +66,63 @@ fn resolved_comment(lang: Lang) -> &'static str {
     )
 }
 
-/// Check one PR and act. Returns a short status string.
-pub async fn check_pr(gh: &Client, cfg: &Config, repo: &str, pr_number: i64) -> String {
+/// What actually happened to one PR.
+///
+/// A string was fine for the log line and useless to the sweep, which had to
+/// compare against `"flagged"` and had no way to notice a failure at all — so it
+/// reported "0 flagged, 0 errors" for a round in which every single check had
+/// failed. `Display` reproduces the old strings exactly, so the log line and
+/// existing assertions are unchanged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CheckOutcome {
+    /// Label added and the reminder posted.
+    Flagged,
+    /// Conflicted and already labelled — stay quiet.
+    AlreadyFlagged,
+    /// Label removed; the conflict is gone.
+    Cleared,
+    /// Clean and unlabelled.
+    Noop,
+    /// GitHub is still computing mergeability; the next sweep decides.
+    Unknown,
+    /// The PR isn't open.
+    Closed,
+    /// Something failed. Carries the already-prefixed message.
+    Error(String),
+}
+
+impl std::fmt::Display for CheckOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CheckOutcome::Flagged => f.write_str("flagged"),
+            CheckOutcome::AlreadyFlagged => f.write_str("already-flagged"),
+            CheckOutcome::Cleared => f.write_str("cleared"),
+            CheckOutcome::Noop => f.write_str("noop"),
+            CheckOutcome::Unknown => f.write_str("unknown"),
+            CheckOutcome::Closed => f.write_str("closed"),
+            CheckOutcome::Error(msg) => f.write_str(msg),
+        }
+    }
+}
+
+/// Check one PR and act.
+pub async fn check_pr(gh: &Client, cfg: &Config, repo: &str, pr_number: i64) -> CheckOutcome {
     let pr = match gh.get_pr(repo, pr_number).await {
         Ok(p) => p,
-        Err(e) => return format!("fetch-pr-error: {e}"),
+        Err(e) => return CheckOutcome::Error(format!("fetch-pr-error: {e}")),
     };
     // skip closed PRs
     if pr.get("state").and_then(|s| s.as_str()) != Some("open") {
-        return "closed".into();
+        return CheckOutcome::Closed;
     }
     let mergeable = pr.get("mergeable").and_then(|m| m.as_bool());
-    let labels = gh.list_labels(repo, pr_number).await.unwrap_or_default();
+    // An API failure here used to become `has_label = false`, i.e. a guess that
+    // we had never flagged this PR — which is why a conflicted PR got the same
+    // reminder comment again on every sweep for as long as the endpoint misbehaved.
+    let labels = match gh.list_labels(repo, pr_number).await {
+        Ok(l) => l,
+        Err(e) => return CheckOutcome::Error(format!("list-labels-error: {e}")),
+    };
     let has_label = labels.iter().any(|l| l == &cfg.label_needs_rebase);
     let base_branch = pr
         .pointer("/base/ref")
@@ -91,34 +136,42 @@ pub async fn check_pr(gh: &Client, cfg: &Config, repo: &str, pr_number: i64) -> 
                 .add_labels(repo, pr_number, &[cfg.label_needs_rebase.clone()])
                 .await
             {
-                return format!("add-label-error: {e}");
+                return CheckOutcome::Error(format!("add-label-error: {e}"));
             }
             // Resolved here rather than at the top of the function: the sweep
             // walks every open PR of every repo, and only two of the five
             // outcomes say anything, so the commits are worth an extra request
             // only once we know we're about to speak.
             let lang = crate::lang::for_pr(gh, repo, pr_number, None).await;
-            let _ = gh
+            // The label is the state, and it is already set — so this is
+            // flagged either way. Logged rather than propagated for that reason.
+            if let Err(e) = gh
                 .post_issue_comment(repo, pr_number, &reminder_comment(repo, &base_branch, lang))
-                .await;
-            "flagged".into()
+                .await
+            {
+                tracing::warn!("rebase reminder on {repo}#{pr_number}: {e}");
+            }
+            CheckOutcome::Flagged
         }
-        RebaseDecision::AlreadyFlagged => "already-flagged".into(),
+        RebaseDecision::AlreadyFlagged => CheckOutcome::AlreadyFlagged,
         RebaseDecision::Clear => {
             if let Err(e) = gh
                 .remove_label(repo, pr_number, &cfg.label_needs_rebase)
                 .await
             {
-                return format!("remove-label-error: {e}");
+                return CheckOutcome::Error(format!("remove-label-error: {e}"));
             }
             let lang = crate::lang::for_pr(gh, repo, pr_number, None).await;
-            let _ = gh
+            if let Err(e) = gh
                 .post_issue_comment(repo, pr_number, resolved_comment(lang))
-                .await;
-            "cleared".into()
+                .await
+            {
+                tracing::warn!("rebase resolved note on {repo}#{pr_number}: {e}");
+            }
+            CheckOutcome::Cleared
         }
-        RebaseDecision::Noop => "noop".into(),
-        RebaseDecision::Unknown => "unknown".into(),
+        RebaseDecision::Noop => CheckOutcome::Noop,
+        RebaseDecision::Unknown => CheckOutcome::Unknown,
     }
 }
 
@@ -164,6 +217,7 @@ pub async fn sweep(cfg: &Config) -> String {
 
     let mut checked = 0usize;
     let mut flagged = 0usize;
+    let mut cleared = 0usize;
     let mut errors = 0usize;
 
     for inst in &installations {
@@ -195,16 +249,25 @@ pub async fn sweep(cfg: &Config) -> String {
                     continue;
                 };
                 checked += 1;
-                let status = check_pr(&gh, cfg, &repo, n).await;
-                if status == "flagged" {
-                    flagged += 1;
+                match check_pr(&gh, cfg, &repo, n).await {
+                    CheckOutcome::Flagged => flagged += 1,
+                    CheckOutcome::Cleared => cleared += 1,
+                    // Counted at last: a sweep where every check failed used to
+                    // read exactly like a sweep where nothing needed doing.
+                    CheckOutcome::Error(msg) => {
+                        tracing::warn!("rebase check {repo}#{n}: {msg}");
+                        errors += 1;
+                    }
+                    _ => {}
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             }
         }
     }
 
-    let summary = format!("sweep done: {checked} PRs checked, {flagged} flagged, {errors} errors");
+    let summary = format!(
+        "sweep done: {checked} PRs checked, {flagged} flagged, {cleared} cleared, {errors} errors"
+    );
     tracing::info!("{summary}");
     summary
 }

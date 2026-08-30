@@ -585,10 +585,11 @@ async fn run_builtin_inner(
 
     let summary = render_summary(&verdict, "builtin", lang);
     let inline = build_inline_comments(&verdict, &added);
-    gh.post_review(repo, pr_number, &summary, inline)
+    let mode = gh
+        .post_review(repo, pr_number, &summary, inline)
         .await
         .map_err(|e: GhError| e.to_string())?;
-    Ok("ok".into())
+    Ok(mode.to_string())
 }
 
 /// Fetch (previous own review body, new commits since that review).

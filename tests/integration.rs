@@ -111,7 +111,7 @@ async fn test_ping_comment_replies_pong() {
         .mount(&server)
         .await;
 
-    let crab = octocrab::OctocrabBuilder::new()
+    let crab = xero_bot::github::client_builder()
         .personal_token("ghp_test")
         .base_uri(server.uri())
         .unwrap()
@@ -164,7 +164,7 @@ async fn test_ready_label_flow_with_mock() {
         .mount(&server)
         .await;
 
-    let crab = octocrab::OctocrabBuilder::new()
+    let crab = xero_bot::github::client_builder()
         .personal_token("ghp_test")
         .base_uri(server.uri())
         .unwrap()
@@ -214,7 +214,7 @@ async fn test_r_plus_permission_denied() {
         .mount(&server)
         .await;
 
-    let crab = octocrab::OctocrabBuilder::new()
+    let crab = xero_bot::github::client_builder()
         .personal_token("ghp_test")
         .base_uri(server.uri())
         .unwrap()
@@ -269,7 +269,7 @@ async fn test_r_plus_approves_with_write() {
         .mount(&server)
         .await;
 
-    let crab = octocrab::OctocrabBuilder::new()
+    let crab = xero_bot::github::client_builder()
         .personal_token("ghp_test")
         .base_uri(server.uri())
         .unwrap()
@@ -334,7 +334,7 @@ async fn test_rebase_check_flags_conflict() {
         .mount(&server)
         .await;
 
-    let crab = octocrab::OctocrabBuilder::new()
+    let crab = xero_bot::github::client_builder()
         .personal_token("ghp_test")
         .base_uri(server.uri())
         .unwrap()
@@ -346,7 +346,62 @@ async fn test_rebase_check_flags_conflict() {
     };
     let cfg = test_cfg();
     let status = xero_bot::rebase::check_pr(&gh, &cfg, "octocat/hello", 7).await;
-    assert_eq!(status, "flagged");
+    assert_eq!(status, xero_bot::rebase::CheckOutcome::Flagged);
+    // The log line is `Display`, so the string the operator sees is unchanged.
+    assert_eq!(status.to_string(), "flagged");
+}
+
+/// A failure to read the labels must be an error, not a guess.
+///
+/// `unwrap_or_default()` turned it into "no labels", i.e. "we have never flagged
+/// this PR" — so every sweep round re-posted the rebase reminder for as long as
+/// the endpoint kept failing.
+#[tokio::test]
+async fn test_rebase_label_read_failure_is_an_error() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/repos/octocat/hello/pulls/7"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "number": 7, "state": "open", "mergeable": false,
+            "base": {"ref": "main"}, "head": {"sha": "abc"}
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/octocat/hello/issues/7/labels"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+        .mount(&server)
+        .await;
+    // The point of the test: nothing is written on the strength of a guess.
+    Mock::given(method("POST"))
+        .and(path("/repos/octocat/hello/issues/7/labels"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .expect(0)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/repos/octocat/hello/issues/7/comments"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({"id": 1})))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let crab = xero_bot::github::client_builder()
+        .personal_token("ghp_test")
+        .base_uri(server.uri())
+        .unwrap()
+        .build()
+        .unwrap();
+    let gh = Client {
+        crab,
+        app_slug: "xero-review".into(),
+    };
+    let status = xero_bot::rebase::check_pr(&gh, &test_cfg(), "octocat/hello", 7).await;
+    assert!(
+        matches!(status, xero_bot::rebase::CheckOutcome::Error(_)),
+        "expected an error outcome, got {status:?}"
+    );
+    assert!(status.to_string().starts_with("list-labels-error:"));
 }
 
 #[tokio::test]
@@ -381,7 +436,7 @@ async fn test_codeql_report_posts_findings() {
         .mount(&server)
         .await;
 
-    let crab = octocrab::OctocrabBuilder::new()
+    let crab = xero_bot::github::client_builder()
         .personal_token("ghp_test")
         .base_uri(server.uri())
         .unwrap()
@@ -417,7 +472,7 @@ async fn test_diagnostics_are_posted_once() {
         .mount(&server)
         .await;
 
-    let crab = octocrab::OctocrabBuilder::new()
+    let crab = xero_bot::github::client_builder()
         .personal_token("ghp_test")
         .base_uri(server.uri())
         .unwrap()
@@ -463,7 +518,7 @@ async fn test_no_diagnostics_means_no_comment() {
         .mount(&server)
         .await;
 
-    let crab = octocrab::OctocrabBuilder::new()
+    let crab = xero_bot::github::client_builder()
         .personal_token("ghp_test")
         .base_uri(server.uri())
         .unwrap()
@@ -525,7 +580,7 @@ async fn claim_reply_body(
         .mount(&server)
         .await;
 
-    let crab = octocrab::OctocrabBuilder::new()
+    let crab = xero_bot::github::client_builder()
         .personal_token("ghp_test")
         .base_uri(server.uri())
         .unwrap()
@@ -605,7 +660,7 @@ async fn test_commits_error_still_replies_in_english() {
         .mount(&server)
         .await;
 
-    let crab = octocrab::OctocrabBuilder::new()
+    let crab = xero_bot::github::client_builder()
         .personal_token("ghp_test")
         .base_uri(server.uri())
         .unwrap()
@@ -645,7 +700,7 @@ async fn test_claim_works_on_an_issue() {
         .mount(&server)
         .await;
 
-    let crab = octocrab::OctocrabBuilder::new()
+    let crab = xero_bot::github::client_builder()
         .personal_token("ghp_test")
         .base_uri(server.uri())
         .unwrap()
@@ -688,7 +743,7 @@ async fn test_pr_only_commands_on_an_issue_explain_themselves() {
         .mount(&server)
         .await;
 
-    let crab = octocrab::OctocrabBuilder::new()
+    let crab = xero_bot::github::client_builder()
         .personal_token("ghp_test")
         .base_uri(server.uri())
         .unwrap()
@@ -768,7 +823,7 @@ async fn test_review_request_on_an_issue_is_called_an_assignment() {
         .mount(&server)
         .await;
 
-    let crab = octocrab::OctocrabBuilder::new()
+    let crab = xero_bot::github::client_builder()
         .personal_token("ghp_test")
         .base_uri(server.uri())
         .unwrap()

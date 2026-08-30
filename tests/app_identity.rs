@@ -35,7 +35,7 @@ fn test_cfg() -> Config {
 }
 
 fn client_for(server: &MockServer, app_slug: &str) -> Client {
-    let crab = octocrab::OctocrabBuilder::new()
+    let crab = xero_bot::github::client_builder()
         .personal_token("ghp_test")
         .base_uri(server.uri())
         .unwrap()
@@ -109,6 +109,15 @@ async fn own_previous_reviews_with_empty_slug_matches_nothing() {
         ])))
         .mount(&server)
         .await;
+    // Finding nothing in the reviews sends it to the comment fallback, which
+    // must reach the same conclusion rather than matching on the empty login.
+    Mock::given(method("GET"))
+        .and(path("/repos/octocat/hello/issues/7/comments"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            {"id": 5, "body": "just talking", "user": {"login": ""}},
+        ])))
+        .mount(&server)
+        .await;
 
     let gh = client_for(&server, "");
     let mine = gh.own_previous_reviews("octocat/hello", 7).await.unwrap();
@@ -116,6 +125,74 @@ async fn own_previous_reviews_with_empty_slug_matches_nothing() {
         mine.is_empty(),
         "empty slug must match nothing, got {mine:?}"
     );
+}
+
+/// The root fix: a review that degraded to a plain issue comment is still ours.
+///
+/// `post_review` falls back to a plain comment when the reviews endpoint is
+/// refused, and such a review is *not* in the reviews list. Identifying our own
+/// output by author-on-the-reviews-API lost it completely, so the next
+/// incremental run re-reported everything it had already said. The marker in the
+/// body is what makes it findable.
+#[tokio::test]
+async fn own_previous_reviews_falls_back_to_marked_comment() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/repos/octocat/hello/pulls/7/reviews"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/octocat/hello/issues/7/comments"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            {"id": 5, "body": "unrelated chatter", "user": {"login": "alice"},
+             "created_at": "2024-01-01T00:00:00Z"},
+            {"id": 6, "body": "findings\n\n<!-- xero-bot-review -->",
+             "user": {"login": "someone-else"},
+             "created_at": "2024-02-02T00:00:00Z"},
+        ])))
+        .mount(&server)
+        .await;
+
+    // Deliberately the wrong slug: the marker alone has to carry it, because
+    // when the slug can't be resolved that is all there is.
+    let gh = client_for(&server, "not-the-author");
+    let mine = gh.own_previous_reviews("octocat/hello", 7).await.unwrap();
+
+    assert_eq!(mine.len(), 1, "marked comment must be found, got {mine:?}");
+    assert_eq!(mine[0].get("id").and_then(|i| i.as_i64()), Some(6));
+    // The incremental context reads `submitted_at` as its "commits since"
+    // cutoff; on a comment that value lives under `created_at`.
+    assert_eq!(
+        mine[0].get("submitted_at").and_then(|s| s.as_str()),
+        Some("2024-02-02T00:00:00Z"),
+    );
+}
+
+/// Costing an extra request on every reviewed PR would be a bad trade, so the
+/// fallback only runs when the reviews list turned up nothing of ours.
+#[tokio::test]
+async fn own_previous_reviews_skips_the_fallback_when_reviews_answered() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/repos/octocat/hello/pulls/7/reviews"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            {"id": 2, "state": "COMMENTED", "body": "findings",
+             "user": {"login": "xero-review[bot]"}},
+        ])))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/octocat/hello/issues/7/comments"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let gh = client_for(&server, "xero-review");
+    let mine = gh.own_previous_reviews("octocat/hello", 7).await.unwrap();
+    assert_eq!(mine.len(), 1);
+    // wiremock verifies .expect(0) on drop
 }
 
 /// `r-` must find and dismiss the approval the bot posted for `r+`. Before the

@@ -6,6 +6,7 @@
 //! code-scanning alerts, diff fetching).
 
 use octocrab::models::{AppId, InstallationId};
+use octocrab::service::middleware::retry::RetryConfig;
 use octocrab::{Octocrab, OctocrabBuilder};
 use serde_json::{json, Value};
 
@@ -87,6 +88,44 @@ pub async fn paginate(crab: &Octocrab, route: &str) -> Result<Vec<Value>, GhErro
         .await
         .map_err(classify_octo_error)?;
     crab.all_pages(first).await.map_err(classify_octo_error)
+}
+
+/// Marker embedded in every review body this bot publishes.
+///
+/// An HTML comment, so GitHub renders nothing. Identifying our own output by
+/// content rather than by "the author is our slug, on the reviews API" is the
+/// root fix for two separate failures: the author comparison broke whenever the
+/// slug couldn't be resolved, and a review that degraded to a plain comment
+/// stopped being findable at all.
+///
+/// Deliberately *not* added to `r+` approvals — that body is a human's
+/// approval relayed by us, and marking it would feed it back to the model as
+/// "your previous review".
+pub const REVIEW_MARKER: &str = "<!-- xero-bot-review -->";
+
+/// How a review actually reached the PR.
+///
+/// Returned rather than logged because a caller that says "review posted" while
+/// the inline comments were silently dropped is making a claim it can't back —
+/// see [`Client::post_review`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewPostMode {
+    /// Posted as a review with its inline comments intact.
+    Full,
+    /// GitHub refused the inline comments; the body went out alone.
+    InlineDropped,
+    /// The reviews endpoint was unavailable; the body went out as a comment.
+    PlainComment,
+}
+
+impl std::fmt::Display for ReviewPostMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            ReviewPostMode::Full => "ok",
+            ReviewPostMode::InlineDropped => "ok-no-inline",
+            ReviewPostMode::PlainComment => "ok-as-comment",
+        })
+    }
 }
 
 /// Normalize a GitHub login for comparison.
@@ -174,6 +213,32 @@ fn encoding_key(cfg: &Config) -> Result<jsonwebtoken::EncodingKey, GhError> {
     })
 }
 
+/// The builder every client — production and test — starts from.
+///
+/// It exists to hold one decision: **retries are off**. Octocrab's default is
+/// `RetryConfig::Simple(3)`, which replays *any* request, including `POST`, on a
+/// 5xx, a 429, or a transport error — immediately, with no backoff. So every
+/// write this bot makes was being issued up to four times, and a 500 from GitHub
+/// does not mean the request failed: a review, an approval or a comment created
+/// just before the error still exists. The result was duplicate reviews nobody
+/// could tell apart, and it silently defeated [`Client::post_review`]'s whole
+/// reason for classifying failures before deciding to retry.
+///
+/// The trade is deliberate: a read that fails now surfaces as an error, and the
+/// user can re-issue the command. A duplicated write cannot be undone.
+///
+/// Centralized rather than applied at each call site so that tests exercise the
+/// same policy as production instead of restating it — a test that configured
+/// its own transport would prove nothing about the shipped one.
+pub fn client_builder() -> OctocrabBuilder<
+    octocrab::NoSvc,
+    octocrab::DefaultOctocrabBuilderConfig,
+    octocrab::NoAuth,
+    octocrab::NotLayerReady,
+> {
+    OctocrabBuilder::new().add_retry_config(RetryConfig::None)
+}
+
 impl Client {
     /// Build an app-level client (for listing installations).
     pub fn app_client(cfg: &Config) -> Result<Octocrab, GhError> {
@@ -182,7 +247,7 @@ impl Client {
             .app_id
             .parse()
             .map_err(|_| GhError::BadShape(format!("bad APP_ID: {}", cfg.app_id)))?;
-        Ok(OctocrabBuilder::new().app(AppId(app_id), key).build()?)
+        Ok(client_builder().app(AppId(app_id), key).build()?)
     }
 
     /// Build an installation-scoped client.
@@ -277,12 +342,14 @@ impl Client {
             .map_err(classify_octo_error)
     }
 
-    /// DELETE with a JSON body (remove assignees).
-    pub async fn delete_with_body(&self, route: &str, body: Value) -> Result<(), GhError> {
+    /// DELETE with a JSON body (remove assignees), returning the response.
+    ///
+    /// The body used to be discarded. It is the only evidence of what the call
+    /// actually did — see [`Client::remove_assignees`].
+    pub async fn delete_with_body(&self, route: &str, body: Value) -> Result<Value, GhError> {
         self.crab
             .delete::<Value, _, _>(route, Some(&body))
             .await
-            .map(|_| ())
             .map_err(classify_octo_error)
     }
 
@@ -433,30 +500,73 @@ impl Client {
         .await
     }
 
+    /// The `assignees` array of an issue payload, as logins.
+    fn assignee_logins(v: &Value) -> Vec<String> {
+        v.get("assignees")
+            .and_then(|a| a.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|u| u.get("login").and_then(|l| l.as_str()).map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Current assignees of an issue or PR.
+    ///
+    /// Needed because a removal that changed nothing and a removal that worked
+    /// are the same 200 with the same body — see [`Client::remove_assignees`].
+    pub async fn list_assignees(&self, repo: &str, issue: i64) -> Result<Vec<String>, GhError> {
+        let v = self.get(&format!("/repos/{repo}/issues/{issue}")).await?;
+        Ok(Self::assignee_logins(&v))
+    }
+
+    /// Assign users, returning the assignee list GitHub ended up with.
+    ///
+    /// The response was discarded, and that mattered: this endpoint **silently
+    /// ignores** a login it won't assign — no error, just a 201 whose
+    /// `assignees` array doesn't contain them. So `claim` answered "claimed"
+    /// to a user who was never assigned to anything.
     pub async fn add_assignees(
         &self,
         repo: &str,
         issue: i64,
         users: &[String],
-    ) -> Result<(), GhError> {
-        self.post(
-            &format!("/repos/{repo}/issues/{issue}/assignees"),
-            Some(json!({ "assignees": users })),
-        )
-        .await?;
-        Ok(())
+    ) -> Result<Vec<String>, GhError> {
+        let v = self
+            .post(
+                &format!("/repos/{repo}/issues/{issue}/assignees"),
+                Some(json!({ "assignees": users })),
+            )
+            .await?;
+        Ok(Self::assignee_logins(&v))
     }
 
+    /// Unassign users, returning the assignee list that remains.
+    ///
+    /// Like [`Client::add_assignees`] this is silently permissive: removing
+    /// someone who was never assigned is a success with an unchanged list.
+    /// Callers that need to tell those apart have to read the state first.
     pub async fn remove_assignees(
         &self,
         repo: &str,
         issue: i64,
         users: &[String],
-    ) -> Result<(), GhError> {
-        self.delete_with_body(
-            &format!("/repos/{repo}/issues/{issue}/assignees"),
-            json!({ "assignees": users }),
-        )
+    ) -> Result<Vec<String>, GhError> {
+        let v = self
+            .delete_with_body(
+                &format!("/repos/{repo}/issues/{issue}/assignees"),
+                json!({ "assignees": users }),
+            )
+            .await?;
+        Ok(Self::assignee_logins(&v))
+    }
+
+    /// Comments on an issue or PR, all pages.
+    pub async fn list_issue_comments(&self, repo: &str, issue: i64) -> Result<Vec<Value>, GhError> {
+        self.get_all(&format!(
+            "/repos/{repo}/issues/{issue}/comments?per_page=100"
+        ))
         .await
     }
 
@@ -517,65 +627,174 @@ impl Client {
         .await
     }
 
-    /// previous reviews left by this bot (incremental review memory)
+    /// Is this review or comment one of ours?
+    ///
+    /// The marker decides first, and the author only as a fallback. Recognising
+    /// our own output by *content* is what makes it findable at all after
+    /// [`Client::post_review`] degrades to a plain issue comment — that review
+    /// isn't in the reviews list, so identity-by-author lost it entirely and
+    /// the next incremental run re-reported everything it had already said.
+    fn looks_like_ours(v: &Value, slug: &str) -> bool {
+        let body = v.get("body").and_then(|b| b.as_str()).unwrap_or("");
+        if body.contains(REVIEW_MARKER) {
+            return true;
+        }
+        if slug.is_empty() {
+            return false;
+        }
+        v.pointer("/user/login")
+            .and_then(|l| l.as_str())
+            .map(|l| normalize_login(l) == slug)
+            .unwrap_or(false)
+    }
+
+    /// Previous reviews left by this bot, newest last (incremental review
+    /// memory).
+    ///
+    /// Costs one extra request on a PR we have never reviewed, which is exactly
+    /// when the answer is empty and the fallback has to look — a review that
+    /// degraded to a comment is indistinguishable from no review until the
+    /// comments are read.
     pub async fn own_previous_reviews(
         &self,
         repo: &str,
         number: i64,
     ) -> Result<Vec<Value>, GhError> {
-        let reviews = self.list_pr_reviews(repo, number).await?;
         // `app_slug` is already normalized; the review author is `slug[bot]`, so
         // normalize that side too or this never matches and the incremental
         // review silently has no memory.
         let slug = normalize_login(&self.app_slug);
         if slug.is_empty() {
-            tracing::warn!("app_slug is empty; cannot identify own reviews on {repo}#{number}");
-            return Ok(Vec::new());
+            tracing::warn!(
+                "app_slug is empty on {repo}#{number}; own reviews are identifiable \
+                 only by their marker"
+            );
         }
-        Ok(reviews
+        let reviews = self.list_pr_reviews(repo, number).await?;
+        let mine: Vec<Value> = reviews
             .into_iter()
-            .filter(|r| {
-                r.get("user")
-                    .and_then(|u| u.get("login"))
-                    .and_then(|l| l.as_str())
-                    .map(|l| normalize_login(l) == slug)
-                    .unwrap_or(false)
+            .filter(|r| Self::looks_like_ours(r, &slug))
+            .collect();
+        if !mine.is_empty() {
+            return Ok(mine);
+        }
+
+        // Fallback: look for a review that was published as a plain comment.
+        Ok(self
+            .list_issue_comments(repo, number)
+            .await?
+            .into_iter()
+            .filter(|c| Self::looks_like_ours(c, &slug))
+            .map(|mut c| {
+                // Hand them back in the shape a review has, so the caller
+                // needn't know which source answered. `submitted_at` is what
+                // the incremental context uses as its cutoff for "commits
+                // since the last review"; on a comment that is `created_at`.
+                if let Some(created) = c.get("created_at").cloned() {
+                    if let Some(obj) = c.as_object_mut() {
+                        obj.entry("submitted_at").or_insert(created);
+                    }
+                }
+                c
             })
             .collect())
     }
 
-    /// post a review (COMMENT event) with optional inline comments;
-    /// falls back to no-inline retry and finally a plain comment (Python bot behavior)
+    /// Request a review from users on a pull request.
+    ///
+    /// This is the endpoint that creates a review *request* — what GitHub shows
+    /// under "Reviewers" and what a required-review rule counts. Assignment
+    /// (the issues endpoint) is a different relation that merely looks like one,
+    /// and it was the only call `r?` made while the reply claimed the other.
+    ///
+    /// A 422 here is informative rather than a malfunction: it is how GitHub
+    /// says the user cannot review this PR (no access, or they authored it).
+    pub async fn request_reviewers(
+        &self,
+        repo: &str,
+        number: i64,
+        users: &[String],
+    ) -> Result<Vec<String>, GhError> {
+        let v = self
+            .post(
+                &format!("/repos/{repo}/pulls/{number}/requested_reviewers"),
+                Some(json!({ "reviewers": users })),
+            )
+            .await?;
+        Ok(v.get("requested_reviewers")
+            .and_then(|a| a.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|u| u.get("login").and_then(|l| l.as_str()).map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
+    /// Publish a review (COMMENT event) with inline comments, degrading in the
+    /// one direction that is safe.
+    ///
+    /// The old policy retried on *any* error and then posted a plain comment on
+    /// top, so a timeout or a 502 — precisely the failures where the request may
+    /// have been processed anyway — produced two or three copies of the same
+    /// review. The rule now follows what the status actually tells us:
+    ///
+    /// - **422**: GitHub rejected the request, usually because an inline comment
+    ///   points at a line that isn't in the diff. Definitively no review was
+    ///   created, so a second POST cannot duplicate one — drop the inline
+    ///   comments and try once more.
+    /// - **403/404**: the reviews endpoint is refused (missing permission, or
+    ///   the number isn't a PR). Nothing will make it work; publish the body as
+    ///   a plain comment so the work isn't lost.
+    /// - **anything else** (timeout, 5xx, transport): may have succeeded. Stop
+    ///   and report; a duplicate review is worse than a missing one, because
+    ///   nobody can tell which of the two is current.
     pub async fn post_review(
         &self,
         repo: &str,
         number: i64,
         body: &str,
         inline: Vec<Value>,
-    ) -> Result<(), GhError> {
+    ) -> Result<ReviewPostMode, GhError> {
         let route = format!("/repos/{repo}/pulls/{number}/reviews");
-        let payload = json!({
-            "body": body,
-            "event": "COMMENT",
-            "comments": inline,
-        });
-        match self.post(&route, Some(payload.clone())).await {
-            Ok(_) => return Ok(()),
-            Err(e) => tracing::warn!("review post failed: {e}"),
-        }
-        if !inline.is_empty() {
-            let payload = json!({
-                "body": body,
-                "event": "COMMENT",
-                "comments": [],
-            });
-            match self.post(&route, Some(payload)).await {
-                Ok(_) => return Ok(()),
-                Err(e) => tracing::warn!("review post (no inline) failed: {e}"),
+        let body = format!("{body}\n\n{REVIEW_MARKER}");
+        match self
+            .post(
+                &route,
+                Some(json!({"body": &body, "event": "COMMENT", "comments": &inline})),
+            )
+            .await
+        {
+            Ok(_) => return Ok(ReviewPostMode::Full),
+            Err(GhError::Api { status: 422, message }) => {
+                tracing::warn!(
+                    "review on {repo}#{number} rejected (422: {message}); \
+                     retrying without the {} inline comment(s)",
+                    inline.len()
+                );
+                if !inline.is_empty() {
+                    match self
+                        .post(
+                            &route,
+                            Some(json!({"body": &body, "event": "COMMENT", "comments": []})),
+                        )
+                        .await
+                    {
+                        Ok(_) => return Ok(ReviewPostMode::InlineDropped),
+                        Err(e) => tracing::warn!("review without inline comments failed too: {e}"),
+                    }
+                }
             }
+            Err(GhError::Api { status, message }) if status == 403 || status == 404 => {
+                tracing::warn!(
+                    "reviews endpoint on {repo}#{number} unavailable ({status}: {message}); \
+                     publishing as a plain comment"
+                );
+            }
+            Err(e) => return Err(e),
         }
-        // last resort: plain issue comment
-        self.post_issue_comment(repo, number, body).await
+        self.post_issue_comment(repo, number, &body).await?;
+        Ok(ReviewPostMode::PlainComment)
     }
 
     /// post an APPROVE review on behalf of a human (r+ command)

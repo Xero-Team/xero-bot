@@ -43,6 +43,19 @@ pub async fn engine_available(binary: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// The installation token these engines clone with.
+///
+/// Fetched here rather than by the caller because only the subprocess engines
+/// need one: `builtin` and `agent` were paying for a token they never used. And
+/// the failure has to be an error, not `unwrap_or_default()` — an empty token
+/// goes into the clone URL and comes back as an authentication failure with no
+/// indication that the token was what went missing.
+async fn installation_token(gh: &Client, cfg: &Config, installation_id: i64) -> Result<String, String> {
+    gh.installation_token(cfg, installation_id)
+        .await
+        .map_err(|e| format!("could not get an installation token: {e}"))
+}
+
 /// Clone-or-fetch the repo at `ref` into the cache dir. `token` is an
 /// installation token used for the clone URL.
 pub async fn ensure_checkout(
@@ -194,21 +207,23 @@ async fn post_subproc_result(
     let diff = gh.get_pr_diff(repo, pr_number).await.unwrap_or_default();
     let added = parse_added_lines(&truncate(&diff, cfg.max_diff_chars).0);
     let inline = build_inline_comments(&verdict, &added);
-    if let Err(e) = gh.post_review(repo, pr_number, &summary, inline).await {
-        let _ = gh
-            .post_issue_comment(
-                repo,
-                pr_number,
-                &t!(
-                    lang,
-                    "## 🤖 AI Code Review\n\n❌ Failed to publish: `{e}`",
-                    "## 🤖 AI Code Review\n\n❌ 发布失败: `{e}`"
-                ),
-            )
-            .await;
-        return format!("error: {e}");
+    match gh.post_review(repo, pr_number, &summary, inline).await {
+        Ok(mode) => mode.to_string(),
+        Err(e) => {
+            let _ = gh
+                .post_issue_comment(
+                    repo,
+                    pr_number,
+                    &t!(
+                        lang,
+                        "## 🤖 AI Code Review\n\n❌ Failed to publish: `{e}`",
+                        "## 🤖 AI Code Review\n\n❌ 发布失败: `{e}`"
+                    ),
+                )
+                .await;
+            format!("error: {e}")
+        }
     }
-    "ok".into()
 }
 
 // ---------------------------------------------------------------------------
@@ -220,7 +235,7 @@ pub async fn run_pi(
     cfg: &Config,
     repo: &str,
     pr_number: i64,
-    token: &str,
+    installation_id: i64,
     lang: Lang,
 ) -> String {
     let _ = gh
@@ -234,7 +249,7 @@ pub async fn run_pi(
         )
         .await;
 
-    if let Err(e) = run_pi_inner(gh, cfg, repo, pr_number, token, lang).await {
+    if let Err(e) = run_pi_inner(gh, cfg, repo, pr_number, installation_id, lang).await {
         let _ = gh
             .post_issue_comment(
                 repo,
@@ -256,7 +271,7 @@ async fn run_pi_inner(
     cfg: &Config,
     repo: &str,
     pr_number: i64,
-    token: &str,
+    installation_id: i64,
     lang: Lang,
 ) -> Result<(), String> {
     let meta = gh
@@ -269,7 +284,8 @@ async fn run_pi_inner(
         .ok_or("no head sha")?;
     let pr_ref = format!("pull/{pr_number}/head:{head_sha}");
 
-    let dir = ensure_checkout(cfg, repo, &pr_ref, token).await?;
+    let token = installation_token(gh, cfg, installation_id).await?;
+    let dir = ensure_checkout(cfg, repo, &pr_ref, &token).await?;
 
     let (previous_review, new_commits) =
         crate::review::fetch_incremental_context(gh, repo, pr_number, cfg.max_diff_chars).await;
@@ -334,7 +350,7 @@ pub async fn run_codex(
     cfg: &Config,
     repo: &str,
     pr_number: i64,
-    token: &str,
+    installation_id: i64,
     lang: Lang,
 ) -> String {
     let _ = gh
@@ -348,7 +364,7 @@ pub async fn run_codex(
         )
         .await;
 
-    if let Err(e) = run_codex_inner(gh, cfg, repo, pr_number, token, lang).await {
+    if let Err(e) = run_codex_inner(gh, cfg, repo, pr_number, installation_id, lang).await {
         let _ = gh
             .post_issue_comment(
                 repo,
@@ -370,7 +386,7 @@ async fn run_codex_inner(
     cfg: &Config,
     repo: &str,
     pr_number: i64,
-    token: &str,
+    installation_id: i64,
     lang: Lang,
 ) -> Result<(), String> {
     let meta = gh
@@ -383,7 +399,8 @@ async fn run_codex_inner(
         .ok_or("no head sha")?;
     let pr_ref = format!("pull/{pr_number}/head:{head_sha}");
 
-    let dir = ensure_checkout(cfg, repo, &pr_ref, token).await?;
+    let token = installation_token(gh, cfg, installation_id).await?;
+    let dir = ensure_checkout(cfg, repo, &pr_ref, &token).await?;
 
     let (previous_review, new_commits) =
         crate::review::fetch_incremental_context(gh, repo, pr_number, cfg.max_diff_chars).await;
@@ -450,27 +467,28 @@ async fn run_codex_inner(
 // Engine dispatch
 // ---------------------------------------------------------------------------
 
-/// Pick and run an engine. `token` is needed only for subprocess engines.
+/// Pick and run an engine. `installation_id` is used only by the subprocess
+/// engines, which exchange it for a clone token themselves.
 pub async fn run_review(
     gh: &Client,
     cfg: &Config,
     repo: &str,
     pr_number: i64,
-    token: &str,
+    installation_id: i64,
     lang: Lang,
 ) -> String {
     let choice = cfg.review_engine.to_lowercase();
     match choice.as_str() {
         "builtin" => crate::review::run_builtin(gh, cfg, repo, pr_number, lang).await,
         "agent" => crate::agent::run_agent_review(gh, cfg, repo, pr_number, lang).await,
-        "pi" => run_pi(gh, cfg, repo, pr_number, token, lang).await,
-        "codex" => run_codex(gh, cfg, repo, pr_number, token, lang).await,
+        "pi" => run_pi(gh, cfg, repo, pr_number, installation_id, lang).await,
+        "codex" => run_codex(gh, cfg, repo, pr_number, installation_id, lang).await,
         _ => {
             // auto: pi → codex → agent → builtin
             if engine_available(&cfg.pi_path).await {
-                run_pi(gh, cfg, repo, pr_number, token, lang).await
+                run_pi(gh, cfg, repo, pr_number, installation_id, lang).await
             } else if engine_available(&cfg.codex_path).await {
-                run_codex(gh, cfg, repo, pr_number, token, lang).await
+                run_codex(gh, cfg, repo, pr_number, installation_id, lang).await
             } else if cfg.ai_ready() {
                 crate::agent::run_agent_review(gh, cfg, repo, pr_number, lang).await
             } else {
