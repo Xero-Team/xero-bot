@@ -342,6 +342,36 @@ impl Client {
         self.post_issue_comment(repo, number, body).await
     }
 
+    /// post an APPROVE review on behalf of a human (r+ command)
+    pub async fn post_approve_review(
+        &self,
+        repo: &str,
+        number: i64,
+        body: &str,
+    ) -> Result<Value, GhError> {
+        self.post(
+            &format!("/repos/{repo}/pulls/{number}/reviews"),
+            Some(json!({"body": body, "event": "APPROVE"})),
+        )
+        .await
+    }
+
+    /// dismiss a review by id (for r-)
+    pub async fn dismiss_review(
+        &self,
+        repo: &str,
+        number: i64,
+        review_id: i64,
+        message: &str,
+    ) -> Result<(), GhError> {
+        self.put(
+            &format!("/repos/{repo}/pulls/{number}/reviews/{review_id}/dismissals"),
+            Some(json!({"message": message})),
+        )
+        .await?;
+        Ok(())
+    }
+
     // -------------------------------------------------------------------
     // Repo content (agent tools)
     // -------------------------------------------------------------------
