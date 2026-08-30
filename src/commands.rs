@@ -49,6 +49,8 @@ pub enum Command {
     },
     /// r- — withdraw approval
     Reject,
+    /// codeql report
+    Codeql,
 }
 
 /// One parsed command plus where it appeared (for ordered execution).
@@ -227,6 +229,7 @@ fn parse_verb(bot_name: &str, rest: &str) -> Option<Command> {
             Some(Command::Approve { on_behalf_of })
         }
         "r-" => Some(Command::Reject),
+        "codeql" => Some(Command::Codeql),
         _ => {
             // `r? @user` also valid right after mention: `@xero r? @user`
             if word == "r?" {
@@ -458,6 +461,12 @@ mod tests {
         );
         let cmds = parse_commands("xero-review", "@xero-review r-");
         assert!(matches!(cmds[0].command, Command::Reject));
+    }
+
+    #[test]
+    fn test_codeql() {
+        let cmds = parse_commands("xero-review", "@xero-review codeql");
+        assert!(matches!(cmds[0].command, Command::Codeql));
     }
 
     #[test]

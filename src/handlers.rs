@@ -87,6 +87,9 @@ async fn handle_one(gh: &Client, cfg: &Config, ctx: &CommentContext, cmd: Comman
                 .unwrap_or_default();
             crate::engines_subproc::run_review(gh, cfg, &ctx.repo, ctx.pr_number, &token).await
         }
+        Command::Codeql => {
+            crate::codeql::run_codeql_report(gh, cfg, &ctx.repo, ctx.pr_number).await
+        }
         Command::RequestReview { user } => {
             // triagebot: assignment is the review request
             match gh

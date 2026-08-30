@@ -1,0 +1,271 @@
+//! CodeQL quality report: read existing code-scanning alerts for the repo,
+//! intersect them with the PR's changed files, post a report comment.
+//!
+//! This is the serverless-friendly approach — no CodeQL CLI execution. The
+//! repo itself must already run CodeQL (default setup or codeql.yml workflow).
+
+use serde_json::Value;
+
+use crate::config::Config;
+use crate::github::{Client, GhError};
+
+pub async fn run_codeql_report(gh: &Client, cfg: &Config, repo: &str, pr_number: i64) -> String {
+    let _ = gh
+        .post_issue_comment(repo, pr_number, "🔍 正在生成 CodeQL 质量报告,稍候…")
+        .await;
+
+    match run_inner(gh, cfg, repo, pr_number).await {
+        Ok(status) => status,
+        Err(e) => {
+            let _ = gh
+                .post_issue_comment(
+                    repo,
+                    pr_number,
+                    &format!("## 🔍 CodeQL 质量报告\n\n❌ 出错: `{e}`"),
+                )
+                .await;
+            format!("error: {e}")
+        }
+    }
+}
+
+async fn run_inner(
+    gh: &Client,
+    _cfg: &Config,
+    repo: &str,
+    pr_number: i64,
+) -> Result<String, String> {
+    // 1. alerts
+    let alerts = match gh.code_scanning_alerts(repo).await {
+        Ok(a) => a,
+        Err(GhError::Api { status: 403, .. }) | Err(GhError::Api { status: 404, .. }) => {
+            let body = not_enabled_message(repo);
+            let _ = gh.post_issue_comment(repo, pr_number, &body).await;
+            return Ok("not-enabled".into());
+        }
+        Err(e) => return Err(e.to_string()),
+    };
+
+    // 2. changed files
+    let files = gh
+        .list_pr_files(repo, pr_number)
+        .await
+        .map_err(|e| e.to_string())?;
+    let changed: std::collections::HashSet<&str> = files
+        .iter()
+        .filter_map(|f| f.get("filename").and_then(|n| n.as_str()))
+        .collect();
+
+    // 3. intersect: alert location file ∈ changed files
+    let mut relevant: Vec<&Value> = Vec::new();
+    for alert in &alerts {
+        let Some(loc) = alert
+            .pointer("/most_recent_instance/location")
+            .cloned()
+            .or_else(|| alert.get("location").cloned())
+        else {
+            continue;
+        };
+        let Some(path) = loc.get("path").and_then(|p| p.as_str()) else {
+            continue;
+        };
+        if changed.contains(path) {
+            relevant.push(alert);
+        }
+    }
+
+    // 4. render + post
+    let report = render_report(&alerts, &relevant, &changed);
+    let _ = gh.post_issue_comment(repo, pr_number, &report).await;
+    Ok("ok".into())
+}
+
+fn severity_rank(sev: &str) -> u8 {
+    match sev.to_lowercase().as_str() {
+        "critical" => 0,
+        "error" | "high" => 1,
+        "warning" | "medium" => 2,
+        "note" | "low" => 3,
+        _ => 4,
+    }
+}
+
+fn severity_badge(sev: &str) -> (&'static str, &'static str) {
+    match sev.to_lowercase().as_str() {
+        "critical" => ("🔴", "critical"),
+        "error" | "high" => ("🟠", "error"),
+        "warning" | "medium" => ("🟡", "warning"),
+        "note" | "low" => ("🔵", "note"),
+        _ => ("⚪", "?"),
+    }
+}
+
+fn render_report(
+    all_alerts: &[Value],
+    relevant: &[&Value],
+    changed: &std::collections::HashSet<&str>,
+) -> String {
+    let mut lines = vec![
+        "## 🔍 CodeQL 质量报告".to_string(),
+        String::new(),
+        format!("- 仓库存量 open 告警: **{}** 条", all_alerts.len()),
+        format!(
+            "- 本次 PR 变更文件: **{}** 个,其中 **{}** 个文件触及存量告警",
+            changed.len(),
+            relevant
+                .iter()
+                .filter_map(|a| {
+                    a.pointer("/most_recent_instance/location/path")
+                        .or_else(|| a.pointer("/location/path"))
+                        .and_then(|p| p.as_str())
+                })
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+        ),
+        String::new(),
+    ];
+
+    if relevant.is_empty() {
+        lines.push("✅ 本次变更未触及任何存量 CodeQL 告警。".to_string());
+        return lines.join("\n");
+    }
+
+    // sort by severity
+    let mut sorted: Vec<&&Value> = relevant.iter().collect();
+    sorted.sort_by_key(|a| {
+        a.get("rule")
+            .and_then(|r| r.get("security_severity_level"))
+            .and_then(|s| s.as_str())
+            .or_else(|| {
+                a.get("rule")
+                    .and_then(|r| r.get("severity"))
+                    .and_then(|s| s.as_str())
+            })
+            .map(severity_rank)
+            .unwrap_or(4)
+    });
+
+    lines.push(format!("### 本次变更触及的告警({} 条)", sorted.len()));
+    lines.push(String::new());
+    lines.push("| 级别 | 规则 | 位置 | 说明 |".into());
+    lines.push("|---|---|---|---|".into());
+    for alert in sorted {
+        let sev = alert
+            .get("rule")
+            .and_then(|r| r.get("security_severity_level"))
+            .and_then(|s| s.as_str())
+            .or_else(|| {
+                alert
+                    .get("rule")
+                    .and_then(|r| r.get("severity"))
+                    .and_then(|s| s.as_str())
+            })
+            .unwrap_or("");
+        let (icon, label) = severity_badge(sev);
+        let rule_id = alert
+            .get("rule")
+            .and_then(|r| r.get("id"))
+            .and_then(|i| i.as_str())
+            .unwrap_or("?");
+        let description = alert
+            .get("rule")
+            .and_then(|r| r.get("description"))
+            .and_then(|d| d.as_str())
+            .unwrap_or("");
+        let (path, start_line) = alert
+            .pointer("/most_recent_instance/location")
+            .or_else(|| alert.get("location"))
+            .map(|loc| {
+                (
+                    loc.get("path").and_then(|p| p.as_str()).unwrap_or("?"),
+                    loc.get("start_line").and_then(|l| l.as_i64()).unwrap_or(0),
+                )
+            })
+            .unwrap_or(("?", 0));
+        let html_url = alert.get("html_url").and_then(|u| u.as_str()).unwrap_or("");
+        let loc_cell = if html_url.is_empty() {
+            format!("`{path}:{start_line}`")
+        } else {
+            format!("[`{path}:{start_line}`]({html_url})")
+        };
+        lines.push(format!(
+            "| {icon} {label} | `{rule_id}` | {loc_cell} | {} |",
+            description.chars().take(120).collect::<String>()
+        ));
+    }
+
+    lines.push(String::new());
+    lines.push(
+        "> 提示: 建议在本次 PR 中一并修复所列告警(或确认误报并加 `// lgtm` 忽略注释)。\
+其余未触及的存量告警不在本报告范围内。"
+            .to_string(),
+    );
+    lines.join("\n")
+}
+
+fn not_enabled_message(repo: &str) -> String {
+    format!(
+        "## 🔍 CodeQL 质量报告\n\n\
+⚠️ 仓库 `{repo}` 未启用 code scanning(或 App 无读取权限),无法生成报告。\n\n\
+**启用方式(任选其一)**:\n\
+1. **CodeQL default setup**(推荐): 仓库 Settings → Code security → Code scanning → Setup default configuration\n\
+2. **Workflow**: 添加 `.github/workflows/codeql.yml`(使用 `github/codeql-action/init` + `analyze`)\n\n\
+启用后再次评论 `@bot codeql` 即可生成报告。\n\
+_注: 私有仓库的 code scanning 需要 GitHub Advanced Security 许可。_\n\
+_同时请确认 GitHub App 已被授予 \"Code scanning alerts\" 只读权限。_"
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn alert(path: &str, line: i64, rule: &str, sev: &str) -> Value {
+        serde_json::json!({
+            "rule": {"id": rule, "severity": sev, "description": format!("{rule} description")},
+            "most_recent_instance": {"location": {"path": path, "start_line": line}},
+            "html_url": "https://github.com/x/y/security/code-scanning/1"
+        })
+    }
+
+    #[test]
+    fn test_render_report_clean() {
+        let alerts = vec![alert("other/file.rs", 1, "rs/sql-injection", "error")];
+        let mut changed = std::collections::HashSet::new();
+        changed.insert("src/main.rs");
+        let out = render_report(&alerts, &[], &changed);
+        assert!(out.contains("未触及任何存量"));
+        assert!(out.contains("**1** 条"));
+    }
+
+    #[test]
+    fn test_render_report_with_hits() {
+        let alerts = vec![
+            alert("src/main.rs", 10, "rs/sql-injection", "error"),
+            alert("src/lib.rs", 3, "js/xss", "warning"),
+        ];
+        let mut changed = std::collections::HashSet::new();
+        changed.insert("src/main.rs");
+        // only the first alert is relevant
+        let relevant: Vec<&Value> = alerts
+            .iter()
+            .filter(|a| {
+                a.pointer("/most_recent_instance/location/path")
+                    .and_then(|p| p.as_str())
+                    == Some("src/main.rs")
+            })
+            .collect();
+        let out = render_report(&alerts, &relevant, &changed);
+        assert!(out.contains("触及的告警(1 条)"));
+        assert!(out.contains("rs/sql-injection"));
+        assert!(!out.contains("js/xss"));
+    }
+
+    #[test]
+    fn test_not_enabled_message() {
+        let m = not_enabled_message("o/r");
+        assert!(m.contains("未启用"));
+        assert!(m.contains("default setup"));
+        assert!(m.contains("Advanced Security"));
+    }
+}

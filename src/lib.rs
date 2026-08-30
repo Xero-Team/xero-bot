@@ -1,3 +1,4 @@
+pub mod codeql;
 pub mod commands;
 pub mod dispatch;
 pub mod engines_subproc;
