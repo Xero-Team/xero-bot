@@ -15,6 +15,10 @@ use regex::Regex;
 pub enum Command {
     Ping,
     Help,
+    /// `r? @user` — assign reviewer
+    RequestReview {
+        user: String,
+    },
 }
 
 /// One parsed command plus where it appeared (for ordered execution).
@@ -58,17 +62,41 @@ pub fn parse_commands(bot_name: &str, text: &str) -> Vec<ParsedCommand> {
 
     // --- anchor 1: @bot mentions ---
     let mention_re = Regex::new(&format!(r"(?i)@{}\b", regex::escape(&name_lower))).unwrap();
+    let mut mention_spans: Vec<(usize, usize)> = Vec::new();
     for m in mention_re.find_iter(&cleaned) {
         let rest = &cleaned[m.end()..];
         // skip the "[bot]" suffix if present
         let rest = rest.strip_prefix("[bot]").unwrap_or(rest);
         let start = m.start();
+        mention_spans.push((start, m.end()));
         if let Some(cmd) = parse_verb(bot_name, rest) {
             commands.push(ParsedCommand {
                 command: cmd,
                 start,
             });
         }
+    }
+
+    // --- anchor 2: bare r? review requests (triagebot: works anywhere, no mention needed) ---
+    // skip occurrences that a mention already consumed (e.g. `@bot r? @user`)
+    let r_re = Regex::new(r"(?i)\br\?\s*@?([A-Za-z0-9][A-Za-z0-9-]*)").unwrap();
+    for m in r_re.captures_iter(&cleaned) {
+        let match_start = m.get(0).map(|g| g.start()).unwrap_or(0);
+        let inside_mention = mention_spans
+            .iter()
+            .any(|(s, e)| match_start >= *s && match_start < *e + 4);
+        if inside_mention {
+            continue;
+        }
+        // capture group 1 = the username
+        let user = m.get(1).map(|g| g.as_str().to_string()).unwrap_or_default();
+        if user.is_empty() || user.eq_ignore_ascii_case(&name_lower) {
+            continue;
+        }
+        commands.push(ParsedCommand {
+            command: Command::RequestReview { user },
+            start: match_start,
+        });
     }
 
     commands.sort_by_key(|c| c.start);
@@ -81,7 +109,7 @@ fn parse_verb(bot_name: &str, rest: &str) -> Option<Command> {
     let lower = trimmed.to_lowercase();
 
     // word + remainder (first whitespace boundary)
-    let (word, _args) = match lower.find(char::is_whitespace) {
+    let (word, args) = match lower.find(char::is_whitespace) {
         Some(i) => (&lower[..i], trimmed[i..].trim()),
         None => (lower.as_str(), ""),
     };
@@ -90,10 +118,43 @@ fn parse_verb(bot_name: &str, rest: &str) -> Option<Command> {
         "ping" => Some(Command::Ping),
         "help" | "commands" => Some(Command::Help),
         _ => {
-            let _ = bot_name;
-            None
+            // `r? @user` also valid right after mention: `@xero r? @user`
+            if word == "r?" {
+                let users = parse_users(args);
+                users
+                    .into_iter()
+                    .next()
+                    .map(|user| Command::RequestReview { user })
+                    .or(Some(Command::RequestReview {
+                        user: bot_name.to_string(), // self-request: ignore
+                    }))
+            } else {
+                None
+            }
         }
     }
+}
+
+/// Collect @mentions from a whitespace-separated arg string.
+fn parse_users(args: &str) -> Vec<String> {
+    args.split_whitespace()
+        .filter_map(|t| {
+            let t = t.trim();
+            if let Some(u) = t.strip_prefix('@') {
+                if is_valid_login(u) {
+                    return Some(u.to_string());
+                }
+            }
+            None
+        })
+        .collect()
+}
+
+fn is_valid_login(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 39
+        && !s.starts_with('-')
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
 }
 
 #[cfg(test)]
@@ -141,6 +202,39 @@ mod tests {
     #[test]
     fn test_plain_mention_no_verb() {
         let cmds = parse_commands("xero-review", "cc @xero-review about this");
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn test_r_question_bare() {
+        let cmds = parse_commands("xero-review", "r? @octocat");
+        assert_eq!(cmds.len(), 1);
+        match &cmds[0].command {
+            Command::RequestReview { user } => assert_eq!(user, "octocat"),
+            other => panic!("expected RequestReview, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_r_question_no_at() {
+        let cmds = parse_commands("xero-review", "thanks! r? octocat");
+        assert_eq!(cmds.len(), 1);
+        match &cmds[0].command {
+            Command::RequestReview { user } => assert_eq!(user, "octocat"),
+            other => panic!("expected RequestReview, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_r_question_after_mention() {
+        let cmds = parse_commands("xero-review", "@xero-review r? @alice");
+        assert_eq!(cmds.len(), 1);
+        assert!(matches!(&cmds[0].command, Command::RequestReview { user } if user == "alice"));
+    }
+
+    #[test]
+    fn test_r_question_inside_code_block_ignored() {
+        let cmds = parse_commands("xero-review", "```\nr? @octocat\n```");
         assert!(cmds.is_empty());
     }
 }

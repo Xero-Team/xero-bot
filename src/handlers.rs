@@ -3,7 +3,7 @@
 
 use crate::commands::Command;
 use crate::config::Config;
-use crate::github::Client;
+use crate::github::{Client, GhError};
 
 pub struct CommentContext {
     pub repo: String,
@@ -53,5 +53,33 @@ async fn handle_one(gh: &Client, cfg: &Config, ctx: &CommentContext, cmd: Comman
             .is_ok()
             .then_some("ok".into())
             .unwrap_or_else(|| "error".into()),
+        Command::RequestReview { user } => {
+            // triagebot: assignment is the review request
+            match gh
+                .add_assignees(&ctx.repo, ctx.pr_number, &[user.clone()])
+                .await
+            {
+                Ok(()) => {
+                    let _ = gh
+                        .post_issue_comment(
+                            &ctx.repo,
+                            ctx.pr_number,
+                            &format!("已指派 @{user} 为 reviewer,请审查 🙏"),
+                        )
+                        .await;
+                    "ok".into()
+                }
+                Err(e) => {
+                    let msg = match &e {
+                        GhError::Api { status, .. } if *status == 403 || *status == 422 => format!(
+                            "⚠️ 无法指派 @{user}:用户需要有仓库写权限、或是组织成员、或曾在该 PR 留言。"
+                        ),
+                        _ => format!("⚠️ 指派失败: `{e}`"),
+                    };
+                    let _ = gh.post_issue_comment(&ctx.repo, ctx.pr_number, &msg).await;
+                    format!("error: {e}")
+                }
+            }
+        }
     }
 }
