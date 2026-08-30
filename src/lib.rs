@@ -1,5 +1,6 @@
 pub mod commands;
 pub mod dispatch;
+pub mod engines_subproc;
 pub mod config;
 pub mod github;
 pub mod handlers;
