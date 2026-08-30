@@ -47,13 +47,31 @@ fn chrono_now_secs() -> i64 {
         .unwrap_or(0)
 }
 
+/// Build the RS256 signing key from the configured PEM.
+///
+/// GitHub App keys are RSA — PKCS#1 (`BEGIN RSA PRIVATE KEY`) as downloaded
+/// from the App settings page, or PKCS#8 (`BEGIN PRIVATE KEY`) after an
+/// `openssl pkcs8` conversion. `from_rsa_pem` accepts both; parsing as EC
+/// rejects every real App key with `InvalidKeyFormat`.
+fn encoding_key(cfg: &Config) -> Result<jsonwebtoken::EncodingKey, GhError> {
+    let pem = cfg.pem().map_err(GhError::BadShape)?;
+    jsonwebtoken::EncodingKey::from_rsa_pem(pem.as_bytes()).map_err(|e| {
+        // Report shape, never key material, so a misconfigured key is
+        // diagnosable from the logs alone.
+        let head = pem.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+        GhError::BadShape(format!(
+            "bad PEM key: {e} (loaded {} bytes, first line {:?}) — expected an RSA \
+             private key; check PRIVATE_KEY_B64 / PRIVATE_KEY_PATH",
+            pem.len(),
+            head.trim()
+        ))
+    })
+}
+
 impl Client {
     /// Build an app-level client (for listing installations).
     pub fn app_client(cfg: &Config) -> Result<Octocrab, GhError> {
-        let key = jsonwebtoken::EncodingKey::from_ec_pem(
-            cfg.pem().map_err(GhError::BadShape)?.as_bytes(),
-        )
-        .map_err(|e| GhError::BadShape(format!("bad PEM key: {e}")))?;
+        let key = encoding_key(cfg)?;
         let app_id: u64 = cfg
             .app_id
             .parse()
@@ -170,10 +188,7 @@ impl Client {
             "exp": now + 9 * 60,
             "iss": cfg.app_id,
         });
-        let key = jsonwebtoken::EncodingKey::from_ec_pem(
-            cfg.pem().map_err(GhError::BadShape)?.as_bytes(),
-        )
-        .map_err(|e| GhError::BadShape(format!("bad PEM key: {e}")))?;
+        let key = encoding_key(cfg)?;
         let jwt = jsonwebtoken::encode(
             &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256),
             &claims,

@@ -98,20 +98,45 @@ fn bool_cfg(key: &str, default: bool) -> bool {
         .unwrap_or(default)
 }
 
+/// Resolve the App private key from `PRIVATE_KEY_B64` (works anywhere) or
+/// `PRIVATE_KEY_PATH` (self-hosted only).
+///
+/// Both sources are treated as unset when blank. This matters: a leftover
+/// `PRIVATE_KEY_B64=` in `.env` is a *set* variable whose empty value decodes
+/// to an empty key, which would otherwise shadow `PRIVATE_KEY_PATH` and fail
+/// much later as an opaque `InvalidKeyFormat` at JWT-signing time.
 fn read_key_pem() -> Option<String> {
-    if let Ok(b64) = env::var("PRIVATE_KEY_B64") {
-        let b64 = b64.trim();
-        if !b64.is_empty() {
-            use base64::Engine;
-            if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64) {
-                if let Ok(pem) = String::from_utf8(bytes) {
-                    return Some(pem);
-                }
-            }
+    if let Some(b64) = env::var("PRIVATE_KEY_B64")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+    {
+        use base64::Engine;
+        match base64::engine::general_purpose::STANDARD.decode(b64.trim()) {
+            Ok(bytes) => match String::from_utf8(bytes) {
+                Ok(pem) if !pem.trim().is_empty() => return Some(pem),
+                Ok(_) => tracing::warn!("PRIVATE_KEY_B64 decoded to empty content; ignoring"),
+                Err(e) => tracing::warn!("PRIVATE_KEY_B64 is not valid UTF-8: {e}; ignoring"),
+            },
+            Err(e) => tracing::warn!("PRIVATE_KEY_B64 is not valid base64: {e}; ignoring"),
         }
     }
+
     let path = env::var("PRIVATE_KEY_PATH").ok()?;
-    std::fs::read_to_string(Path::new(&path)).ok()
+    let path = path.trim();
+    if path.is_empty() {
+        return None;
+    }
+    match std::fs::read_to_string(Path::new(path)) {
+        Ok(pem) if !pem.trim().is_empty() => Some(pem),
+        Ok(_) => {
+            tracing::warn!("PRIVATE_KEY_PATH file is empty: {path}");
+            None
+        }
+        Err(e) => {
+            tracing::warn!("cannot read PRIVATE_KEY_PATH {path}: {e}");
+            None
+        }
+    }
 }
 
 impl Config {
@@ -169,11 +194,25 @@ impl Config {
         if self.bot_name.is_empty() {
             missing.push("BOT_NAME");
         }
-        if missing.is_empty() {
-            Ok(())
-        } else {
-            Err(format!("missing required env vars: {}", missing.join(", ")))
+        if !missing.is_empty() {
+            return Err(format!("missing required env vars: {}", missing.join(", ")));
         }
+
+        // Parse the key now: signing happens on a background task whose errors
+        // are only logged, so an unusable key would otherwise surface as a
+        // per-webhook `InvalidKeyFormat` instead of a startup failure.
+        if let Some(pem) = &self.private_key_pem {
+            if jsonwebtoken::EncodingKey::from_rsa_pem(pem.as_bytes()).is_err() {
+                let head = pem.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+                return Err(format!(
+                    "private key is not a usable RSA PEM (loaded {} bytes, first line {:?}). \
+                     Use the .pem downloaded from the GitHub App settings page.",
+                    pem.len(),
+                    head.trim()
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// AI config is only needed when a review actually runs; check lazily.
