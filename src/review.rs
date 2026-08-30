@@ -13,6 +13,50 @@ use crate::t;
 
 pub const SEVERITIES: [&str; 5] = ["critical", "high", "medium", "low", "info"];
 
+/// Fold any severity word we might be handed into one of [`SEVERITIES`].
+///
+/// Three vocabularies reach the renderers: our own five buckets (from the model
+/// prompt), SARIF's `none`/`note`/`warning`/`error` (CodeQL `rule.severity`),
+/// and CVSS's `low`/`medium`/`high`/`critical` (CodeQL
+/// `security_severity_level`). Every place that read a severity used to do its
+/// own matching, and they disagreed — a finding marked `warning` was counted
+/// under *info* in the summary table, listed in *no* section at all (the filter
+/// compared the raw string against the five buckets), and still emitted as an
+/// inline comment with the info dot. One report, three different answers about
+/// the same finding.
+///
+/// Anything unrecognized becomes `info` rather than being dropped: an
+/// unexpected word from a model is not a reason to lose the finding.
+pub fn canon_severity(raw: &str) -> &'static str {
+    match raw.trim().to_lowercase().as_str() {
+        "critical" | "blocker" => "critical",
+        "high" | "error" => "high",
+        "medium" | "moderate" | "warning" => "medium",
+        "low" | "note" | "minor" => "low",
+        _ => "info",
+    }
+}
+
+/// Escape a value going into a Markdown table cell.
+///
+/// A `|` ends the cell and a newline ends the row, so an unescaped one from a
+/// rule description silently shifts every following column — the location and
+/// the link end up under the wrong headers. GitHub renders `\|` as a literal
+/// pipe; there is no way to put a real line break inside a cell, so newlines
+/// fold to a space.
+pub fn md_cell(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '|' => out.push_str("\\|"),
+            '\r' => {}
+            '\n' => out.push(' '),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 /// The dot alone. Split out from [`sev_meta`] so callers that only draw the
 /// badge — inline comments, whose body text comes from the model — needn't
 /// carry a language just to throw the label away.
@@ -43,6 +87,14 @@ pub fn sev_meta(sev: &str, lang: Lang) -> (&'static str, &'static str) {
 
 /// For each file, collect line numbers on the new side that were added.
 /// These are the only lines GitHub lets inline review comments attach to.
+///
+/// `+++` is ambiguous in a unified diff: it introduces the new-side filename in
+/// a header, and it is also what an added line whose content starts with `++ `
+/// looks like. Reading it positionally — a header only where a header can
+/// appear — is the only way to tell them apart. Treating every `+++ ` as a
+/// header meant such a line cleared `current_file`, so **every remaining added
+/// line in that file was dropped** and none of its findings could be posted
+/// inline. Diffs of Markdown and of diffs themselves hit this routinely.
 pub fn parse_added_lines(
     diff: &str,
 ) -> std::collections::HashMap<String, std::collections::HashSet<i64>> {
@@ -55,19 +107,38 @@ pub fn parse_added_lines(
 
     let mut current_file: Option<String> = None;
     let mut new_line: i64 = 0;
+    // A `+++` line is a header only here: after `diff --git`, or after a `---`
+    // seen outside a hunk (a bare unified diff with no `diff --git` at all).
+    let mut expect_file_header = false;
+    // Inside a hunk every `---`/`+++` is content — a removed or added line
+    // whose own text begins with `--`/`++`.
+    let mut in_hunk = false;
 
     for line in diff.lines() {
-        if let Some(m) = file_re.captures(line) {
-            let name = m.get(1).unwrap().as_str().to_string();
-            added.entry(name.clone()).or_default();
-            current_file = Some(name);
-            continue;
-        }
-        if line.starts_with("+++ ") {
+        if line.starts_with("diff --git ") {
+            expect_file_header = true;
+            in_hunk = false;
             current_file = None;
             continue;
         }
+        if !in_hunk && line.starts_with("--- ") {
+            expect_file_header = true;
+            continue;
+        }
+        if expect_file_header && line.starts_with("+++ ") {
+            expect_file_header = false;
+            // `+++ /dev/null` (a deletion) and anything else not under `b/`
+            // leaves no file to attach comments to.
+            current_file = file_re.captures(line).map(|m| {
+                let name = m.get(1).unwrap().as_str().to_string();
+                added.entry(name.clone()).or_default();
+                name
+            });
+            continue;
+        }
         if line.starts_with("@@") {
+            expect_file_header = false;
+            in_hunk = true;
             if let Some(mm) = hunk_re.captures(line) {
                 new_line = mm.get(1).and_then(|d| d.as_str().parse().ok()).unwrap_or(0) - 1;
             }
@@ -88,11 +159,24 @@ pub fn parse_added_lines(
     added
 }
 
-pub fn truncate(diff: &str, max_chars: usize) -> (String, bool) {
-    if diff.len() <= max_chars {
-        return (diff.to_string(), false);
+/// Cut `text` to at most `max_bytes`, reporting whether anything was dropped.
+///
+/// The budget is bytes, because that is what the guard has always measured
+/// (`str::len`) and what a request body is limited by. The cut used to be in
+/// *chars*, so the two halves disagreed: a diff over the byte limit was
+/// truncated to `max_bytes` **characters**, up to 3× the intended budget on CJK
+/// text — exactly the input most likely to be near the limit in the first
+/// place. Slicing needs a char boundary, so the cut walks back to the nearest
+/// one; that loses at most three bytes.
+pub fn truncate(text: &str, max_bytes: usize) -> (String, bool) {
+    if text.len() <= max_bytes {
+        return (text.to_string(), false);
     }
-    (diff.chars().take(max_chars).collect(), true)
+    let mut end = max_bytes;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    (text[..end].to_string(), true)
 }
 
 // ---------------------------------------------------------------------------
@@ -367,6 +451,12 @@ that were resolved or rejected, and confirm the fixes in your summary):\n{p}\n",
 // Rendering & posting
 // ---------------------------------------------------------------------------
 
+/// One finding's bucket. The single reader of the `severity` field, so the
+/// three renderers below cannot drift apart again.
+fn finding_severity(f: &Value) -> &'static str {
+    canon_severity(f.get("severity").and_then(|s| s.as_str()).unwrap_or("info"))
+}
+
 pub fn render_summary(verdict: &Value, engine_tag: &str, lang: Lang) -> String {
     let findings = verdict
         .get("findings")
@@ -383,15 +473,9 @@ pub fn render_summary(verdict: &Value, engine_tag: &str, lang: Lang) -> String {
         counts.insert(s, 0);
     }
     for f in &findings {
-        let sev = f
-            .get("severity")
-            .and_then(|s| s.as_str())
-            .unwrap_or("info")
-            .to_lowercase();
-        match counts.get_mut(sev.as_str()) {
-            Some(c) => *c += 1,
-            None => *counts.get_mut("info").unwrap() += 1,
-        }
+        // Via `canon_severity`, so this count, the sections below and the
+        // inline comments all put the finding in the same bucket.
+        *counts.get_mut(finding_severity(f)).unwrap() += 1;
     }
 
     let mut table = String::from(lang.pick(
@@ -424,13 +508,7 @@ pub fn render_summary(verdict: &Value, engine_tag: &str, lang: Lang) -> String {
     for s in SEVERITIES {
         let items: Vec<&Value> = findings
             .iter()
-            .filter(|f| {
-                f.get("severity")
-                    .and_then(|x| x.as_str())
-                    .unwrap_or("info")
-                    .to_lowercase()
-                    == s
-            })
+            .filter(|f| finding_severity(f) == s)
             .collect();
         if items.is_empty() {
             continue;
@@ -484,12 +562,7 @@ pub fn build_inline_comments(
         {
             continue;
         }
-        let sev = f
-            .get("severity")
-            .and_then(|x| x.as_str())
-            .unwrap_or("info")
-            .to_lowercase();
-        let icon = sev_icon(&sev);
+        let icon = sev_icon(finding_severity(f));
         let title = f.get("title").and_then(|x| x.as_str()).unwrap_or("");
         let desc = f.get("description").and_then(|x| x.as_str()).unwrap_or("");
         let sug = f.get("suggestion").and_then(|x| x.as_str()).unwrap_or("");
@@ -597,7 +670,7 @@ pub async fn fetch_incremental_context(
     gh: &Client,
     repo: &str,
     pr_number: i64,
-    max_chars: usize,
+    max_bytes: usize,
 ) -> (Option<String>, Option<String>) {
     let prev = gh
         .own_previous_reviews(repo, pr_number)
@@ -607,7 +680,10 @@ pub async fn fetch_incremental_context(
         .iter()
         .rev()
         .find_map(|r| r.get("body").and_then(|b| b.as_str()).map(String::from))
-        .map(|b| b.chars().take(max_chars / 2).collect::<String>());
+        // Through `truncate` for the same reason: taking `max/2` *chars* of a
+        // Chinese review body spends up to 1.5× the whole prompt budget on the
+        // half of it meant for context.
+        .map(|b| truncate(&b, max_bytes / 2).0);
 
     let new_commits = if prev.is_empty() {
         None
@@ -687,6 +763,53 @@ index 111..222 100644
         assert_eq!(set.len(), 4);
     }
 
+    /// A content line that happens to start with `++ ` is not a file header.
+    /// It used to clear `current_file`, so every added line after it in the same
+    /// file was lost and no finding there could be posted inline.
+    #[test]
+    fn added_lines_survive_a_plus_plus_content_line() {
+        let diff = "\
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,1 +1,4 @@
+ # Changelog
++++ nested diff marker
++-- and the old-side one too
++real content
+";
+        let added = parse_added_lines(diff);
+        let set = added.get("CHANGELOG.md").expect("file must be tracked");
+        assert_eq!(
+            set,
+            &[2i64, 3, 4].into_iter().collect(),
+            "content lines after a `++ ` line were dropped: {set:?}"
+        );
+    }
+
+    /// `+++ /dev/null` names no file on the new side, so there is nothing to
+    /// attach to — and it must not leave the *previous* file selected.
+    #[test]
+    fn deleted_file_selects_nothing() {
+        let diff = "\
+diff --git a/keep.rs b/keep.rs
+--- a/keep.rs
++++ b/keep.rs
+@@ -1,1 +1,2 @@
+ a
++b
+diff --git a/gone.rs b/gone.rs
+--- a/gone.rs
++++ /dev/null
+@@ -1,1 +0,0 @@
+-x
+";
+        let added = parse_added_lines(diff);
+        assert_eq!(added.get("keep.rs"), Some(&[2i64].into_iter().collect()));
+        assert!(!added.contains_key("gone.rs"));
+        assert_eq!(added.len(), 1, "{added:?}");
+    }
+
     #[test]
     fn test_truncate() {
         let (d, t) = truncate("hello", 10);
@@ -695,6 +818,93 @@ index 111..222 100644
         let (d, t) = truncate("hello world", 5);
         assert_eq!(d, "hello");
         assert!(t);
+    }
+
+    /// The guard measured bytes and the cut counted chars, so a CJK diff over
+    /// the limit was truncated to `max` *characters* — 3× the budget.
+    #[test]
+    fn truncate_budget_is_bytes_and_cuts_on_a_boundary() {
+        // 10 chars, 30 bytes.
+        let cjk = "一二三四五六七八九十";
+        assert_eq!(cjk.len(), 30);
+
+        // Under budget in bytes: untouched.
+        let (d, t) = truncate(cjk, 30);
+        assert_eq!(d, cjk);
+        assert!(!t);
+
+        // Over budget: the result must respect the byte budget, not blow past
+        // it — the old code returned all 30 bytes here.
+        let (d, t) = truncate(cjk, 10);
+        assert!(t);
+        assert!(d.len() <= 10, "{} bytes for a 10-byte budget", d.len());
+        // 10 is mid-character (bytes 9..12 are 四), so it backs off to 9.
+        assert_eq!(d, "一二三");
+
+        // A budget smaller than the first character yields nothing rather than
+        // panicking on a mid-character slice.
+        let (d, t) = truncate(cjk, 2);
+        assert_eq!(d, "");
+        assert!(t);
+    }
+
+    #[test]
+    fn canon_severity_folds_every_vocabulary() {
+        // ours
+        for s in SEVERITIES {
+            assert_eq!(canon_severity(s), s);
+        }
+        // SARIF (CodeQL rule.severity)
+        assert_eq!(canon_severity("error"), "high");
+        assert_eq!(canon_severity("warning"), "medium");
+        assert_eq!(canon_severity("note"), "low");
+        assert_eq!(canon_severity("none"), "info");
+        // case and stray whitespace
+        assert_eq!(canon_severity(" WARNING "), "medium");
+        // unknown words land in info rather than being dropped
+        assert_eq!(canon_severity("spicy"), "info");
+        assert_eq!(canon_severity(""), "info");
+    }
+
+    /// The regression that motivated `canon_severity`: one finding, three
+    /// renderers, and they disagreed about which bucket it was in.
+    #[test]
+    fn a_sarif_severity_is_counted_listed_and_marked_alike() {
+        let verdict = serde_json::json!({
+            "summary": "s",
+            "findings": [
+                {"severity": "warning", "title": "t", "file": "src/main.rs", "line": 3,
+                 "description": "d", "suggestion": ""}
+            ]
+        });
+        let out = render_summary(&verdict, "", Lang::En);
+        // Counted as medium in the table...
+        assert!(out.contains("| 🟡 medium | 1 |"), "{out}");
+        assert!(out.contains("| ⚪ info | 0 |"), "{out}");
+        // ...and listed under the matching section, which it appeared in at
+        // all before only if the raw word was one of our five.
+        assert!(out.contains("### 🟡 medium (1)"), "{out}");
+        // ...and the inline comment carries the same dot.
+        let added = parse_added_lines(SAMPLE_DIFF);
+        let inline = build_inline_comments(&verdict, &added);
+        assert_eq!(inline.len(), 1);
+        assert!(
+            inline[0]["body"].as_str().unwrap().starts_with("🟡"),
+            "{:?}",
+            inline[0]["body"]
+        );
+    }
+
+    #[test]
+    fn md_cell_escapes_pipes_and_newlines() {
+        assert_eq!(md_cell("a|b"), "a\\|b");
+        assert_eq!(md_cell("a\r\nb"), "a b");
+        assert_eq!(md_cell("plain"), "plain");
+        // A row must stay one row no matter what the cell contains.
+        let cell = md_cell("x | y\nz");
+        assert!(!cell.contains('\n'));
+        assert_eq!(cell.matches('|').count(), 1);
+        assert!(cell.contains("\\|"));
     }
 
     #[test]

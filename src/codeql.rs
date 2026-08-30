@@ -9,6 +9,7 @@ use serde_json::Value;
 use crate::config::Config;
 use crate::github::{Client, GhError};
 use crate::lang::Lang;
+use crate::review::md_cell;
 use crate::t;
 
 pub async fn run_codeql_report(
@@ -113,24 +114,24 @@ async fn run_inner(
     Ok("ok".into())
 }
 
+/// Sort key: 0 is the most severe.
+///
+/// Both this and [`severity_badge`] go through `canon_severity` so the CodeQL
+/// report and the AI review agree on what a word means — they had separate
+/// tables, and an alert whose `security_severity_level` was `moderate` sorted
+/// last here while the AI review would have called it medium.
 fn severity_rank(sev: &str) -> u8 {
-    match sev.to_lowercase().as_str() {
-        "critical" => 0,
-        "error" | "high" => 1,
-        "warning" | "medium" => 2,
-        "note" | "low" => 3,
-        _ => 4,
-    }
+    crate::review::SEVERITIES
+        .iter()
+        .position(|s| *s == crate::review::canon_severity(sev))
+        .unwrap_or(crate::review::SEVERITIES.len()) as u8
 }
 
-fn severity_badge(sev: &str) -> (&'static str, &'static str) {
-    match sev.to_lowercase().as_str() {
-        "critical" => ("🔴", "critical"),
-        "error" | "high" => ("🟠", "error"),
-        "warning" | "medium" => ("🟡", "warning"),
-        "note" | "low" => ("🔵", "note"),
-        _ => ("⚪", "?"),
-    }
+/// The dot and its label, in the reader's language. Previously the label was
+/// SARIF's own vocabulary and English-only, so a Chinese report said
+/// "🟡 warning" in a table headed 级别.
+fn severity_badge(sev: &str, lang: Lang) -> (&'static str, &'static str) {
+    crate::review::sev_meta(crate::review::canon_severity(sev), lang)
 }
 
 fn render_report(
@@ -220,7 +221,7 @@ fn render_report(
                     .and_then(|s| s.as_str())
             })
             .unwrap_or("");
-        let (icon, label) = severity_badge(sev);
+        let (icon, label) = severity_badge(sev, lang);
         let rule_id = alert
             .get("rule")
             .and_then(|r| r.get("id"))
@@ -242,14 +243,22 @@ fn render_report(
             })
             .unwrap_or(("?", 0));
         let html_url = alert.get("html_url").and_then(|u| u.as_str()).unwrap_or("");
+        // Escaped before it goes in a cell: a rule description is prose from
+        // the query author, and a single `|` in it shifted every column after
+        // it — the location cell landed under "Description".
+        let path = md_cell(path);
         let loc_cell = if html_url.is_empty() {
             format!("`{path}:{start_line}`")
         } else {
             format!("[`{path}:{start_line}`]({html_url})")
         };
+        // Truncate first, escape second, so the cut can't land between the `\`
+        // and the `|` it escapes.
+        let description: String = description.chars().take(120).collect();
         lines.push(format!(
-            "| {icon} {label} | `{rule_id}` | {loc_cell} | {} |",
-            description.chars().take(120).collect::<String>()
+            "| {icon} {label} | `{}` | {loc_cell} | {} |",
+            md_cell(rule_id),
+            md_cell(&description)
         ));
     }
 
@@ -333,6 +342,46 @@ mod tests {
         assert!(out.contains("触及的告警(1 条)"));
         assert!(out.contains("rs/sql-injection"));
         assert!(!out.contains("js/xss"));
+    }
+
+    /// The badge vocabulary is now shared with the AI review, and localized:
+    /// a Chinese report used to say "🟡 warning" under a 级别 header.
+    #[test]
+    fn severity_badge_is_shared_and_localized() {
+        assert_eq!(severity_badge("error", Lang::En), ("🟠", "high"));
+        assert_eq!(severity_badge("error", Lang::Zh), ("🟠", "高"));
+        assert_eq!(severity_badge("warning", Lang::Zh), ("🟡", "中"));
+        // `security_severity_level` is CVSS, `rule.severity` is SARIF — both
+        // reach this function, and both must rank the same way.
+        assert_eq!(severity_rank("error"), severity_rank("high"));
+        assert_eq!(severity_rank("warning"), severity_rank("medium"));
+        assert!(severity_rank("critical") < severity_rank("note"));
+        assert!(severity_rank("note") < severity_rank("nonsense"));
+    }
+
+    /// A `|` in a rule description shifted every column after it, so the
+    /// location cell rendered under "Description".
+    #[test]
+    fn table_cells_are_escaped() {
+        let mut a = alert("src/main.rs", 10, "rs/pipe", "error");
+        a["rule"]["description"] = serde_json::json!("takes a|b and\nsplits it");
+        let alerts = vec![a];
+        let relevant: Vec<&Value> = alerts.iter().collect();
+        let mut changed = std::collections::HashSet::new();
+        changed.insert("src/main.rs");
+        let out = render_report(&alerts, &relevant, &changed, Lang::En);
+
+        let row = out
+            .lines()
+            .find(|l| l.contains("rs/pipe"))
+            .expect("row must exist");
+        // Header, separator and the row all have to agree on column count.
+        assert_eq!(
+            row.matches('|').count() - row.matches("\\|").count(),
+            5,
+            "column count broken: {row}"
+        );
+        assert!(row.contains("takes a\\|b and splits it"), "{row}");
     }
 
     #[test]

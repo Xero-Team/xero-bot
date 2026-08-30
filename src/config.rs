@@ -22,6 +22,9 @@ pub struct Config {
     pub ai_api_key: String,
     pub ai_model: String,
     pub api_format: String,
+    /// Diff budget for the prompt, in **bytes** — `MAX_DIFF_CHARS` keeps its
+    /// name for compatibility, but the guard has always measured `str::len`,
+    /// and [`crate::review::truncate`] now cuts in the same unit it checks.
     pub max_diff_chars: usize,
 
     // Review engines
