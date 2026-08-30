@@ -29,3 +29,8 @@ thiserror = "2"
 http = "1"
 http-body-util = "0.1"
 bytes = "1"
+
+# --- self-hosted server binary (docker / VPS) ---
+[[bin]]
+name = "server"
+path = "src/main.rs"
