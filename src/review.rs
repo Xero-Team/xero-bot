@@ -134,6 +134,57 @@ pub fn parse_verdict(text: &str) -> Option<Value> {
     None
 }
 
+// ---------------------------------------------------------------------------
+// Prompt
+// ---------------------------------------------------------------------------
+
+pub const SYSTEM_PROMPT: &str =
+    "你是一名资深、严谨的安全与代码质量审查员。审查 pull request 的代码改动,\
+按风险分级输出问题。只报告真实问题,不要为了凑数编造。\
+输出必须是严格的 JSON(不要加任何解释性文字、不要 markdown 围栏)。\
+JSON schema: \
+{\"summary\": \"一句话总体评价\", \
+\"findings\": [{\"severity\": \"critical|high|medium|low|info\", \
+\"title\": \"简短标题\", \"file\": \"改动中的文件路径\", \
+\"line\": 整数行号(改动新增行之一,若不适用填1), \
+\"description\": \"问题描述与潜在影响\", \
+\"suggestion\": \"具体修复建议\"}]}。\
+severity 标准: critical=安全漏洞(注入/RCE/鉴权绕过/数据丢失); \
+high=逻辑bug/资源泄漏/竞态/核心功能损坏; \
+medium=边界条件/错误处理缺失; low=风格/可维护性; info=建议/疑问/nit。\
+用中文输出 description 和 suggestion。若无问题, findings 为空数组。";
+
+pub fn build_user_prompt(
+    diff: &str,
+    pr_meta: &Value,
+    truncated: bool,
+    previous_review: Option<&str>,
+    new_commits: Option<&str>,
+) -> String {
+    let title = pr_meta.get("title").and_then(|t| t.as_str()).unwrap_or("");
+    let body: String = pr_meta
+        .get("body")
+        .and_then(|b| b.as_str())
+        .unwrap_or("")
+        .chars()
+        .take(2000)
+        .collect();
+    let note = if truncated {
+        "\n\n[注意: diff 已截断,仅展示前部分改动]\n"
+    } else {
+        ""
+    };
+    let prev_section = previous_review
+        .map(|p| format!("\n## 上一轮审查意见(检查这些是否已修复;避免重复已被解决/驳回的发现,如已修复请在总结中确认):\n{p}\n"))
+        .unwrap_or_default();
+    let commits_section = new_commits
+        .map(|c| format!("\n## 自上一轮审查以来的新提交(重点审查增量):\n{c}\n"))
+        .unwrap_or_default();
+    format!(
+        "PR 标题: {title}\nPR 描述: {body}\n{prev_section}{commits_section}\n以下是 PR 的 unified diff(只关注新增的代码):\n{diff}{note}\n\n请审查上述改动并按指定 JSON schema 输出。"
+    )
+}
+
 fn extract_ai_text(fmt: &str, out: &Value) -> Result<String, String> {
     match fmt {
         "chat" => out
@@ -305,5 +356,21 @@ index 111..222 100644
     fn test_parse_verdict_none() {
         assert!(parse_verdict("").is_none());
         assert!(parse_verdict("no json here").is_none());
+    }
+
+    #[test]
+    fn test_build_user_prompt_incremental_sections() {
+        let meta = serde_json::json!({"title": "T", "body": "B"});
+        let p = build_user_prompt(
+            "d",
+            &meta,
+            false,
+            Some("上一轮: 修了 X"),
+            Some("fix: a\nfix: b"),
+        );
+        assert!(p.contains("上一轮审查意见"));
+        assert!(p.contains("上一轮: 修了 X"));
+        assert!(p.contains("新提交"));
+        assert!(p.contains("fix: a"));
     }
 }
