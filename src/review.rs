@@ -7,6 +7,7 @@
 use serde_json::{json, Value};
 
 use crate::config::Config;
+use crate::github::Client;
 
 pub const SEVERITIES: [&str; 5] = ["critical", "high", "medium", "low", "info"];
 
@@ -437,6 +438,66 @@ pub fn truncate(diff: &str, max_chars: usize) -> (String, bool) {
         return (diff.to_string(), false);
     }
     (diff.chars().take(max_chars).collect(), true)
+}
+
+pub async fn fetch_incremental_context(
+    gh: &Client,
+    repo: &str,
+    pr_number: i64,
+    max_chars: usize,
+) -> (Option<String>, Option<String>) {
+    let prev = gh
+        .own_previous_reviews(repo, pr_number)
+        .await
+        .unwrap_or_default();
+    let last_body = prev
+        .iter()
+        .rev()
+        .find_map(|r| r.get("body").and_then(|b| b.as_str()).map(String::from))
+        .map(|b| b.chars().take(max_chars / 2).collect::<String>());
+
+    let new_commits = if prev.is_empty() {
+        None
+    } else {
+        // commits submitted after the last own review
+        let commits = gh
+            .list_pr_commits(repo, pr_number)
+            .await
+            .unwrap_or_default();
+        let last_time = prev
+            .iter()
+            .filter_map(|r| r.get("submitted_at").and_then(|t| t.as_str()))
+            .max()
+            .map(String::from);
+        match last_time {
+            Some(cutoff) => {
+                let recent: Vec<String> = commits
+                    .iter()
+                    .filter(|c| {
+                        c.get("commit")
+                            .and_then(|cm| cm.get("committer"))
+                            .and_then(|cm| cm.get("date"))
+                            .and_then(|d| d.as_str())
+                            .map(|d| d > cutoff.as_str())
+                            .unwrap_or(false)
+                    })
+                    .filter_map(|c| {
+                        c.get("commit")
+                            .and_then(|cm| cm.get("message"))
+                            .and_then(|m| m.as_str())
+                            .map(|m| m.lines().next().unwrap_or("").to_string())
+                    })
+                    .collect();
+                if recent.is_empty() {
+                    None
+                } else {
+                    Some(recent.join("\n"))
+                }
+            }
+            None => None,
+        }
+    };
+    (last_body, new_commits)
 }
 
 #[cfg(test)]
