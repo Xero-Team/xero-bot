@@ -177,3 +177,101 @@ async fn post_subproc_result(
     }
     "ok".into()
 }
+
+// ---------------------------------------------------------------------------
+// pi engine
+// ---------------------------------------------------------------------------
+
+pub async fn run_pi(gh: &Client, cfg: &Config, repo: &str, pr_number: i64, token: &str) -> String {
+    let _ = gh
+        .post_issue_comment(
+            repo,
+            pr_number,
+            "🔄 正在审查(pi 引擎,项目记忆 + 增量对比),稍候…",
+        )
+        .await;
+
+    if let Err(e) = run_pi_inner(gh, cfg, repo, pr_number, token).await {
+        let _ = gh
+            .post_issue_comment(
+                repo,
+                pr_number,
+                &format!("## 🤖 AI Code Review (pi)\n\n❌ 审查出错: `{e}`"),
+            )
+            .await;
+        return format!("error: {e}");
+    }
+    "ok".into()
+}
+
+async fn run_pi_inner(
+    gh: &Client,
+    cfg: &Config,
+    repo: &str,
+    pr_number: i64,
+    token: &str,
+) -> Result<(), String> {
+    let meta = gh
+        .get_pr(repo, pr_number)
+        .await
+        .map_err(|e| e.to_string())?;
+    let head_sha = meta
+        .pointer("/head/sha")
+        .and_then(|s| s.as_str())
+        .ok_or("no head sha")?;
+    let pr_ref = format!("pull/{pr_number}/head:{head_sha}");
+
+    let dir = ensure_checkout(cfg, repo, &pr_ref, token).await?;
+
+    let (previous_review, new_commits) =
+        crate::review::fetch_incremental_context(gh, repo, pr_number, cfg.max_diff_chars).await;
+    let prompt = build_review_prompt(
+        repo,
+        pr_number,
+        &meta,
+        previous_review.as_deref(),
+        new_commits.as_deref(),
+    );
+
+    let sessions = sessions_dir(cfg, repo);
+    tokio::fs::create_dir_all(&sessions)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let mut cmd = tokio::process::Command::new(&cfg.pi_path);
+    cmd.arg("-p") // print mode: non-interactive
+        .arg("--session-dir")
+        .arg(&sessions)
+        .arg("--tools")
+        .arg("read,grep,find,ls,bash") // read + git diff via bash
+        .arg("--no-extensions")
+        .arg("--no-skills")
+        .arg("-nc") // no context files (AGENTS.md etc.)
+        .arg(&prompt)
+        .current_dir(&dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if !cfg.pi_args.is_empty() {
+        for a in cfg.pi_args.split_whitespace() {
+            cmd.arg(a);
+        }
+    }
+
+    let out = cmd.output().await.map_err(|e| format!("pi spawn: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "pi exited {}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+                .chars()
+                .take(500)
+                .collect::<String>()
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let status = post_subproc_result(gh, cfg, repo, pr_number, &stdout, "pi").await;
+    if status != "ok" {
+        return Err(status);
+    }
+    Ok(())
+}
