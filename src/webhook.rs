@@ -8,6 +8,12 @@ pub type HmacSha256 = Hmac<Sha256>;
 
 /// Verify GitHub's `X-Hub-Signature-256` header (`sha256=<hex>`) against the body.
 pub fn verify_signature(secret: &str, body: &[u8], signature_header: Option<&str>) -> bool {
+    // Fail closed on an unconfigured secret. HMAC accepts a key of any length,
+    // so `new_from_slice(b"")` succeeds and an empty WEBHOOK_SECRET would verify
+    // signatures against the empty key — letting anyone drive the bot.
+    if secret.is_empty() {
+        return false;
+    }
     let Some(sig) = signature_header else {
         return false;
     };
@@ -197,6 +203,21 @@ mod tests {
         assert!(!verify_signature("wrong", body, Some(&sig)));
         assert!(!verify_signature(secret, body, None));
         assert!(!verify_signature(secret, body, Some("garbage")));
+    }
+
+    /// An unset WEBHOOK_SECRET must reject everything. HMAC accepts a key of any
+    /// length, so `new_from_slice(b"")` succeeds — meaning a correctly-computed
+    /// signature over the empty key would otherwise verify, letting anyone drive
+    /// the bot. Compute exactly that signature and assert it's refused, so this
+    /// is a test of the guard rather than of an accidental mismatch.
+    #[test]
+    fn test_empty_secret_rejects_even_a_valid_mac() {
+        let body = b"{\"action\": \"created\"}";
+        let mut mac = <HmacSha256 as Mac>::new_from_slice(b"").unwrap();
+        mac.update(body);
+        let sig = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
+        assert!(!verify_signature("", body, Some(&sig)));
+        assert!(!verify_signature("", body, None));
     }
 
     #[test]

@@ -13,36 +13,39 @@ use xero_bot::dispatch::{execute_work, route_event, Routing, Work};
 use xero_bot::github::Client;
 
 /// A Config pointed at nothing (API base overridden per-test via octocrab env).
+///
+/// Built by overriding `from_env()` rather than as a struct literal, so adding a
+/// field to `Config` doesn't break this file.
 fn test_cfg() -> Config {
-    Config {
-        app_id: "12345".into(),
-        private_key_pem: Some(TEST_KEY.into()),
-        webhook_secret: "whsec".into(),
-        bot_name: "xero-review".into(),
-        ai_base_url: String::new(),
-        ai_api_key: String::new(),
-        ai_model: String::new(),
-        api_format: "chat".into(),
-        max_diff_chars: 60_000,
-        review_engine: "builtin".into(),
-        agent_max_turns: 4,
-        agent_timeout_secs: 10,
-        pi_path: "definitely-not-a-binary".into(),
-        pi_args: String::new(),
-        codex_path: "definitely-not-a-binary".into(),
-        codex_args: String::new(),
-        data_dir: "/tmp/xero-test".into(),
-        cron_secret: String::new(),
-        rebase_check_delay_secs: 0,
-        rebase_sweep_enabled: false,
-        rebase_sweep_interval_secs: 3600,
-        label_needs_rebase: "needs-rebase".into(),
-        label_waiting_review: "waiting-on-review".into(),
-        label_waiting_author: "waiting-on-author".into(),
-        label_blocked: "blocked".into(),
-        codeql_label: "codeql".into(),
-        port: 8080,
-    }
+    let mut c = Config::from_env();
+    c.app_id = "12345".into();
+    c.private_key_pem = Some(TEST_KEY.into());
+    c.webhook_secret = "whsec".into();
+    c.bot_name = "xero-review".into();
+    c.ai_base_url = String::new();
+    c.ai_api_key = String::new();
+    c.ai_model = String::new();
+    c.api_format = "chat".into();
+    c.max_diff_chars = 60_000;
+    c.review_engine = "builtin".into();
+    c.agent_max_turns = 4;
+    c.agent_timeout_secs = 10;
+    c.pi_path = "definitely-not-a-binary".into();
+    c.pi_args = String::new();
+    c.codex_path = "definitely-not-a-binary".into();
+    c.codex_args = String::new();
+    c.data_dir = "/tmp/xero-test".into();
+    c.cron_secret = String::new();
+    c.rebase_check_delay_secs = 0;
+    c.rebase_sweep_enabled = false;
+    c.rebase_sweep_interval_secs = 3600;
+    c.label_needs_rebase = "needs-rebase".into();
+    c.label_waiting_review = "waiting-on-review".into();
+    c.label_waiting_author = "waiting-on-author".into();
+    c.label_blocked = "blocked".into();
+    c.codeql_label = "codeql".into();
+    c.port = 8080;
+    c
 }
 
 /// A throwaway key for JWT signing (test-only; never used against real GitHub).

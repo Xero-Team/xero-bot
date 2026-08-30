@@ -28,6 +28,15 @@ async fn handler(req: Request, state: AppState) -> Result<Response<ResponseBody>
     let _ = load_dotenv(".env");
     let cfg = Config::from_env();
 
+    // The self-hosted server exits at startup on a bad config; a serverless
+    // function has no startup, so check per request. Answer 500 rather than 200
+    // so the failure shows up red on GitHub's delivery page instead of looking
+    // like the bot quietly ignored the event.
+    if let Err(e) = cfg.validate() {
+        tracing::error!("refusing webhook: {e}");
+        return json_response(500, json!({"error": "server misconfigured"}));
+    }
+
     if req.method().as_str() != "POST" {
         return json_response(405, json!({"error": "method not allowed"}));
     }

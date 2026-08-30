@@ -1,8 +1,8 @@
 //! Vercel function: GET /api/cron — rebase sweep, invoked by Vercel Cron.
 //!
-//! Vercel sends `Authorization: Bearer $CRON_SECRET` (when CRON_SECRET is
-//! configured) and the user agent `vercel-cron/1.0`. We accept either the
-//! bearer secret or the vercel-cron UA.
+//! Vercel sends `Authorization: Bearer $CRON_SECRET`. CRON_SECRET is required:
+//! the user agent was previously accepted as a fallback, but a UA is trivially
+//! forged and the sweep walks every installation, so it isn't authentication.
 
 use serde_json::{json, Value};
 use vercel_runtime::{run, service_fn, Error, Request, Response, ResponseBody};
@@ -26,27 +26,27 @@ async fn handler(req: Request, _state: AppState) -> Result<Response<ResponseBody
     let _ = load_dotenv(".env");
     let cfg = Config::from_env();
 
+    if let Err(e) = cfg.validate() {
+        tracing::error!("refusing cron: {e}");
+        return json_response(500, json!({"error": "server misconfigured"}));
+    }
+
     if req.method().as_str() != "GET" && req.method().as_str() != "HEAD" {
         return json_response(405, json!({"error": "method not allowed"}));
     }
 
-    // auth: CRON_SECRET bearer (preferred) or vercel-cron user agent
+    // Require the bearer secret. Fail closed when it isn't configured rather
+    // than falling back to the user agent, which anyone can set.
+    if cfg.cron_secret.is_empty() {
+        tracing::error!("refusing cron: CRON_SECRET is not set");
+        return json_response(500, json!({"error": "CRON_SECRET not configured"}));
+    }
     let auth = req
         .headers()
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    let ua = req
-        .headers()
-        .get("user-agent")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    let authorized = if !cfg.cron_secret.is_empty() {
-        auth == format!("Bearer {}", cfg.cron_secret)
-    } else {
-        ua.starts_with("vercel-cron")
-    };
-    if !authorized {
+    if auth != format!("Bearer {}", cfg.cron_secret) {
         return json_response(401, json!({"error": "unauthorized"}));
     }
 

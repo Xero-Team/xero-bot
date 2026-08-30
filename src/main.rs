@@ -44,6 +44,18 @@ async fn main() {
         std::process::exit(2);
     }
 
+    // We bind 0.0.0.0, so an unauthenticated /cron is reachable from anywhere
+    // the port is. The sweep walks every installation and can post reminder
+    // comments, so make the exposure visible rather than silently trusting the
+    // ".env" note about binding to an internal network.
+    if cfg.cron_secret.is_empty() {
+        tracing::warn!(
+            "CRON_SECRET is empty: GET /cron is unauthenticated and this server \
+             listens on 0.0.0.0 — set CRON_SECRET or firewall port {}",
+            cfg.port
+        );
+    }
+
     // rebase sweep loop
     if cfg.rebase_sweep_enabled {
         let sweep_cfg = cfg.clone();
