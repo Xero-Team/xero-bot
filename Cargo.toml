@@ -44,3 +44,16 @@ features = ["axum"]
 # fix; behaviour otherwise identical. See vendor/vercel_runtime/src/lib.rs.
 [patch.crates-io]
 vercel_runtime = { path = "vendor/vercel_runtime" }
+
+# --- Vercel function entrypoints ---
+[[bin]]
+name = "webhook"
+path = "api/webhook.rs"
+
+[[bin]]
+name = "cron"
+path = "api/cron.rs"
+
+[[bin]]
+name = "health"
+path = "api/health.rs"
