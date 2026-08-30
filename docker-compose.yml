@@ -1,0 +1,14 @@
+services:
+  xero-bot:
+    build: .
+    ports:
+      - "8080:8080"
+    env_file: .env
+    environment:
+      - XERO_DATA_DIR=/data
+    volumes:
+      - xero-data:/data
+    restart: unless-stopped
+
+volumes:
+  xero-data:
