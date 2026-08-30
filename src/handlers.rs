@@ -1,9 +1,16 @@
 //! Command execution: takes parsed commands from a PR comment and performs the
 //! corresponding GitHub API actions, posting a reply per command.
+//!
+//! Every reply is written twice, once per language, and picked by
+//! [`CommentContext::lang`] — see [`crate::lang`] for how that is decided. The
+//! two wordings sit on adjacent lines so a drift between them is visible in
+//! review rather than only in production.
 
 use crate::commands::Command;
 use crate::config::Config;
 use crate::github::{Client, GhError};
+use crate::lang::Lang;
+use crate::t;
 
 pub struct CommentContext {
     pub repo: String,
@@ -11,11 +18,35 @@ pub struct CommentContext {
     pub commenter: String,
     pub pr_author: String,
     pub installation_id: i64,
+    /// Which language to answer in, decided from the PR's commits.
+    pub lang: Lang,
 }
 
-pub fn help_text(bot_name: &str) -> String {
-    format!(
-        "### 🤖 xero-bot 命令参考\n\n\
+pub fn help_text(bot_name: &str, lang: Lang) -> String {
+    match lang {
+        Lang::En => format!(
+            "### 🤖 xero-bot commands\n\n\
+| Command | What it does |\n|---|---|\n\
+| `@{bot_name} review` | AI code review (incremental: last review plus new commits) |\n\
+| `@{bot_name} codeql` | CodeQL quality report (existing repo alerts mapped onto this change) |\n\
+| `@{bot_name} ping` | Health check |\n\
+| `@{bot_name} help` | Show this help |\n\
+| `r? @user` | Request review from @user (assigns them as reviewer) |\n\
+| `@{bot_name} cc @user…` | Notify the listed users |\n\
+| `@{bot_name} ready` / `?r` | Waiting for review (adds `waiting-on-review`) |\n\
+| `@{bot_name} author` | Waiting on the author (adds `waiting-on-author`) |\n\
+| `@{bot_name} blocked` | Blocked (adds `blocked`) |\n\
+| `@{bot_name} label +a -b` | Add / remove labels |\n\
+| `@{bot_name} assign @user` | Assign to @user |\n\
+| `@{bot_name} claim` | Claim (assign to yourself) |\n\
+| `@{bot_name} unclaim` | Release the assignment |\n\
+| `@{bot_name} r+` | Relay an approval (needs write; the bot APPROVEs in your name) |\n\
+| `@{bot_name} r+ as @user` | Relay an approval crediting @user |\n\
+| `@{bot_name} r-` | Withdraw the bot's approval |\n\n\
+_Conflicted PRs are labelled `needs-rebase` automatically, with a reminder._"
+        ),
+        Lang::Zh => format!(
+            "### 🤖 xero-bot 命令参考\n\n\
 | 命令 | 说明 |\n|---|---|\n\
 | `@{bot_name} review` | AI 代码审查(增量:结合上一轮审查与新提交) |\n\
 | `@{bot_name} codeql` | CodeQL 质量报告(读取仓库存量告警并映射到本次变更) |\n\
@@ -34,7 +65,8 @@ pub fn help_text(bot_name: &str) -> String {
 | `@{bot_name} r+ as @user` | 以 @user 名义代审批(用于转发他处给出的批准) |\n\
 | `@{bot_name} r-` | 撤回 bot 的审批 |\n\n\
 _冲突的 PR 会被自动打上 `needs-rebase` 标签并提醒。_"
-    )
+        ),
+    }
 }
 
 /// Collapse a GitHub call into the short result label that `dispatch` logs,
@@ -70,7 +102,9 @@ pub async fn handle_comment(
     // Posted before the commands run: `review` can take minutes, and a note
     // saying half the comment was misunderstood is only useful while the author
     // is still looking.
-    if let Some(body) = crate::commands::diag::render_messages(&diagnostics, &cfg.bot_name) {
+    if let Some(body) =
+        crate::commands::diag::render_messages(&diagnostics, &cfg.bot_name, ctx.lang)
+    {
         let r = labeled(
             "diagnostics reply",
             gh.post_issue_comment(&ctx.repo, ctx.pr_number, &body).await,
@@ -86,6 +120,7 @@ pub async fn handle_comment(
 }
 
 async fn handle_one(gh: &Client, cfg: &Config, ctx: &CommentContext, cmd: Command) -> String {
+    let lang = ctx.lang;
     match cmd {
         Command::Ping => labeled(
             "ping reply",
@@ -94,13 +129,20 @@ async fn handle_one(gh: &Client, cfg: &Config, ctx: &CommentContext, cmd: Comman
         ),
         Command::Help => labeled(
             "help reply",
-            gh.post_issue_comment(&ctx.repo, ctx.pr_number, &help_text(&cfg.bot_name))
+            gh.post_issue_comment(&ctx.repo, ctx.pr_number, &help_text(&cfg.bot_name, lang))
                 .await,
         ),
         Command::Review => {
             if !ctx_is_pr(ctx) {
                 let _ = gh
-                    .post_issue_comment(&ctx.repo, ctx.pr_number, "⚠️ review 命令只在 PR 上有效。")
+                    .post_issue_comment(
+                        &ctx.repo,
+                        ctx.pr_number,
+                        lang.pick(
+                            "⚠️ `review` only works on a pull request.",
+                            "⚠️ review 命令只在 PR 上有效。",
+                        ),
+                    )
                     .await;
                 return "not-a-pr".into();
             }
@@ -109,7 +151,10 @@ async fn handle_one(gh: &Client, cfg: &Config, ctx: &CommentContext, cmd: Comman
                     .post_issue_comment(
                         &ctx.repo,
                         ctx.pr_number,
-                        "⚠️ 未配置 AI(缺 AI_BASE_URL/AI_API_KEY/AI_MODEL),无法审查。",
+                        lang.pick(
+                            "⚠️ No AI configured (missing AI_BASE_URL / AI_API_KEY / AI_MODEL); cannot review.",
+                            "⚠️ 未配置 AI(缺 AI_BASE_URL/AI_API_KEY/AI_MODEL),无法审查。",
+                        ),
                     )
                     .await;
                 return "ai-not-configured".into();
@@ -119,10 +164,10 @@ async fn handle_one(gh: &Client, cfg: &Config, ctx: &CommentContext, cmd: Comman
                 .installation_token(cfg, ctx.installation_id)
                 .await
                 .unwrap_or_default();
-            crate::engines_subproc::run_review(gh, cfg, &ctx.repo, ctx.pr_number, &token).await
+            crate::engines_subproc::run_review(gh, cfg, &ctx.repo, ctx.pr_number, &token, lang).await
         }
         Command::Codeql => {
-            crate::codeql::run_codeql_report(gh, cfg, &ctx.repo, ctx.pr_number).await
+            crate::codeql::run_codeql_report(gh, cfg, &ctx.repo, ctx.pr_number, lang).await
         }
         Command::RequestReview { user } => {
             // triagebot: assignment is the review request
@@ -135,17 +180,23 @@ async fn handle_one(gh: &Client, cfg: &Config, ctx: &CommentContext, cmd: Comman
                         .post_issue_comment(
                             &ctx.repo,
                             ctx.pr_number,
-                            &format!("已指派 @{user} 为 reviewer,请审查 🙏"),
+                            &t!(
+                                lang,
+                                "Assigned @{user} as reviewer — please take a look 🙏",
+                                "已指派 @{user} 为 reviewer,请审查 🙏"
+                            ),
                         )
                         .await;
                     "ok".into()
                 }
                 Err(e) => {
                     let msg = match &e {
-                        GhError::Api { status, .. } if *status == 403 || *status == 422 => format!(
+                        GhError::Api { status, .. } if *status == 403 || *status == 422 => t!(
+                            lang,
+                            "⚠️ Cannot assign @{user}: they need write access to the repo, or org membership, or a prior comment on this PR.",
                             "⚠️ 无法指派 @{user}:用户需要有仓库写权限、或是组织成员、或曾在该 PR 留言。"
                         ),
-                        _ => format!("⚠️ 指派失败: `{e}`"),
+                        _ => t!(lang, "⚠️ Assignment failed: `{e}`", "⚠️ 指派失败: `{e}`"),
                     };
                     let _ = gh.post_issue_comment(&ctx.repo, ctx.pr_number, &msg).await;
                     format!("error: {e}")
@@ -153,12 +204,21 @@ async fn handle_one(gh: &Client, cfg: &Config, ctx: &CommentContext, cmd: Comman
             }
         }
         Command::Cc { users } => {
-            let mentions: Vec<String> = users.iter().map(|u| format!("@{u}")).collect();
+            let mentions = users
+                .iter()
+                .map(|u| format!("@{u}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let commenter = &ctx.commenter;
             let _ = gh
                 .post_issue_comment(
                     &ctx.repo,
                     ctx.pr_number,
-                    &format!("cc {} (via @{})", mentions.join(" "), ctx.commenter),
+                    &t!(
+                        lang,
+                        "cc {mentions} (via @{commenter})",
+                        "cc {mentions}(via @{commenter})"
+                    ),
                 )
                 .await;
             "ok".into()
@@ -177,7 +237,11 @@ async fn handle_one(gh: &Client, cfg: &Config, ctx: &CommentContext, cmd: Comman
                         .post_issue_comment(
                             &ctx.repo,
                             ctx.pr_number,
-                            &format!("⚠️ 添加标签失败: `{e}`"),
+                            &t!(
+                                lang,
+                                "⚠️ Could not add labels: `{e}`",
+                                "⚠️ 添加标签失败: `{e}`"
+                            ),
                         )
                         .await;
                     ok = false;
@@ -196,7 +260,11 @@ async fn handle_one(gh: &Client, cfg: &Config, ctx: &CommentContext, cmd: Comman
                             .post_issue_comment(
                                 &ctx.repo,
                                 ctx.pr_number,
-                                &format!("⚠️ 移除标签失败: `{e}`"),
+                                &t!(
+                                    lang,
+                                    "⚠️ Could not remove labels: `{e}`",
+                                    "⚠️ 移除标签失败: `{e}`"
+                                ),
                             )
                             .await;
                         ok = false;
@@ -224,11 +292,12 @@ async fn handle_one(gh: &Client, cfg: &Config, ctx: &CommentContext, cmd: Comman
                             .join(" ")
                     ));
                 }
+                let changed = parts.join(" ");
                 let _ = gh
                     .post_issue_comment(
                         &ctx.repo,
                         ctx.pr_number,
-                        &format!("已更新标签: {}", parts.join(" ")),
+                        &t!(lang, "Labels updated: {changed}", "已更新标签: {changed}"),
                     )
                     .await;
             }
@@ -244,18 +313,27 @@ async fn handle_one(gh: &Client, cfg: &Config, ctx: &CommentContext, cmd: Comman
         {
             Ok(()) => {
                 let _ = gh
-                    .post_issue_comment(&ctx.repo, ctx.pr_number, &format!("已指派给 @{user}。"))
+                    .post_issue_comment(
+                        &ctx.repo,
+                        ctx.pr_number,
+                        &t!(lang, "Assigned to @{user}.", "已指派给 @{user}。"),
+                    )
                     .await;
                 "ok".into()
             }
             Err(e) => {
                 let _ = gh
-                    .post_issue_comment(&ctx.repo, ctx.pr_number, &format!("⚠️ 指派失败: `{e}`"))
+                    .post_issue_comment(
+                        &ctx.repo,
+                        ctx.pr_number,
+                        &t!(lang, "⚠️ Assignment failed: `{e}`", "⚠️ 指派失败: `{e}`"),
+                    )
                     .await;
                 format!("error: {e}")
             }
         },
         Command::Claim => {
+            let who = &ctx.commenter;
             match gh
                 .add_assignees(&ctx.repo, ctx.pr_number, &[ctx.commenter.clone()])
                 .await
@@ -265,7 +343,7 @@ async fn handle_one(gh: &Client, cfg: &Config, ctx: &CommentContext, cmd: Comman
                         .post_issue_comment(
                             &ctx.repo,
                             ctx.pr_number,
-                            &format!("@{} 已认领。", ctx.commenter),
+                            &t!(lang, "@{who} claimed this.", "@{who} 已认领。"),
                         )
                         .await;
                     "ok".into()
@@ -275,7 +353,7 @@ async fn handle_one(gh: &Client, cfg: &Config, ctx: &CommentContext, cmd: Comman
                         .post_issue_comment(
                             &ctx.repo,
                             ctx.pr_number,
-                            &format!("⚠️ 认领失败: `{e}`"),
+                            &t!(lang, "⚠️ Could not claim: `{e}`", "⚠️ 认领失败: `{e}`"),
                         )
                         .await;
                     format!("error: {e}")
@@ -283,6 +361,7 @@ async fn handle_one(gh: &Client, cfg: &Config, ctx: &CommentContext, cmd: Comman
             }
         }
         Command::Unclaim => {
+            let who = &ctx.commenter;
             match gh
                 .remove_assignees(&ctx.repo, ctx.pr_number, &[ctx.commenter.clone()])
                 .await
@@ -292,7 +371,11 @@ async fn handle_one(gh: &Client, cfg: &Config, ctx: &CommentContext, cmd: Comman
                         .post_issue_comment(
                             &ctx.repo,
                             ctx.pr_number,
-                            &format!("@{} 已释放指派。", ctx.commenter),
+                            &t!(
+                                lang,
+                                "@{who} released the assignment.",
+                                "@{who} 已释放指派。"
+                            ),
                         )
                         .await;
                     "ok".into()
@@ -302,7 +385,11 @@ async fn handle_one(gh: &Client, cfg: &Config, ctx: &CommentContext, cmd: Comman
                         .post_issue_comment(
                             &ctx.repo,
                             ctx.pr_number,
-                            &format!("⚠️ 释放失败: `{e}`"),
+                            &t!(
+                                lang,
+                                "⚠️ Could not release the assignment: `{e}`",
+                                "⚠️ 释放失败: `{e}`"
+                            ),
                         )
                         .await;
                     format!("error: {e}")
@@ -322,10 +409,17 @@ fn ctx_is_pr(_ctx: &CommentContext) -> bool {
 
 /// ready/author/blocked: add one status label, remove its siblings.
 async fn set_status_label(gh: &Client, cfg: &Config, ctx: &CommentContext, cmd: Command) -> String {
+    let lang = ctx.lang;
     let (add, label_desc) = match cmd {
-        Command::Ready => (&cfg.label_waiting_review, "等待审查"),
-        Command::Author => (&cfg.label_waiting_author, "等待作者"),
-        Command::Blocked => (&cfg.label_blocked, "受阻"),
+        Command::Ready => (
+            &cfg.label_waiting_review,
+            lang.pick("waiting for review", "等待审查"),
+        ),
+        Command::Author => (
+            &cfg.label_waiting_author,
+            lang.pick("waiting on the author", "等待作者"),
+        ),
+        Command::Blocked => (&cfg.label_blocked, lang.pick("blocked", "受阻")),
         _ => unreachable!(),
     };
     let siblings: Vec<String> = [
@@ -345,7 +439,11 @@ async fn set_status_label(gh: &Client, cfg: &Config, ctx: &CommentContext, cmd: 
     {
         tracing::warn!("add label {add} on {}#{}: {e}", ctx.repo, ctx.pr_number);
         let _ = gh
-            .post_issue_comment(&ctx.repo, ctx.pr_number, &format!("⚠️ 打标签失败: `{e}`"))
+            .post_issue_comment(
+                &ctx.repo,
+                ctx.pr_number,
+                &t!(lang, "⚠️ Could not label: `{e}`", "⚠️ 打标签失败: `{e}`"),
+            )
             .await;
         ok = false;
     }
@@ -362,7 +460,11 @@ async fn set_status_label(gh: &Client, cfg: &Config, ctx: &CommentContext, cmd: 
             .post_issue_comment(
                 &ctx.repo,
                 ctx.pr_number,
-                &format!("状态已更新: **{label_desc}**(`{add}`)。"),
+                &t!(
+                    lang,
+                    "Status updated: **{label_desc}** (`{add}`).",
+                    "状态已更新: **{label_desc}**(`{add}`)。"
+                ),
             )
             .await;
     }
@@ -380,24 +482,35 @@ async fn handle_approve(
     ctx: &CommentContext,
     on_behalf_of: Option<String>,
 ) -> String {
+    let lang = ctx.lang;
     // 1. commenter must have write/maintain/admin
     let perm = match gh.collaborator_permission(&ctx.repo, &ctx.commenter).await {
         Ok(p) => p,
         Err(e) => {
             let _ = gh
-                .post_issue_comment(&ctx.repo, ctx.pr_number, &format!("⚠️ 无法校验权限: `{e}`"))
+                .post_issue_comment(
+                    &ctx.repo,
+                    ctx.pr_number,
+                    &t!(
+                        lang,
+                        "⚠️ Could not check permissions: `{e}`",
+                        "⚠️ 无法校验权限: `{e}`"
+                    ),
+                )
                 .await;
             return format!("error: {e}");
         }
     };
     if !matches!(perm.as_str(), "admin" | "maintain" | "write") {
+        let commenter = &ctx.commenter;
         let _ = gh
             .post_issue_comment(
                 &ctx.repo,
                 ctx.pr_number,
-                &format!(
-                    "⚠️ @{commenter} 的 `r+` 被拒绝:需要仓库 write 及以上权限(当前: {perm})。",
-                    commenter = ctx.commenter
+                &t!(
+                    lang,
+                    "⚠️ `r+` from @{commenter} refused: write access or above is required (currently: {perm}).",
+                    "⚠️ @{commenter} 的 `r+` 被拒绝:需要仓库 write 及以上权限(当前: {perm})。"
                 ),
             )
             .await;
@@ -413,13 +526,19 @@ async fn handle_approve(
             .post_issue_comment(
                 &ctx.repo,
                 ctx.pr_number,
-                &format!("⚠️ 不能审批自己的 PR(`{credited}` 是本 PR 作者)。"),
+                &t!(
+                    lang,
+                    "⚠️ Cannot approve your own PR (`{credited}` authored it).",
+                    "⚠️ 不能审批自己的 PR(`{credited}` 是本 PR 作者)。"
+                ),
             )
             .await;
         return "self-approve".into();
     }
 
-    // 3. post APPROVE review, crediting the human
+    // 3. post APPROVE review, crediting the human. Kept in English in both
+    //    cases: this line is the audit trail for who approved what, and it is
+    //    also what shows up in GitHub's review list.
     let body = if credited == ctx.commenter {
         format!(
             "✅ Approved on behalf of @{commenter} (r+ by @{commenter}, relayed by xero-bot).",
@@ -441,7 +560,15 @@ async fn handle_approve(
         }
         Err(e) => {
             let _ = gh
-                .post_issue_comment(&ctx.repo, ctx.pr_number, &format!("⚠️ 代审批失败: `{e}`"))
+                .post_issue_comment(
+                    &ctx.repo,
+                    ctx.pr_number,
+                    &t!(
+                        lang,
+                        "⚠️ Relayed approval failed: `{e}`",
+                        "⚠️ 代审批失败: `{e}`"
+                    ),
+                )
                 .await;
             format!("error: {e}")
         }
@@ -450,11 +577,20 @@ async fn handle_approve(
 
 /// r-: withdraw — dismiss our own previous APPROVE reviews.
 async fn handle_reject(gh: &Client, _cfg: &Config, ctx: &CommentContext) -> String {
+    let lang = ctx.lang;
     let reviews = match gh.list_pr_reviews(&ctx.repo, ctx.pr_number).await {
         Ok(r) => r,
         Err(e) => {
             let _ = gh
-                .post_issue_comment(&ctx.repo, ctx.pr_number, &format!("⚠️ 列出审查失败: `{e}`"))
+                .post_issue_comment(
+                    &ctx.repo,
+                    ctx.pr_number,
+                    &t!(
+                        lang,
+                        "⚠️ Could not list reviews: `{e}`",
+                        "⚠️ 列出审查失败: `{e}`"
+                    ),
+                )
                 .await;
             return format!("error: {e}");
         }
@@ -468,7 +604,10 @@ async fn handle_reject(gh: &Client, _cfg: &Config, ctx: &CommentContext) -> Stri
             .post_issue_comment(
                 &ctx.repo,
                 ctx.pr_number,
-                "⚠️ 无法确定 bot 自身身份,无法撤回审批(请检查 APP_SLUG / BOT_NAME)。",
+                lang.pick(
+                    "⚠️ Cannot determine the bot's own identity, so the approval can't be withdrawn (check APP_SLUG / BOT_NAME).",
+                    "⚠️ 无法确定 bot 自身身份,无法撤回审批(请检查 APP_SLUG / BOT_NAME)。",
+                ),
             )
             .await;
         return "no-app-slug".into();
@@ -491,7 +630,10 @@ async fn handle_reject(gh: &Client, _cfg: &Config, ctx: &CommentContext) -> Stri
             .post_issue_comment(
                 &ctx.repo,
                 ctx.pr_number,
-                "没有可撤回的 bot 审批(此前未在本 PR 上 `r+`)。",
+                lang.pick(
+                    "No bot approval to withdraw (there was no `r+` on this PR).",
+                    "没有可撤回的 bot 审批(此前未在本 PR 上 `r+`)。",
+                ),
             )
             .await;
         return "nothing-to-dismiss".into();
@@ -513,11 +655,16 @@ async fn handle_reject(gh: &Client, _cfg: &Config, ctx: &CommentContext) -> Stri
             dismissed += 1;
         }
     }
+    let who = &ctx.commenter;
     let _ = gh
         .post_issue_comment(
             &ctx.repo,
             ctx.pr_number,
-            &format!("已撤回 {dismissed} 个 bot 审批(r- by @{})。", ctx.commenter),
+            &t!(
+                lang,
+                "Withdrew {dismissed} bot approval(s) (r- by @{who}).",
+                "已撤回 {dismissed} 个 bot 审批(r- by @{who})。"
+            ),
         )
         .await;
     "ok".into()

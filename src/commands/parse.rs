@@ -27,7 +27,7 @@
 
 use std::ops::Range;
 
-use super::diag::Diagnostic;
+use super::diag::{Diagnostic, Expected};
 use super::lex::{is_valid_label, Tok, Token};
 use super::Command;
 
@@ -193,7 +193,7 @@ impl<'a> Parser<'a> {
             _ => {
                 self.diagnostics.push(Diagnostic::MissingArgument {
                     verb,
-                    expected: "一个 @用户名",
+                    expected: Expected::User,
                     span: self.span(),
                 });
                 None
@@ -298,7 +298,7 @@ impl<'a> Parser<'a> {
                 if users.is_empty() {
                     self.diagnostics.push(Diagnostic::MissingArgument {
                         verb: "cc",
-                        expected: "至少一个 @用户名",
+                        expected: Expected::Users,
                         span: self.span(),
                     });
                 } else {
@@ -357,7 +357,7 @@ impl<'a> Parser<'a> {
         if add.is_empty() && remove.is_empty() {
             self.diagnostics.push(Diagnostic::MissingArgument {
                 verb: "label",
-                expected: "至少一个 `+标签` 或 `-标签`",
+                expected: Expected::Labels,
                 span: self.span(),
             });
         } else {
@@ -418,7 +418,7 @@ impl<'a> Parser<'a> {
             if users.is_empty() {
                 self.diagnostics.push(Diagnostic::MissingArgument {
                     verb: "cc",
-                    expected: "至少一个 @用户名",
+                    expected: Expected::Users,
                     span: self.span(),
                 });
             } else {

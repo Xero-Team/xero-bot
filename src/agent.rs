@@ -9,11 +9,51 @@ use serde_json::{json, Value};
 
 use crate::config::Config;
 use crate::github::{Client, GhError};
+use crate::lang::Lang;
 use crate::review::{
     build_inline_comments, parse_added_lines, parse_verdict, render_summary, truncate,
 };
+use crate::t;
 
-const AGENT_SYSTEM_PROMPT: &str = "\
+/// The reviewer's brief, in the language the review will be written in.
+fn agent_system_prompt(lang: Lang) -> &'static str {
+    lang.pick(AGENT_SYSTEM_PROMPT_EN, AGENT_SYSTEM_PROMPT_ZH)
+}
+
+const AGENT_SYSTEM_PROMPT_EN: &str = "\
+You are a senior, rigorous code reviewer working inside a GitHub PR review workflow.
+
+You have tools available (via function calling):
+- list_files(path): list the files/subdirectories at a path in the repository, to learn the \
+project's structure. Pass \"\" on the first call (repository root).
+- read_file(path): read one file's text content. Prefer the build config (package.json, \
+Cargo.toml, go.mod), the README, and the source files this change touches.
+- search_code(query): search code in the repository. Query syntax: \"term in:file\", or just \
+keywords.
+
+Workflow (follow it):
+1. Explore first: call list_files(\"\") for the root; use list_files on the directories the \
+changed files live in; read 1-4 key files (build config, the modules involved) to build \
+context.
+2. Then review: read the diff with that context in mind, and report only real problems — \
+don't pad the list.
+3. When you're done, call submit_review with the final result, then stop.
+
+submit_review's `verdict` argument must match this schema:
+{\"summary\": \"one-sentence overall assessment (in English)\",
+ \"findings\": [{\"severity\": \"critical|high|medium|low|info\",
+   \"title\": \"short title\", \"file\": \"path of a file in the diff\",
+   \"line\": integer line number (one of the added lines; use 1 if not applicable),
+   \"description\": \"the problem and its potential impact (in English)\", \
+\"suggestion\": \"a concrete fix (in English)\"}]}
+
+Severity guide: critical=security hole (injection/RCE/auth bypass/data loss); high=logic \
+bug/resource leak/race/core functionality broken; medium=edge case/missing error handling; \
+low=style/maintainability; info=suggestion/question/nit. If there is nothing to report, \
+`findings` is an empty array. If a \"Previous review\" section is provided, check which of \
+those were fixed and don't repeat findings that are already resolved.";
+
+const AGENT_SYSTEM_PROMPT_ZH: &str = "\
 你是一名资深、严谨的代码审查员,在 GitHub PR 审查工作流中工作。
 
 你有两类工具可用(通过函数调用):
@@ -116,6 +156,7 @@ pub async fn run_agent(
     cfg: &Config,
     repo: &str,
     pr_number: i64,
+    lang: Lang,
 ) -> Result<AgentOutcome, String> {
     // gather PR context
     let meta = gh
@@ -146,21 +187,40 @@ pub async fn run_agent(
         .take(1500)
         .collect();
     let prev_section = previous_review
-        .map(|p| format!("\n## 上一轮审查意见(核对是否已修复,避免重复):\n{p}\n"))
+        .map(|p| {
+            t!(
+                lang,
+                "\n## Previous review (check whether these were fixed; don't repeat them):\n{p}\n",
+                "\n## 上一轮审查意见(核对是否已修复,避免重复):\n{p}\n"
+            )
+        })
         .unwrap_or_default();
     let commits_section = new_commits
-        .map(|c| format!("\n## 自上一轮审查以来的新提交(重点增量):\n{c}\n"))
+        .map(|c| {
+            t!(
+                lang,
+                "\n## Commits pushed since the previous review (focus on the increment):\n{c}\n",
+                "\n## 自上一轮审查以来的新提交(重点增量):\n{c}\n"
+            )
+        })
         .unwrap_or_default();
-    let trunc_note = if _truncated { "(diff 已截断)" } else { "" };
+    let trunc_note = if _truncated {
+        lang.pick("(diff truncated)", "(diff 已截断)")
+    } else {
+        ""
+    };
 
-    let user_prompt = format!(
+    let user_prompt = t!(
+        lang,
+        "Repository: {repo}\nBase branch: {base_ref}\nPR title: {title}\nPR description: {body}{prev_section}{commits_section}\n\n\
+Use the tools to learn the project's structure first, then review the diff below{trunc_note}. Call submit_review when you're done:\n\n{diff}",
         "仓库: {repo}\n基准分支: {base_ref}\nPR 标题: {title}\nPR 描述: {body}{prev_section}{commits_section}\n\n\
 先用工具了解项目结构,再审查以下 diff{trunc_note}。完成后调用 submit_review 提交:\n\n{diff}"
     );
 
     // message history
     let mut messages: Vec<Value> = vec![
-        json!({"role": "system", "content": AGENT_SYSTEM_PROMPT}),
+        json!({"role": "system", "content": agent_system_prompt(lang)}),
         json!({"role": "user", "content": user_prompt}),
     ];
 
@@ -282,7 +342,10 @@ pub async fn run_agent(
         messages.push(message);
         messages.push(json!({
             "role": "user",
-            "content": "请调用 submit_review 提交最终审查结果(verdict 按 schema)。"
+            "content": lang.pick(
+                "Call submit_review with your final result (the `verdict` matching the schema).",
+                "请调用 submit_review 提交最终审查结果(verdict 按 schema)。",
+            )
         }));
     }
 
@@ -383,18 +446,31 @@ fn urlencode(s: &str) -> String {
 
 /// Full agent review run: agent loop → fallback to builtin verdict on
 /// failure → post. Mirrors run_builtin's error-reporting contract.
-pub async fn run_agent_review(gh: &Client, cfg: &Config, repo: &str, pr_number: i64) -> String {
+pub async fn run_agent_review(
+    gh: &Client,
+    cfg: &Config,
+    repo: &str,
+    pr_number: i64,
+    lang: Lang,
+) -> String {
     let _ = gh
-        .post_issue_comment(repo, pr_number, "🔄 正在审查(探索项目 + 增量对比),稍候…")
+        .post_issue_comment(
+            repo,
+            pr_number,
+            lang.pick(
+                "🔄 Reviewing (exploring the project + incremental diff), one moment…",
+                "🔄 正在审查(探索项目 + 增量对比),稍候…",
+            ),
+        )
         .await;
 
-    let outcome = run_agent(gh, cfg, repo, pr_number).await;
+    let outcome = run_agent(gh, cfg, repo, pr_number, lang).await;
 
     match outcome {
         Ok(o) => {
             if let Some(verdict) = o.verdict {
                 let engine = format!("agent ({} turns)", o.turns_used);
-                let summary = render_summary(&verdict, &engine);
+                let summary = render_summary(&verdict, &engine, lang);
                 let full_diff = gh.get_pr_diff(repo, pr_number).await.unwrap_or_default();
                 let added = parse_added_lines(&truncate(&full_diff, cfg.max_diff_chars).0);
                 let inline = build_inline_comments(&verdict, &added);
@@ -403,7 +479,11 @@ pub async fn run_agent_review(gh: &Client, cfg: &Config, repo: &str, pr_number: 
                         .post_issue_comment(
                             repo,
                             pr_number,
-                            &format!("## 🤖 AI Code Review\n\n❌ 发布失败: `{e}`"),
+                            &t!(
+                                lang,
+                                "## 🤖 AI Code Review\n\n❌ Failed to publish: `{e}`",
+                                "## 🤖 AI Code Review\n\n❌ 发布失败: `{e}`"
+                            ),
                         )
                         .await;
                     return format!("error: {e}");
@@ -411,19 +491,29 @@ pub async fn run_agent_review(gh: &Client, cfg: &Config, repo: &str, pr_number: 
                 "ok".into()
             } else if o.timed_out {
                 // timed out: fall back to builtin
-                let note = "⚠️ agent 探索超时,回退到基础审查。";
+                let note = lang.pick(
+                    "⚠️ The agent's exploration timed out; falling back to the basic review.",
+                    "⚠️ agent 探索超时,回退到基础审查。",
+                );
                 let _ = gh.post_issue_comment(repo, pr_number, note).await;
-                crate::review::run_builtin(gh, cfg, repo, pr_number).await
+                crate::review::run_builtin(gh, cfg, repo, pr_number, lang).await
             } else {
-                let note = "⚠️ agent 未提交审查结果,回退到基础审查。";
+                let note = lang.pick(
+                    "⚠️ The agent submitted no review; falling back to the basic review.",
+                    "⚠️ agent 未提交审查结果,回退到基础审查。",
+                );
                 let _ = gh.post_issue_comment(repo, pr_number, note).await;
-                crate::review::run_builtin(gh, cfg, repo, pr_number).await
+                crate::review::run_builtin(gh, cfg, repo, pr_number, lang).await
             }
         }
         Err(e) => {
-            let note = format!("⚠️ agent 出错(`{e}`),回退到基础审查。");
+            let note = t!(
+                lang,
+                "⚠️ The agent failed (`{e}`); falling back to the basic review.",
+                "⚠️ agent 出错(`{e}`),回退到基础审查。"
+            );
             let _ = gh.post_issue_comment(repo, pr_number, &note).await;
-            crate::review::run_builtin(gh, cfg, repo, pr_number).await
+            crate::review::run_builtin(gh, cfg, repo, pr_number, lang).await
         }
     }
 }
@@ -437,6 +527,7 @@ fn _gh_err_bound(e: &GhError) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lang::Lang;
 
     #[test]
     fn test_tool_definitions_valid() {
@@ -457,7 +548,21 @@ mod tests {
 
     #[test]
     fn test_agent_system_prompt_has_submit() {
-        assert!(AGENT_SYSTEM_PROMPT.contains("submit_review"));
-        assert!(AGENT_SYSTEM_PROMPT.contains("severity"));
+        for lang in [Lang::En, Lang::Zh] {
+            let p = agent_system_prompt(lang);
+            assert!(p.contains("submit_review"), "{lang:?}");
+            assert!(p.contains("severity"), "{lang:?}");
+            // the tool names the model is told it has must be the ones it has
+            for tool in ["list_files", "read_file", "search_code"] {
+                assert!(p.contains(tool), "{lang:?} prompt missing {tool}");
+            }
+        }
+        assert!(
+            !agent_system_prompt(Lang::En)
+                .chars()
+                .any(|c| ('\u{4E00}'..='\u{9FFF}').contains(&c)),
+            "{}",
+            agent_system_prompt(Lang::En)
+        );
     }
 }

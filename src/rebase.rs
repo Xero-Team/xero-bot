@@ -7,6 +7,8 @@ use serde_json::Value;
 
 use crate::config::Config;
 use crate::github::Client;
+use crate::lang::Lang;
+use crate::t;
 
 /// What to do about the needs-rebase label, given (mergeable, has_label).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -43,17 +45,25 @@ pub fn decide(mergeable: Option<bool>, has_label: bool) -> RebaseDecision {
     }
 }
 
-fn reminder_comment(repo: &str, base_branch: &str) -> String {
-    format!(
+fn reminder_comment(repo: &str, base_branch: &str, lang: Lang) -> String {
+    t!(
+        lang,
+        "⚠️ **This PR conflicts with its base branch and needs a rebase.**\n\n\
+```bash\ngit fetch origin {base_branch}\ngit rebase origin/{base_branch}\n# after resolving the conflicts\ngit push --force-with-lease\n```\n\n\
+The `needs-rebase` label is removed automatically once the conflicts are gone.\n\
+_({repo} · detected by xero-bot)_",
         "⚠️ **此 PR 已与目标分支冲突,需要 rebase。**\n\n\
 ```bash\ngit fetch origin {base_branch}\ngit rebase origin/{base_branch}\n# 解决冲突后\ngit push --force-with-lease\n```\n\n\
 冲突解决后会自动移除 `needs-rebase` 标签。\n\
-_(_{repo} · 由 xero-bot 自动检测)_"
+_({repo} · 由 xero-bot 自动检测)_"
     )
 }
 
-fn resolved_comment() -> &'static str {
-    "✅ 冲突已解决,移除 `needs-rebase` 标签。"
+fn resolved_comment(lang: Lang) -> &'static str {
+    lang.pick(
+        "✅ Conflicts resolved; removing the `needs-rebase` label.",
+        "✅ 冲突已解决,移除 `needs-rebase` 标签。",
+    )
 }
 
 /// Check one PR and act. Returns a short status string.
@@ -83,8 +93,13 @@ pub async fn check_pr(gh: &Client, cfg: &Config, repo: &str, pr_number: i64) -> 
             {
                 return format!("add-label-error: {e}");
             }
+            // Resolved here rather than at the top of the function: the sweep
+            // walks every open PR of every repo, and only two of the five
+            // outcomes say anything, so the commits are worth an extra request
+            // only once we know we're about to speak.
+            let lang = crate::lang::for_pr(gh, repo, pr_number, None).await;
             let _ = gh
-                .post_issue_comment(repo, pr_number, &reminder_comment(repo, &base_branch))
+                .post_issue_comment(repo, pr_number, &reminder_comment(repo, &base_branch, lang))
                 .await;
             "flagged".into()
         }
@@ -96,8 +111,9 @@ pub async fn check_pr(gh: &Client, cfg: &Config, repo: &str, pr_number: i64) -> 
             {
                 return format!("remove-label-error: {e}");
             }
+            let lang = crate::lang::for_pr(gh, repo, pr_number, None).await;
             let _ = gh
-                .post_issue_comment(repo, pr_number, resolved_comment())
+                .post_issue_comment(repo, pr_number, resolved_comment(lang))
                 .await;
             "cleared".into()
         }
@@ -211,9 +227,18 @@ mod tests {
 
     #[test]
     fn test_reminder_comment() {
-        let c = reminder_comment("o/r", "main");
-        assert!(c.contains("rebase"));
-        assert!(c.contains("origin/main"));
-        assert!(c.contains("needs-rebase"));
+        for lang in [Lang::En, Lang::Zh] {
+            let c = reminder_comment("o/r", "main", lang);
+            assert!(c.contains("rebase"), "{c}");
+            assert!(c.contains("origin/main"), "{c}");
+            assert!(c.contains("needs-rebase"), "{c}");
+            assert!(c.contains("o/r"), "{c}");
+        }
+        // and no Chinese left in the English one
+        let en = reminder_comment("o/r", "main", Lang::En);
+        assert!(
+            !en.chars().any(|c| ('\u{4E00}'..='\u{9FFF}').contains(&c)),
+            "{en}"
+        );
     }
 }

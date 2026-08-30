@@ -8,17 +8,33 @@ use serde_json::{json, Value};
 
 use crate::config::Config;
 use crate::github::{Client, GhError};
+use crate::lang::Lang;
+use crate::t;
 
 pub const SEVERITIES: [&str; 5] = ["critical", "high", "medium", "low", "info"];
 
-pub fn sev_meta(sev: &str) -> (&'static str, &'static str) {
+/// The dot alone. Split out from [`sev_meta`] so callers that only draw the
+/// badge — inline comments, whose body text comes from the model — needn't
+/// carry a language just to throw the label away.
+pub fn sev_icon(sev: &str) -> &'static str {
     match sev {
-        "critical" => ("🔴", "严重"),
-        "high" => ("🟠", "高"),
-        "medium" => ("🟡", "中"),
-        "low" => ("🔵", "低"),
-        _ => ("⚪", "信息"),
+        "critical" => "🔴",
+        "high" => "🟠",
+        "medium" => "🟡",
+        "low" => "🔵",
+        _ => "⚪",
     }
+}
+
+pub fn sev_meta(sev: &str, lang: Lang) -> (&'static str, &'static str) {
+    let label = match sev {
+        "critical" => lang.pick("critical", "严重"),
+        "high" => lang.pick("high", "高"),
+        "medium" => lang.pick("medium", "中"),
+        "low" => lang.pick("low", "低"),
+        _ => lang.pick("info", "信息"),
+    };
+    (sev_icon(sev), label)
 }
 
 // ---------------------------------------------------------------------------
@@ -256,8 +272,31 @@ pub fn parse_verdict(text: &str) -> Option<Value> {
 // Prompt
 // ---------------------------------------------------------------------------
 
-pub const SYSTEM_PROMPT: &str =
-    "你是一名资深、严谨的安全与代码质量审查员。审查 pull request 的代码改动,\
+/// The reviewer's brief, in the language the review will be written in.
+///
+/// Translated in full rather than bolting [`Lang::output_rule`] onto a Chinese
+/// prompt: a model asked in English writes better English, and the prose fields
+/// of the verdict are published verbatim.
+pub fn system_prompt(lang: Lang) -> &'static str {
+    lang.pick(
+        "You are a senior, rigorous security and code-quality reviewer. Review the \
+code changes in a pull request and report problems graded by risk. Report only \
+real problems; do not invent findings to fill the list. \
+Your output must be strict JSON (no explanatory prose, no markdown fence). \
+JSON schema: \
+{\"summary\": \"one-sentence overall assessment\", \
+\"findings\": [{\"severity\": \"critical|high|medium|low|info\", \
+\"title\": \"short title\", \"file\": \"path of a file in the diff\", \
+\"line\": integer line number (one of the added lines; use 1 if not applicable), \
+\"description\": \"the problem and its potential impact\", \
+\"suggestion\": \"a concrete fix\"}]}. \
+Severity guide: critical=security hole (injection/RCE/auth bypass/data loss); \
+high=logic bug/resource leak/race/core functionality broken; \
+medium=edge case/missing error handling; low=style/maintainability; \
+info=suggestion/question/nit. \
+Write `summary`, `description` and `suggestion` in English. \
+If there is nothing to report, `findings` is an empty array.",
+        "你是一名资深、严谨的安全与代码质量审查员。审查 pull request 的代码改动,\
 按风险分级输出问题。只报告真实问题,不要为了凑数编造。\
 输出必须是严格的 JSON(不要加任何解释性文字、不要 markdown 围栏)。\
 JSON schema: \
@@ -270,7 +309,9 @@ JSON schema: \
 severity 标准: critical=安全漏洞(注入/RCE/鉴权绕过/数据丢失); \
 high=逻辑bug/资源泄漏/竞态/核心功能损坏; \
 medium=边界条件/错误处理缺失; low=风格/可维护性; info=建议/疑问/nit。\
-用中文输出 description 和 suggestion。若无问题, findings 为空数组。";
+用中文输出 summary、description 和 suggestion。若无问题, findings 为空数组。",
+    )
+}
 
 pub fn build_user_prompt(
     diff: &str,
@@ -278,6 +319,7 @@ pub fn build_user_prompt(
     truncated: bool,
     previous_review: Option<&str>,
     new_commits: Option<&str>,
+    lang: Lang,
 ) -> String {
     let title = pr_meta.get("title").and_then(|t| t.as_str()).unwrap_or("");
     let body: String = pr_meta
@@ -288,17 +330,35 @@ pub fn build_user_prompt(
         .take(2000)
         .collect();
     let note = if truncated {
-        "\n\n[注意: diff 已截断,仅展示前部分改动]\n"
+        lang.pick(
+            "\n\n[Note: the diff is truncated; only the first part of the change is shown]\n",
+            "\n\n[注意: diff 已截断,仅展示前部分改动]\n",
+        )
     } else {
         ""
     };
     let prev_section = previous_review
-        .map(|p| format!("\n## 上一轮审查意见(检查这些是否已修复;避免重复已被解决/驳回的发现,如已修复请在总结中确认):\n{p}\n"))
+        .map(|p| {
+            t!(
+                lang,
+                "\n## Previous review (check whether these were fixed; don't repeat findings \
+that were resolved or rejected, and confirm the fixes in your summary):\n{p}\n",
+                "\n## 上一轮审查意见(检查这些是否已修复;避免重复已被解决/驳回的发现,如已修复请在总结中确认):\n{p}\n"
+            )
+        })
         .unwrap_or_default();
     let commits_section = new_commits
-        .map(|c| format!("\n## 自上一轮审查以来的新提交(重点审查增量):\n{c}\n"))
+        .map(|c| {
+            t!(
+                lang,
+                "\n## Commits pushed since the previous review (focus on the increment):\n{c}\n",
+                "\n## 自上一轮审查以来的新提交(重点审查增量):\n{c}\n"
+            )
+        })
         .unwrap_or_default();
-    format!(
+    t!(
+        lang,
+        "PR title: {title}\nPR description: {body}\n{prev_section}{commits_section}\nBelow is the PR's unified diff (look only at the added code):\n{diff}{note}\n\nReview the change above and answer with the JSON schema given.",
         "PR 标题: {title}\nPR 描述: {body}\n{prev_section}{commits_section}\n以下是 PR 的 unified diff(只关注新增的代码):\n{diff}{note}\n\n请审查上述改动并按指定 JSON schema 输出。"
     )
 }
@@ -307,7 +367,7 @@ pub fn build_user_prompt(
 // Rendering & posting
 // ---------------------------------------------------------------------------
 
-pub fn render_summary(verdict: &Value, engine_tag: &str) -> String {
+pub fn render_summary(verdict: &Value, engine_tag: &str, lang: Lang) -> String {
     let findings = verdict
         .get("findings")
         .and_then(|f| f.as_array())
@@ -316,7 +376,7 @@ pub fn render_summary(verdict: &Value, engine_tag: &str) -> String {
     let summary = verdict
         .get("summary")
         .and_then(|s| s.as_str())
-        .unwrap_or("(无总结)");
+        .unwrap_or(lang.pick("(no summary)", "(无总结)"));
 
     let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
     for s in SEVERITIES {
@@ -334,9 +394,12 @@ pub fn render_summary(verdict: &Value, engine_tag: &str) -> String {
         }
     }
 
-    let mut table = String::from("| 等级 | 数量 |\n|---|---|\n");
+    let mut table = String::from(lang.pick(
+        "| Level | Count |\n|---|---|\n",
+        "| 等级 | 数量 |\n|---|---|\n",
+    ));
     for s in SEVERITIES {
-        let (icon, label) = sev_meta(s);
+        let (icon, label) = sev_meta(s, lang);
         table.push_str(&format!("| {icon} {label} | {} |\n", counts[s]));
     }
 
@@ -345,7 +408,7 @@ pub fn render_summary(verdict: &Value, engine_tag: &str) -> String {
         String::new(),
         format!("**{summary}**"),
         String::new(),
-        "### 风险分级".to_string(),
+        lang.pick("### Risk breakdown", "### 风险分级").to_string(),
         String::new(),
         table,
     ];
@@ -354,7 +417,10 @@ pub fn render_summary(verdict: &Value, engine_tag: &str) -> String {
     }
 
     if findings.is_empty() {
-        lines.push("未发现问题 🎉".to_string());
+        lines.push(
+            lang.pick("Nothing found 🎉", "未发现问题 🎉")
+                .to_string(),
+        );
         return lines.join("\n");
     }
 
@@ -372,7 +438,7 @@ pub fn render_summary(verdict: &Value, engine_tag: &str) -> String {
         if items.is_empty() {
             continue;
         }
-        let (icon, label) = sev_meta(s);
+        let (icon, label) = sev_meta(s, lang);
         lines.push(String::new());
         lines.push(format!("### {icon} {label} ({})", items.len()));
         lines.push(String::new());
@@ -386,7 +452,7 @@ pub fn render_summary(verdict: &Value, engine_tag: &str) -> String {
             let title = f
                 .get("title")
                 .and_then(|x| x.as_str())
-                .unwrap_or("(无标题)");
+                .unwrap_or(lang.pick("(no title)", "(无标题)"));
             let desc = f.get("description").and_then(|x| x.as_str()).unwrap_or("");
             let sug = f.get("suggestion").and_then(|x| x.as_str()).unwrap_or("");
             lines.push(format!("- **`{file}:{line}` — {title}**"));
@@ -426,7 +492,7 @@ pub fn build_inline_comments(
             .and_then(|x| x.as_str())
             .unwrap_or("info")
             .to_lowercase();
-        let (icon, _) = sev_meta(&sev);
+        let icon = sev_icon(&sev);
         let title = f.get("title").and_then(|x| x.as_str()).unwrap_or("");
         let desc = f.get("description").and_then(|x| x.as_str()).unwrap_or("");
         let sug = f.get("suggestion").and_then(|x| x.as_str()).unwrap_or("");
@@ -446,11 +512,21 @@ pub fn build_inline_comments(
 
 /// The builtin review run: returns a status string, never panics.
 /// Errors are reported to the PR as comments (Python bot behavior).
-pub async fn run_builtin(gh: &Client, cfg: &Config, repo: &str, pr_number: i64) -> String {
-    match run_builtin_inner(gh, cfg, repo, pr_number).await {
+pub async fn run_builtin(
+    gh: &Client,
+    cfg: &Config,
+    repo: &str,
+    pr_number: i64,
+    lang: Lang,
+) -> String {
+    match run_builtin_inner(gh, cfg, repo, pr_number, lang).await {
         Ok(status) => status,
         Err(e) => {
-            let body = format!("## 🤖 AI Code Review\n\n❌ 审查出错: `{e}`");
+            let body = t!(
+                lang,
+                "## 🤖 AI Code Review\n\n❌ Review failed: `{e}`",
+                "## 🤖 AI Code Review\n\n❌ 审查出错: `{e}`"
+            );
             let _ = gh.post_issue_comment(repo, pr_number, &body).await;
             format!("error: {e}")
         }
@@ -462,10 +538,15 @@ async fn run_builtin_inner(
     cfg: &Config,
     repo: &str,
     pr_number: i64,
+    lang: Lang,
 ) -> Result<String, String> {
     // processing indicator (best-effort)
     let _ = gh
-        .post_issue_comment(repo, pr_number, "🔄 正在审查,稍候…")
+        .post_issue_comment(
+            repo,
+            pr_number,
+            lang.pick("🔄 Reviewing, one moment…", "🔄 正在审查,稍候…"),
+        )
         .await;
 
     // fetch diff + meta
@@ -491,18 +572,21 @@ async fn run_builtin_inner(
         truncated,
         previous_review.as_deref(),
         new_commits.as_deref(),
+        lang,
     );
 
-    let raw = call_ai(cfg, SYSTEM_PROMPT, &user_prompt).await?;
+    let raw = call_ai(cfg, system_prompt(lang), &user_prompt).await?;
     let Some(verdict) = parse_verdict(&raw) else {
-        let body = format!(
+        let body = t!(
+            lang,
+            "## 🤖 AI Code Review\n\n⚠️ Couldn't parse the model's JSON; raw output below:\n\n```\n{raw}\n```",
             "## 🤖 AI Code Review\n\n⚠️ 未能解析模型返回的 JSON,以下为原始输出:\n\n```\n{raw}\n```"
         );
         let _ = gh.post_issue_comment(repo, pr_number, &body).await;
         return Ok("parse-failed".into());
     };
 
-    let summary = render_summary(&verdict, "builtin");
+    let summary = render_summary(&verdict, "builtin", lang);
     let inline = build_inline_comments(&verdict, &added);
     gh.post_review(repo, pr_number, &summary, inline)
         .await
@@ -574,6 +658,7 @@ pub async fn fetch_incremental_context(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lang::Lang;
 
     const SAMPLE_DIFF: &str = "\
 diff --git a/src/main.rs b/src/main.rs
@@ -642,9 +727,11 @@ index 111..222 100644
     #[test]
     fn test_render_summary_empty() {
         let verdict = serde_json::json!({"summary": "clean", "findings": []});
-        let out = render_summary(&verdict, "builtin");
+        let out = render_summary(&verdict, "builtin", Lang::Zh);
         assert!(out.contains("clean"));
         assert!(out.contains("未发现问题"));
+        let en = render_summary(&verdict, "builtin", Lang::En);
+        assert!(en.contains("Nothing found"), "{en}");
     }
 
     #[test]
@@ -658,11 +745,33 @@ index 111..222 100644
                  "description": "d2", "suggestion": ""}
             ]
         });
-        let out = render_summary(&verdict, "");
+        let out = render_summary(&verdict, "", Lang::Zh);
         assert!(out.contains("some issues"));
         assert!(out.contains("🟠 高 (1)"));
         assert!(out.contains("`a.rs:1`"));
         assert!(out.contains("💡 fix it"));
+    }
+
+    /// An English review must not carry Chinese severity labels or headers.
+    /// The model's own prose is the only text in the body that isn't ours.
+    #[test]
+    fn test_render_summary_english_has_no_chinese() {
+        let verdict = serde_json::json!({
+            "summary": "some issues",
+            "findings": [
+                {"severity": "high", "title": "bug", "file": "a.rs", "line": 1,
+                 "description": "desc", "suggestion": "fix it"},
+                {"severity": "info", "file": "b.rs", "line": 2}
+            ]
+        });
+        let out = render_summary(&verdict, "builtin", Lang::En);
+        assert!(out.contains("🟠 high (1)"), "{out}");
+        assert!(out.contains("Risk breakdown"), "{out}");
+        assert!(out.contains("(no title)"), "{out}");
+        assert!(
+            !out.chars().any(|c| ('\u{4E00}'..='\u{9FFF}').contains(&c)),
+            "Chinese left in an English review: {out}"
+        );
     }
 
     #[test]
@@ -693,10 +802,56 @@ index 111..222 100644
             false,
             Some("上一轮: 修了 X"),
             Some("fix: a\nfix: b"),
+            Lang::Zh,
         );
         assert!(p.contains("上一轮审查意见"));
         assert!(p.contains("上一轮: 修了 X"));
         assert!(p.contains("新提交"));
         assert!(p.contains("fix: a"));
+
+        let en = build_user_prompt(
+            "d",
+            &meta,
+            true,
+            Some("previously: fixed X"),
+            Some("fix: a"),
+            Lang::En,
+        );
+        assert!(en.contains("Previous review"), "{en}");
+        assert!(en.contains("Commits pushed since"), "{en}");
+        assert!(en.contains("truncated"), "{en}");
+        assert!(
+            !en.chars().any(|c| ('\u{4E00}'..='\u{9FFF}').contains(&c)),
+            "{en}"
+        );
+    }
+
+    /// Both briefs must describe the same schema, or one language silently
+    /// gets a differently-shaped verdict that `render_summary` can't read.
+    #[test]
+    fn test_system_prompt_agrees_across_languages() {
+        for lang in [Lang::En, Lang::Zh] {
+            let p = system_prompt(lang);
+            for needle in [
+                "summary",
+                "findings",
+                "severity",
+                "title",
+                "file",
+                "line",
+                "description",
+                "suggestion",
+                "critical|high|medium|low|info",
+            ] {
+                assert!(p.contains(needle), "{lang:?} prompt missing {needle}");
+            }
+        }
+        assert!(
+            !system_prompt(Lang::En)
+                .chars()
+                .any(|c| ('\u{4E00}'..='\u{9FFF}').contains(&c)),
+            "{}",
+            system_prompt(Lang::En)
+        );
     }
 }

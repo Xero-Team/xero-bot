@@ -101,6 +101,7 @@ async fn failing_ping_still_labeled_error() {
         commenter: "alice".into(),
         pr_author: "bob".into(),
         installation_id: 42,
+        lang: xero_bot::lang::Lang::Zh,
     };
     let results = xero_bot::handlers::handle_comment(
         &gh,

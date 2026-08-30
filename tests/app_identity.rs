@@ -145,6 +145,7 @@ async fn reject_dismisses_bot_approval() {
         commenter: "alice".into(),
         pr_author: "bob".into(),
         installation_id: 42,
+        lang: xero_bot::lang::Lang::Zh,
     };
     let results = xero_bot::handlers::handle_comment(
         &gh,

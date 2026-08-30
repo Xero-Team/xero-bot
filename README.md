@@ -9,6 +9,7 @@ Features:
 - **Incremental AI code review** — learns the project first and builds on the previous review round, instead of looking at the diff in isolation
 - **Rebase reminders** — when a PR conflicts with its target branch, adds the `needs-rebase` label and a reminder; clears it once resolved
 - **CodeQL quality reports** — reads the repo's existing code scanning alerts and maps them to files changed in the PR
+- **Bilingual replies** — answers in English or Chinese, chosen from the PR's own commit messages; no configuration
 
 ## Command reference
 
@@ -37,6 +38,17 @@ Automatic behavior (no command needed):
 - After a PR push/reopen, checks for conflicts → adds `needs-rebase` + a reminder comment; once resolved → removes the label
 - Periodic sweep (Vercel Cron daily / self-hosted default 6h) as a fallback check
 - Adding the `CODEQL_LABEL` label to a PR (if configured) → auto-generates a CodeQL report
+
+### Reply language
+
+The bot answers in English or Chinese — including the prose of an AI review — and picks
+which from the PR's own commit subjects: mostly English gets English, mostly Chinese gets
+Chinese. Each commit casts one vote, so a single long message can't decide for the rest, and
+only the subject line is read, so English trailers (`Signed-off-by`, `Co-authored-by`) don't
+skew a Chinese PR. When the commits say nothing either way (`bump deps`, `v2 -> v3`) the
+triggering comment is consulted, and failing that the reply is English. There is nothing to
+configure, and no other languages are modelled — Japanese written in kanji is indistinguishable
+from Chinese here and will be answered in Chinese.
 
 ## AI review engine
 

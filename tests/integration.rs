@@ -139,6 +139,7 @@ async fn test_ping_comment_replies_pong() {
         commenter: "alice".into(),
         pr_author: "bob".into(),
         installation_id: 42,
+        lang: xero_bot::lang::Lang::Zh,
     };
     let results = xero_bot::handlers::handle_comment(
         &gh,
@@ -190,6 +191,7 @@ async fn test_ready_label_flow_with_mock() {
         commenter: "alice".into(),
         pr_author: "bob".into(),
         installation_id: 42,
+        lang: xero_bot::lang::Lang::Zh,
     };
     let results = xero_bot::handlers::handle_comment(
         &gh,
@@ -238,6 +240,7 @@ async fn test_r_plus_permission_denied() {
         commenter: "alice".into(),
         pr_author: "bob".into(),
         installation_id: 42,
+        lang: xero_bot::lang::Lang::Zh,
     };
     let results = xero_bot::handlers::handle_comment(
         &gh,
@@ -291,6 +294,7 @@ async fn test_r_plus_approves_with_write() {
         commenter: "alice".into(),
         pr_author: "bob".into(),
         installation_id: 42,
+        lang: xero_bot::lang::Lang::Zh,
     };
     let results = xero_bot::handlers::handle_comment(
         &gh,
@@ -395,7 +399,14 @@ async fn test_codeql_report_posts_findings() {
         app_slug: "xero-review".into(),
     };
     let cfg = test_cfg();
-    let status = xero_bot::codeql::run_codeql_report(&gh, &cfg, "octocat/hello", 7).await;
+    let status = xero_bot::codeql::run_codeql_report(
+        &gh,
+        &cfg,
+        "octocat/hello",
+        7,
+        xero_bot::lang::Lang::Zh,
+    )
+    .await;
     assert_eq!(status, "ok");
 }
 
@@ -430,6 +441,7 @@ async fn test_diagnostics_are_posted_once() {
         commenter: "alice".into(),
         pr_author: "bob".into(),
         installation_id: 42,
+        lang: xero_bot::lang::Lang::Zh,
     };
     let results = xero_bot::handlers::handle_comment(
         &gh,
@@ -474,9 +486,148 @@ async fn test_no_diagnostics_means_no_comment() {
         commenter: "alice".into(),
         pr_author: "bob".into(),
         installation_id: 42,
+        lang: xero_bot::lang::Lang::Zh,
     };
     let results = xero_bot::handlers::handle_comment(&gh, &cfg, &ctx, vec![], vec![]).await;
     assert!(results.is_empty(), "{results:?}");
+}
+
+/// Drive the whole language path against a mock: fetch the PR's commits, let
+/// them pick the language, run a command, and hand back the body of the comment
+/// that actually reached GitHub.
+///
+/// `Claim` is the command under test because its reply is one short sentence
+/// that differs in both languages — `ping` answers `pong 🏓` either way, so it
+/// would pass no matter which language won.
+async fn claim_reply_body(
+    commit_subjects: &[&str],
+    comment_lang: Option<xero_bot::lang::Lang>,
+) -> String {
+    let server = MockServer::start().await;
+
+    let commits: Vec<Value> = commit_subjects
+        .iter()
+        .map(|s| json!({"commit": {"message": s}}))
+        .collect();
+    Mock::given(method("GET"))
+        .and(path("/repos/octocat/hello/pulls/7/commits"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(commits))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/repos/octocat/hello/issues/7/assignees"))
+        .respond_with(
+            ResponseTemplate::new(201).set_body_json(json!({"assignees": [{"login": "alice"}]})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/repos/octocat/hello/issues/7/comments"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({"id": 1})))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let crab = octocrab::OctocrabBuilder::new()
+        .personal_token("ghp_test")
+        .base_uri(server.uri())
+        .unwrap()
+        .build()
+        .unwrap();
+    let gh = Client {
+        crab,
+        app_slug: "xero-review".into(),
+    };
+    let cfg = test_cfg();
+    let lang = xero_bot::lang::for_pr(&gh, "octocat/hello", 7, comment_lang).await;
+    let ctx = xero_bot::handlers::CommentContext {
+        repo: "octocat/hello".into(),
+        pr_number: 7,
+        commenter: "alice".into(),
+        pr_author: "bob".into(),
+        installation_id: 42,
+        lang,
+    };
+    let results = xero_bot::handlers::handle_comment(
+        &gh,
+        &cfg,
+        &ctx,
+        vec![xero_bot::commands::Command::Claim],
+        vec![],
+    )
+    .await;
+    assert_eq!(results, vec!["ok"]);
+
+    let requests = server.received_requests().await.unwrap();
+    let posted = requests
+        .iter()
+        .find(|r| r.url.path().ends_with("/comments"))
+        .expect("a reply should have been posted");
+    serde_json::from_slice::<Value>(&posted.body).unwrap()["body"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+/// A PR whose commits are Chinese gets a Chinese reply.
+#[tokio::test]
+async fn test_chinese_commits_get_a_chinese_reply() {
+    let body = claim_reply_body(&["修复解析器崩溃", "补充测试", "fix: typo"], None).await;
+    assert_eq!(body, "@alice 已认领。", "{body}");
+}
+
+/// The same PR with English commits gets an English reply — the same code path,
+/// so this is what proves the language is read rather than hardcoded.
+#[tokio::test]
+async fn test_english_commits_get_an_english_reply() {
+    let body = claim_reply_body(&["add the parser", "fix the lexer", "修复崩溃"], None).await;
+    assert_eq!(body, "@alice claimed this.", "{body}");
+}
+
+/// Commits that say nothing fall back to the triggering comment, and if that
+/// says nothing either, to English.
+#[tokio::test]
+async fn test_no_signal_falls_back_to_the_comment_then_english() {
+    let noise = ["1.2.3", "v2 -> v3"];
+    let body = claim_reply_body(&noise, Some(xero_bot::lang::Lang::Zh)).await;
+    assert_eq!(body, "@alice 已认领。", "{body}");
+
+    let body = claim_reply_body(&noise, None).await;
+    assert_eq!(body, "@alice claimed this.", "{body}");
+}
+
+/// The commits endpoint failing must not fail the command — the reply still
+/// goes out, in the fallback language.
+#[tokio::test]
+async fn test_commits_error_still_replies_in_english() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/repos/octocat/hello/pulls/7/commits"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+
+    let crab = octocrab::OctocrabBuilder::new()
+        .personal_token("ghp_test")
+        .base_uri(server.uri())
+        .unwrap()
+        .build()
+        .unwrap();
+    let gh = Client {
+        crab,
+        app_slug: "xero-review".into(),
+    };
+    assert_eq!(
+        xero_bot::lang::for_pr(&gh, "octocat/hello", 7, None).await,
+        xero_bot::lang::Lang::En
+    );
+    // and the comment's own language is still honoured when the API is down
+    assert_eq!(
+        xero_bot::lang::for_pr(&gh, "octocat/hello", 7, Some(xero_bot::lang::Lang::Zh)).await,
+        xero_bot::lang::Lang::Zh
+    );
 }
 
 #[test]

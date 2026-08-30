@@ -8,20 +8,39 @@ use serde_json::Value;
 
 use crate::config::Config;
 use crate::github::{Client, GhError};
+use crate::lang::Lang;
+use crate::t;
 
-pub async fn run_codeql_report(gh: &Client, cfg: &Config, repo: &str, pr_number: i64) -> String {
+pub async fn run_codeql_report(
+    gh: &Client,
+    cfg: &Config,
+    repo: &str,
+    pr_number: i64,
+    lang: Lang,
+) -> String {
     let _ = gh
-        .post_issue_comment(repo, pr_number, "🔍 正在生成 CodeQL 质量报告,稍候…")
+        .post_issue_comment(
+            repo,
+            pr_number,
+            lang.pick(
+                "🔍 Building the CodeQL quality report, one moment…",
+                "🔍 正在生成 CodeQL 质量报告,稍候…",
+            ),
+        )
         .await;
 
-    match run_inner(gh, cfg, repo, pr_number).await {
+    match run_inner(gh, cfg, repo, pr_number, lang).await {
         Ok(status) => status,
         Err(e) => {
             let _ = gh
                 .post_issue_comment(
                     repo,
                     pr_number,
-                    &format!("## 🔍 CodeQL 质量报告\n\n❌ 出错: `{e}`"),
+                    &t!(
+                        lang,
+                        "## 🔍 CodeQL quality report\n\n❌ Failed: `{e}`",
+                        "## 🔍 CodeQL 质量报告\n\n❌ 出错: `{e}`"
+                    ),
                 )
                 .await;
             format!("error: {e}")
@@ -34,12 +53,13 @@ async fn run_inner(
     _cfg: &Config,
     repo: &str,
     pr_number: i64,
+    lang: Lang,
 ) -> Result<String, String> {
     // 1. alerts
     let alerts = match gh.code_scanning_alerts(repo).await {
         Ok(a) => a,
         Err(GhError::Api { status: 403, .. }) | Err(GhError::Api { status: 404, .. }) => {
-            let body = not_enabled_message(repo);
+            let body = not_enabled_message(repo, lang);
             let _ = gh.post_issue_comment(repo, pr_number, &body).await;
             return Ok("not-enabled".into());
         }
@@ -75,7 +95,7 @@ async fn run_inner(
     }
 
     // 4. render + post
-    let report = render_report(&alerts, &relevant, &changed);
+    let report = render_report(&alerts, &relevant, &changed, lang);
     let _ = gh.post_issue_comment(repo, pr_number, &report).await;
     Ok("ok".into())
 }
@@ -104,29 +124,44 @@ fn render_report(
     all_alerts: &[Value],
     relevant: &[&Value],
     changed: &std::collections::HashSet<&str>,
+    lang: Lang,
 ) -> String {
+    let open = all_alerts.len();
+    let files = changed.len();
+    let hit_files = relevant
+        .iter()
+        .filter_map(|a| {
+            a.pointer("/most_recent_instance/location/path")
+                .or_else(|| a.pointer("/location/path"))
+                .and_then(|p| p.as_str())
+        })
+        .collect::<std::collections::HashSet<_>>()
+        .len();
     let mut lines = vec![
-        "## 🔍 CodeQL 质量报告".to_string(),
+        lang.pick("## 🔍 CodeQL quality report", "## 🔍 CodeQL 质量报告")
+            .to_string(),
         String::new(),
-        format!("- 仓库存量 open 告警: **{}** 条", all_alerts.len()),
-        format!(
-            "- 本次 PR 变更文件: **{}** 个,其中 **{}** 个文件触及存量告警",
-            changed.len(),
-            relevant
-                .iter()
-                .filter_map(|a| {
-                    a.pointer("/most_recent_instance/location/path")
-                        .or_else(|| a.pointer("/location/path"))
-                        .and_then(|p| p.as_str())
-                })
-                .collect::<std::collections::HashSet<_>>()
-                .len()
+        t!(
+            lang,
+            "- Open alerts in the repo: **{open}**",
+            "- 仓库存量 open 告警: **{open}** 条"
+        ),
+        t!(
+            lang,
+            "- Files changed by this PR: **{files}**, of which **{hit_files}** touch an existing alert",
+            "- 本次 PR 变更文件: **{files}** 个,其中 **{hit_files}** 个文件触及存量告警"
         ),
         String::new(),
     ];
 
     if relevant.is_empty() {
-        lines.push("✅ 本次变更未触及任何存量 CodeQL 告警。".to_string());
+        lines.push(
+            lang.pick(
+                "✅ This change touches none of the existing CodeQL alerts.",
+                "✅ 本次变更未触及任何存量 CodeQL 告警。",
+            )
+            .to_string(),
+        );
         return lines.join("\n");
     }
 
@@ -145,9 +180,20 @@ fn render_report(
             .unwrap_or(4)
     });
 
-    lines.push(format!("### 本次变更触及的告警({} 条)", sorted.len()));
+    let n = sorted.len();
+    lines.push(t!(
+        lang,
+        "### Alerts touched by this change ({n})",
+        "### 本次变更触及的告警({n} 条)"
+    ));
     lines.push(String::new());
-    lines.push("| 级别 | 规则 | 位置 | 说明 |".into());
+    lines.push(
+        lang.pick(
+            "| Level | Rule | Location | Description |",
+            "| 级别 | 规则 | 位置 | 说明 |",
+        )
+        .into(),
+    );
     lines.push("|---|---|---|---|".into());
     for alert in sorted {
         let sev = alert
@@ -196,15 +242,29 @@ fn render_report(
 
     lines.push(String::new());
     lines.push(
-        "> 提示: 建议在本次 PR 中一并修复所列告警(或确认误报并加 `// lgtm` 忽略注释)。\
-其余未触及的存量告警不在本报告范围内。"
-            .to_string(),
+        lang.pick(
+            "> Tip: fix the alerts listed above in this PR (or confirm a false \
+positive and add a `// lgtm` suppression). Existing alerts this change doesn't \
+touch are out of scope for this report.",
+            "> 提示: 建议在本次 PR 中一并修复所列告警(或确认误报并加 `// lgtm` 忽略注释)。\
+其余未触及的存量告警不在本报告范围内。",
+        )
+        .to_string(),
     );
     lines.join("\n")
 }
 
-fn not_enabled_message(repo: &str) -> String {
-    format!(
+fn not_enabled_message(repo: &str, lang: Lang) -> String {
+    t!(
+        lang,
+        "## 🔍 CodeQL quality report\n\n\
+⚠️ Code scanning isn't enabled on `{repo}` (or the App can't read it), so there's no report to build.\n\n\
+**Enable it either way**:\n\
+1. **CodeQL default setup** (recommended): repo Settings → Code security → Code scanning → Setup default configuration\n\
+2. **Workflow**: add `.github/workflows/codeql.yml` (using `github/codeql-action/init` + `analyze`)\n\n\
+Once it's on, comment `@bot codeql` again.\n\
+_Note: code scanning on a private repo needs a GitHub Advanced Security licence._\n\
+_Also check the GitHub App has been granted read access to \"Code scanning alerts\"._",
         "## 🔍 CodeQL 质量报告\n\n\
 ⚠️ 仓库 `{repo}` 未启用 code scanning(或 App 无读取权限),无法生成报告。\n\n\
 **启用方式(任选其一)**:\n\
@@ -219,6 +279,7 @@ _同时请确认 GitHub App 已被授予 \"Code scanning alerts\" 只读权限�
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lang::Lang;
 
     fn alert(path: &str, line: i64, rule: &str, sev: &str) -> Value {
         serde_json::json!({
@@ -233,7 +294,7 @@ mod tests {
         let alerts = vec![alert("other/file.rs", 1, "rs/sql-injection", "error")];
         let mut changed = std::collections::HashSet::new();
         changed.insert("src/main.rs");
-        let out = render_report(&alerts, &[], &changed);
+        let out = render_report(&alerts, &[], &changed, Lang::Zh);
         assert!(out.contains("未触及任何存量"));
         assert!(out.contains("**1** 条"));
     }
@@ -255,7 +316,7 @@ mod tests {
                     == Some("src/main.rs")
             })
             .collect();
-        let out = render_report(&alerts, &relevant, &changed);
+        let out = render_report(&alerts, &relevant, &changed, Lang::Zh);
         assert!(out.contains("触及的告警(1 条)"));
         assert!(out.contains("rs/sql-injection"));
         assert!(!out.contains("js/xss"));
@@ -263,7 +324,7 @@ mod tests {
 
     #[test]
     fn test_not_enabled_message() {
-        let m = not_enabled_message("o/r");
+        let m = not_enabled_message("o/r", Lang::Zh);
         assert!(m.contains("未启用"));
         assert!(m.contains("default setup"));
         assert!(m.contains("Advanced Security"));

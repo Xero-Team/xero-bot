@@ -635,12 +635,16 @@ mod tests {
     /// now answer itself with a wall of diagnostics either.
     #[test]
     fn own_help_text_produces_nothing_at_all() {
-        let help = crate::handlers::help_text("bot");
-        let out = parse_commands("bot", &help);
-        assert!(
-            out.commands.is_empty() && out.diagnostics.is_empty(),
-            "help text must be inert, got {out:?}"
-        );
+        // Both tables: the English one lists the same commands, so it is the
+        // same trap in a different language.
+        for lang in [crate::lang::Lang::En, crate::lang::Lang::Zh] {
+            let help = crate::handlers::help_text("bot", lang);
+            let out = parse_commands("bot", &help);
+            assert!(
+                out.commands.is_empty() && out.diagnostics.is_empty(),
+                "{lang:?} help text must be inert, got {out:?}"
+            );
+        }
     }
 
     #[test]

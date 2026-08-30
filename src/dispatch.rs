@@ -65,10 +65,11 @@ pub fn route_event(cfg: &Config, event_header: &str, payload: &Value) -> Routing
                     return Routing::Respond(serde_json::json!({"ignored": "parse error"}));
                 }
             };
-            // Rendered here, so `Work` carries plain strings and the background
-            // task needn't know the parser's types.
-            let diagnostics: Vec<String> =
-                parsed.diagnostics.iter().map(|d| d.message()).collect();
+            // What the commenter wrote is the weaker of the two language
+            // signals — the PR's own commits decide — but it's the only one
+            // available without an API call, so it travels as the fallback.
+            let comment_lang = crate::lang::detect(&comment_body);
+            let diagnostics = parsed.diagnostics;
 
             // A comment can be worth answering without containing a command:
             // `@bot reviwe` produces nothing to run and one thing to say. Saying
@@ -91,6 +92,7 @@ pub fn route_event(cfg: &Config, event_header: &str, payload: &Value) -> Routing
                 pr_author,
                 commands: parsed.commands,
                 diagnostics,
+                comment_lang,
             })
         }
         WebhookEvent::PullRequest {
@@ -140,9 +142,13 @@ pub enum Work {
         commenter: String,
         pr_author: String,
         commands: Vec<crate::commands::Command>,
-        /// Pre-rendered complaints about what couldn't be understood; may be
-        /// non-empty even when `commands` is empty.
-        diagnostics: Vec<String>,
+        /// What couldn't be understood; may be non-empty even when `commands`
+        /// is empty. Carried unrendered because the wording depends on a
+        /// language that isn't known until the PR's commits have been read.
+        diagnostics: Vec<crate::commands::diag::Diagnostic>,
+        /// The language of the triggering comment, if it said. Only consulted
+        /// when the commits don't settle it.
+        comment_lang: Option<crate::lang::Lang>,
     },
     RebaseCheck {
         repo: String,
@@ -175,17 +181,24 @@ async fn execute_work_inner(cfg: &Config, work: Work) -> Result<(), String> {
             pr_author,
             commands,
             diagnostics,
+            comment_lang,
         } => {
             let gh = Client::installation_resolved(cfg, installation_id)
                 .await
                 .map_err(|e| format!("installation client: {e}"))?;
+            let lang = crate::lang::for_pr(&gh, &repo, pr_number, comment_lang).await;
             let ctx = CommentContext {
                 repo: repo.clone(),
                 pr_number,
                 commenter,
                 pr_author,
                 installation_id,
+                lang,
             };
+            // Rendered here, not at routing time: `handle_comment` takes plain
+            // strings so it needn't know the parser's types, and the wording
+            // needs the language that only this side of the queue knows.
+            let diagnostics: Vec<String> = diagnostics.iter().map(|d| d.message(lang)).collect();
             let results = handle_comment(&gh, cfg, &ctx, commands, diagnostics).await;
             tracing::info!("comment commands on {repo}#{pr_number}: {results:?}");
             Ok(())
@@ -208,7 +221,8 @@ async fn execute_work_inner(cfg: &Config, work: Work) -> Result<(), String> {
         } => {
             let gh = Client::installation(cfg, installation_id, "")
                 .map_err(|e| format!("installation client: {e}"))?;
-            let status = crate::codeql::run_codeql_report(&gh, cfg, &repo, pr_number).await;
+            let lang = crate::lang::for_pr(&gh, &repo, pr_number, None).await;
+            let status = crate::codeql::run_codeql_report(&gh, cfg, &repo, pr_number, lang).await;
             tracing::info!("codeql report {repo}#{pr_number}: {status}");
             Ok(())
         }
@@ -311,7 +325,10 @@ mod tests {
             }) => {
                 assert!(commands.is_empty(), "nothing should run");
                 assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
-                assert!(diagnostics[0].contains("review"), "{diagnostics:?}");
+                // Carried unrendered, so the assertion is on the message the
+                // PR would actually get once its language is known.
+                let msg = diagnostics[0].message(crate::lang::Lang::En);
+                assert!(msg.contains("review"), "{msg}");
             }
             other => panic!("expected Act(Comment), got {other:?}"),
         }

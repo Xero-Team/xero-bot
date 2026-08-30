@@ -9,6 +9,7 @@ Xero-Team 的组织级 GitHub App 机器人。Rust 实现,单二进制,双部署
 - **增量 AI 代码审查** — 先了解项目、结合上一轮审查意见,而非孤立地看 diff
 - **rebase 提醒** — PR 与目标分支冲突时自动打 `needs-rebase` 标签并提醒,解决后自动清除
 - **CodeQL 质量报告** — 读取仓库存量 code scanning 告警,映射到 PR 变更文件
+- **中英双语回复** — 依 PR 自身的 commit 信息决定用中文还是英文,无需配置
 
 ## 命令参考
 
@@ -37,6 +38,14 @@ Xero-Team 的组织级 GitHub App 机器人。Rust 实现,单二进制,双部署
 - PR push/reopen 后检测冲突 → 打 `needs-rebase` + 提醒评论;冲突解决 → 摘标签
 - 周期 sweep(Vercel Cron 每日 / 自托管默认 6h)兜底检测
 - 给 PR 打 `codeql` 标签(若配置了 `CODEQL_LABEL`)→ 自动生成 CodeQL 报告
+
+### 回复语言
+
+bot 用中文还是英文回复(AI 审查的正文同样如此)由 PR 自身的 commit 标题决定:英文居多用英文,
+中文居多用中文。每条 commit 一票,所以一条长信息不会替其余 commit 做决定;只读标题行,
+因此 `Signed-off-by`、`Co-authored-by` 这类英文 trailer 不会把中文 PR 带偏。commit 什么都
+看不出来时(`bump deps`、`v2 -> v3`)退而参考触发评论,仍无法判断则回退英文。无需任何配置;
+只支持这两种语言 —— 以汉字书写的日文在这里与中文无法区分,会被当作中文回复。
 
 ## AI 审查引擎
 
