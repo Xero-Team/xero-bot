@@ -391,3 +391,31 @@ async fn test_codeql_report_posts_findings() {
     let status = xero_bot::codeql::run_codeql_report(&gh, &cfg, "octocat/hello", 7).await;
     assert_eq!(status, "ok");
 }
+
+#[test]
+fn test_parse_and_route_end_to_end() {
+    let cfg = test_cfg();
+    // every supported command parses and routes to Act
+    for (body, _expected) in [
+        ("@xero-review ping", "ping"),
+        ("@xero-review help", "help"),
+        ("r? @octocat", "review-request"),
+        ("?r", "ready"),
+        ("?r cc @alice", "ready+cc"),
+        ("@xero-review label +bug", "label"),
+        ("@xero-review claim", "claim"),
+        ("@xero-review r+", "approve"),
+        ("@xero-review r-", "reject"),
+        ("@xero-review codeql", "codeql"),
+    ] {
+        let payload = make_payload("created", body, "alice", "bob");
+        match route_event(&cfg, "issue_comment", &payload) {
+            Routing::Act(Work::Comment { commands, .. }) => {
+                let parsed = parse_commands("xero-review", body);
+                assert_eq!(commands.len(), parsed.len(), "for body: {body}");
+                assert!(!commands.is_empty(), "for body: {body}");
+            }
+            other => panic!("expected Act(Comment) for {body}, got {other:?}"),
+        }
+    }
+}
