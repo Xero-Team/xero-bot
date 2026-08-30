@@ -105,6 +105,35 @@ pub async fn call_ai(
     extract_ai_text(&fmt, &out)
 }
 
+// ---------------------------------------------------------------------------
+// Verdict parsing (robust, three-tier fallback)
+// ---------------------------------------------------------------------------
+
+pub fn parse_verdict(text: &str) -> Option<Value> {
+    if text.is_empty() {
+        return None;
+    }
+    if let Ok(v) = serde_json::from_str::<Value>(text) {
+        return Some(v);
+    }
+    // ```json fenced
+    let re = regex::Regex::new(r"```(?:json)?\s*(\{.*?\})\s*```").unwrap();
+    if let Some(m) = re.captures(text) {
+        if let Ok(v) = serde_json::from_str::<Value>(m.get(1).unwrap().as_str()) {
+            return Some(v);
+        }
+    }
+    // greediest {...}
+    if let (Some(a), Some(b)) = (text.find('{'), text.rfind('}')) {
+        if a < b {
+            if let Ok(v) = serde_json::from_str::<Value>(&text[a..=b]) {
+                return Some(v);
+            }
+        }
+    }
+    None
+}
+
 fn extract_ai_text(fmt: &str, out: &Value) -> Result<String, String> {
     match fmt {
         "chat" => out
@@ -251,5 +280,30 @@ index 111..222 100644
         let (d, t) = truncate("hello world", 5);
         assert_eq!(d, "hello");
         assert!(t);
+    }
+
+    #[test]
+    fn test_parse_verdict_direct() {
+        let v = parse_verdict(r#"{"summary": "ok", "findings": []}"#);
+        assert!(v.is_some());
+    }
+
+    #[test]
+    fn test_parse_verdict_fenced() {
+        let v = parse_verdict("here you go:\n```json\n{\"summary\": \"x\", \"findings\": []}\n```");
+        assert!(v.is_some());
+        assert_eq!(v.unwrap()["summary"], "x");
+    }
+
+    #[test]
+    fn test_parse_verdict_greedy() {
+        let v = parse_verdict("junk before {\"summary\": \"y\", \"findings\": []} junk after");
+        assert!(v.is_some());
+    }
+
+    #[test]
+    fn test_parse_verdict_none() {
+        assert!(parse_verdict("").is_none());
+        assert!(parse_verdict("no json here").is_none());
     }
 }
