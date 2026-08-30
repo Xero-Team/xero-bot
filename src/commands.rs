@@ -43,6 +43,12 @@ pub enum Command {
     Claim,
     /// unclaim / release-assignment (remove commenter from assignees)
     Unclaim,
+    /// r+ [as @user] — approve on behalf of commenter (or the named user)
+    Approve {
+        on_behalf_of: Option<String>,
+    },
+    /// r- — withdraw approval
+    Reject,
 }
 
 /// One parsed command plus where it appeared (for ordered execution).
@@ -215,6 +221,12 @@ fn parse_verb(bot_name: &str, rest: &str) -> Option<Command> {
         }
         "claim" => Some(Command::Claim),
         "unclaim" | "release-assignment" | "release" => Some(Command::Unclaim),
+        "r+" => {
+            // `@xero r+` or `@xero r+ as @user` or `@xero r+ @user`
+            let on_behalf_of = parse_r_assignee(args);
+            Some(Command::Approve { on_behalf_of })
+        }
+        "r-" => Some(Command::Reject),
         _ => {
             // `r? @user` also valid right after mention: `@xero r? @user`
             if word == "r?" {
@@ -231,6 +243,19 @@ fn parse_verb(bot_name: &str, rest: &str) -> Option<Command> {
             }
         }
     }
+}
+
+/// `r+ as @user` / `r+ @user` / `r+=user` — the bors `r=` credit form.
+fn parse_r_assignee(args: &str) -> Option<String> {
+    let args = args.trim();
+    if args.is_empty() {
+        return None;
+    }
+    // "as @user" or "as user"
+    if let Some(rest) = args.to_lowercase().strip_prefix("as ") {
+        return parse_users(rest).into_iter().next();
+    }
+    parse_users(args).into_iter().next()
 }
 
 /// Collect @mentions from a whitespace-separated arg string.
@@ -418,6 +443,21 @@ mod tests {
         assert!(matches!(cmds[0].command, Command::Unclaim));
         let cmds = parse_commands("xero-review", "@xero-review release-assignment");
         assert!(matches!(cmds[0].command, Command::Unclaim));
+    }
+
+    #[test]
+    fn test_r_plus_minus() {
+        let cmds = parse_commands("xero-review", "@xero-review r+");
+        assert!(matches!(
+            &cmds[0].command,
+            Command::Approve { on_behalf_of: None }
+        ));
+        let cmds = parse_commands("xero-review", "@xero-review r+ as @octocat");
+        assert!(
+            matches!(&cmds[0].command, Command::Approve { on_behalf_of: Some(u) } if u == "octocat")
+        );
+        let cmds = parse_commands("xero-review", "@xero-review r-");
+        assert!(matches!(cmds[0].command, Command::Reject));
     }
 
     #[test]

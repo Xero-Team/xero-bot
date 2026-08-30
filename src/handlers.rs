@@ -234,6 +234,8 @@ async fn handle_one(gh: &Client, cfg: &Config, ctx: &CommentContext, cmd: Comman
                 }
             }
         }
+        Command::Approve { on_behalf_of } => handle_approve(gh, cfg, ctx, on_behalf_of).await,
+        Command::Reject => handle_reject(gh, cfg, ctx).await,
         Command::Unclaim => {
             match gh
                 .remove_assignees(&ctx.repo, ctx.pr_number, &[ctx.commenter.clone()])
@@ -320,4 +322,141 @@ async fn set_status_label(gh: &Client, cfg: &Config, ctx: &CommentContext, cmd: 
     } else {
         "error".into()
     }
+}
+
+/// r+: permission-gated approval relay (bors-style).
+async fn handle_approve(
+    gh: &Client,
+    _cfg: &Config,
+    ctx: &CommentContext,
+    on_behalf_of: Option<String>,
+) -> String {
+    // 1. commenter must have write/maintain/admin
+    let perm = match gh.collaborator_permission(&ctx.repo, &ctx.commenter).await {
+        Ok(p) => p,
+        Err(e) => {
+            let _ = gh
+                .post_issue_comment(&ctx.repo, ctx.pr_number, &format!("⚠️ 无法校验权限: `{e}`"))
+                .await;
+            return format!("error: {e}");
+        }
+    };
+    if !matches!(perm.as_str(), "admin" | "maintain" | "write") {
+        let _ = gh
+            .post_issue_comment(
+                &ctx.repo,
+                ctx.pr_number,
+                &format!(
+                    "⚠️ @{commenter} 的 `r+` 被拒绝:需要仓库 write 及以上权限(当前: {perm})。",
+                    commenter = ctx.commenter
+                ),
+            )
+            .await;
+        return "denied".into();
+    }
+
+    // 2. PR author cannot approve their own PR (GitHub itself blocks this for
+    //    the real author; here the bot is the author of the review, so we
+    //    enforce the semantic manually)
+    let credited = on_behalf_of.unwrap_or_else(|| ctx.commenter.clone());
+    if credited.eq_ignore_ascii_case(&ctx.pr_author) {
+        let _ = gh
+            .post_issue_comment(
+                &ctx.repo,
+                ctx.pr_number,
+                &format!("⚠️ 不能审批自己的 PR(`{credited}` 是本 PR 作者)。"),
+            )
+            .await;
+        return "self-approve".into();
+    }
+
+    // 3. post APPROVE review, crediting the human
+    let body = if credited == ctx.commenter {
+        format!(
+            "✅ Approved on behalf of @{commenter} (r+ by @{commenter}, relayed by xero-bot).",
+            commenter = ctx.commenter
+        )
+    } else {
+        format!(
+            "✅ Approved on behalf of @{credited} (r+ by {commenter}, relayed by xero-bot).",
+            commenter = ctx.commenter
+        )
+    };
+    match gh
+        .post_approve_review(&ctx.repo, ctx.pr_number, &body)
+        .await
+    {
+        Ok(_) => {
+            let _ = gh.post_issue_comment(&ctx.repo, ctx.pr_number, &body).await;
+            "ok".into()
+        }
+        Err(e) => {
+            let _ = gh
+                .post_issue_comment(&ctx.repo, ctx.pr_number, &format!("⚠️ 代审批失败: `{e}`"))
+                .await;
+            format!("error: {e}")
+        }
+    }
+}
+
+/// r-: withdraw — dismiss our own previous APPROVE reviews.
+async fn handle_reject(gh: &Client, _cfg: &Config, ctx: &CommentContext) -> String {
+    let reviews = match gh.list_pr_reviews(&ctx.repo, ctx.pr_number).await {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = gh
+                .post_issue_comment(&ctx.repo, ctx.pr_number, &format!("⚠️ 列出审查失败: `{e}`"))
+                .await;
+            return format!("error: {e}");
+        }
+    };
+    let slug = gh.app_slug.to_lowercase();
+    let mine: Vec<i64> = reviews
+        .iter()
+        .filter(|r| {
+            r.get("user")
+                .and_then(|u| u.get("login"))
+                .and_then(|l| l.as_str())
+                .map(|l| l.to_lowercase() == slug)
+                .unwrap_or(false)
+                && r.get("state").and_then(|s| s.as_str()) == Some("APPROVED")
+        })
+        .filter_map(|r| r.get("id").and_then(|i| i.as_i64()))
+        .collect();
+
+    if mine.is_empty() {
+        let _ = gh
+            .post_issue_comment(
+                &ctx.repo,
+                ctx.pr_number,
+                "没有可撤回的 bot 审批(此前未在本 PR 上 `r+`)。",
+            )
+            .await;
+        return "nothing-to-dismiss".into();
+    }
+
+    let mut dismissed = 0;
+    for id in &mine {
+        if let Err(e) = gh
+            .dismiss_review(
+                &ctx.repo,
+                ctx.pr_number,
+                *id,
+                &format!("r- by @{}: approval withdrawn", ctx.commenter),
+            )
+            .await
+        {
+            tracing::warn!("dismiss review {id}: {e}");
+        } else {
+            dismissed += 1;
+        }
+    }
+    let _ = gh
+        .post_issue_comment(
+            &ctx.repo,
+            ctx.pr_number,
+            &format!("已撤回 {dismissed} 个 bot 审批(r- by @{})。", ctx.commenter),
+        )
+        .await;
+    "ok".into()
 }
