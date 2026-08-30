@@ -275,3 +275,110 @@ async fn run_pi_inner(
     }
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// codex engine
+// ---------------------------------------------------------------------------
+
+pub async fn run_codex(
+    gh: &Client,
+    cfg: &Config,
+    repo: &str,
+    pr_number: i64,
+    token: &str,
+) -> String {
+    let _ = gh
+        .post_issue_comment(repo, pr_number, "🔄 正在审查(codex 引擎),稍候…")
+        .await;
+
+    if let Err(e) = run_codex_inner(gh, cfg, repo, pr_number, token).await {
+        let _ = gh
+            .post_issue_comment(
+                repo,
+                pr_number,
+                &format!("## 🤖 AI Code Review (codex)\n\n❌ 审查出错: `{e}`"),
+            )
+            .await;
+        return format!("error: {e}");
+    }
+    "ok".into()
+}
+
+async fn run_codex_inner(
+    gh: &Client,
+    cfg: &Config,
+    repo: &str,
+    pr_number: i64,
+    token: &str,
+) -> Result<(), String> {
+    let meta = gh
+        .get_pr(repo, pr_number)
+        .await
+        .map_err(|e| e.to_string())?;
+    let head_sha = meta
+        .pointer("/head/sha")
+        .and_then(|s| s.as_str())
+        .ok_or("no head sha")?;
+    let pr_ref = format!("pull/{pr_number}/head:{head_sha}");
+
+    let dir = ensure_checkout(cfg, repo, &pr_ref, token).await?;
+
+    let (previous_review, new_commits) =
+        crate::review::fetch_incremental_context(gh, repo, pr_number, cfg.max_diff_chars).await;
+    let prompt = build_review_prompt(
+        repo,
+        pr_number,
+        &meta,
+        previous_review.as_deref(),
+        new_commits.as_deref(),
+    );
+
+    let out_file = Path::new(&cfg.data_dir).join("codex-last-message.md");
+    if let Some(parent) = out_file.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    let _ = tokio::fs::remove_file(&out_file).await;
+
+    let mut cmd = tokio::process::Command::new(&cfg.codex_path);
+    cmd.arg("exec")
+        .arg("--sandbox")
+        .arg("read-only")
+        .arg("--skip-git-repo-check")
+        .arg("-C")
+        .arg(&dir)
+        .arg("-o")
+        .arg(&out_file)
+        .arg(&prompt)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if !cfg.codex_args.is_empty() {
+        for a in cfg.codex_args.split_whitespace() {
+            cmd.arg(a);
+        }
+    }
+
+    let out = cmd
+        .output()
+        .await
+        .map_err(|e| format!("codex spawn: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "codex exited {}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+                .chars()
+                .take(500)
+                .collect::<String>()
+        ));
+    }
+    let last = tokio::fs::read_to_string(&out_file)
+        .await
+        .map_err(|e| format!("codex output file: {e}"))?;
+    let status = post_subproc_result(gh, cfg, repo, pr_number, &last, "codex").await;
+    if status != "ok" {
+        return Err(status);
+    }
+    Ok(())
+}
