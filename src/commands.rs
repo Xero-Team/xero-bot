@@ -164,15 +164,18 @@ pub fn parse_commands(bot_name: &str, text: &str) -> Vec<ParsedCommand> {
 /// Parse the verb (and arguments) following an `@bot` mention.
 fn parse_verb(bot_name: &str, rest: &str) -> Option<Command> {
     let trimmed = rest.trim_start();
-    let lower = trimmed.to_lowercase();
 
-    // word + remainder (first whitespace boundary)
-    let (word, args) = match lower.find(char::is_whitespace) {
-        Some(i) => (&lower[..i], trimmed[i..].trim()),
-        None => (lower.as_str(), ""),
+    // Split on the first whitespace using offsets from the ORIGINAL string.
+    // `to_lowercase()` is not length-preserving in UTF-8 (`K` U+212A is 3 bytes,
+    // `k` is 1), so an offset found in a lowercased copy can land mid-codepoint
+    // here and panic. Verbs are ASCII, so ASCII-lowercase for comparison only.
+    let (word_raw, args) = match trimmed.char_indices().find(|(_, c)| c.is_whitespace()) {
+        Some((i, _)) => (&trimmed[..i], trimmed[i..].trim()),
+        None => (trimmed, ""),
     };
+    let word = word_raw.to_ascii_lowercase();
 
-    match word {
+    match word.as_str() {
         "ping" => Some(Command::Ping),
         "help" | "commands" => Some(Command::Help),
         "review" => {
@@ -264,11 +267,14 @@ fn parse_users(args: &str) -> Vec<String> {
 /// For `?r cc @user1 @user2` — match "cc" followed by at least one @user.
 fn parse_cc_args(rest: &str) -> Option<Vec<String>> {
     let trimmed = rest.trim_start();
-    let lower = trimmed.to_lowercase();
-    if !lower.starts_with("cc") {
+    // `get(..2)` yields None unless byte 2 is a char boundary, so the slice
+    // below can't split a codepoint. Same hazard as parse_verb.
+    let Some(prefix) = trimmed.get(..2) else {
+        return None;
+    };
+    if !prefix.eq_ignore_ascii_case("cc") {
         return None;
     }
-    // skip the "cc" prefix in the ORIGINAL text (byte offset 2)
     let after_raw = &trimmed[2..];
     let users = parse_users(after_raw);
     if users.is_empty() {
@@ -488,5 +494,57 @@ mod tests {
     fn test_codeql() {
         let cmds = parse_commands("xero-review", "@xero-review codeql");
         assert!(matches!(cmds[0].command, Command::Codeql));
+    }
+
+    /// `to_lowercase()` is not length-preserving in UTF-8, so a byte offset found
+    /// in a lowercased copy could land mid-codepoint in the original and panic.
+    /// Each of these shrinks or grows when lowercased:
+    ///   U+212A KELVIN SIGN  3 bytes -> `k` 1 byte
+    ///   U+2126 OHM SIGN     3 bytes -> `ω` 2 bytes
+    ///   U+0130 İ            2 bytes -> `i̇` 3 bytes
+    /// Reachable from any comment body, and the webhook has no catch layer, so a
+    /// panic here used to take down the response and trigger GitHub redelivery.
+    #[test]
+    fn test_parse_verb_is_utf8_safe() {
+        let nasty = [
+            "\u{212A}", "\u{2126}", "\u{212B}", "\u{130}", "\u{1E9E}", "\u{FB00}", "就绪", "🎉",
+        ];
+        for s in nasty {
+            for body in [
+                // as the verb itself
+                format!("@xero-review {s} x"),
+                format!("@xero-review {s}"),
+                // as the first argument
+                format!("@xero-review cc {s} @alice"),
+                format!("@xero-review assign {s}"),
+                format!("@xero-review label {s} +bug"),
+                // doubled, then followed by multibyte text
+                format!("@xero-review {s}{s} 中文"),
+                // after a valid verb
+                format!("@xero-review review {s}"),
+                format!("@xero-review r+ as {s}"),
+                // bare anchors
+                format!("r? {s}"),
+                format!("?r cc {s}"),
+                format!("{s}?r"),
+            ] {
+                // must not panic; result content is irrelevant here
+                let _ = parse_commands("xero-review", &body);
+            }
+        }
+    }
+
+    /// Mixed-script bodies with no command at all must parse cleanly.
+    #[test]
+    fn test_prose_with_multibyte_is_inert() {
+        for body in [
+            "这个 PR 看起来不错,谢谢!🎉",
+            "@xero-review 谢谢你的审查",
+            "Ω K Å İ ẞ ﬀ",
+            "r?",
+            "?r",
+        ] {
+            let _ = parse_commands("xero-review", body);
+        }
     }
 }

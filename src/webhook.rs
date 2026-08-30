@@ -71,6 +71,12 @@ pub enum WebhookEvent {
         commenter: String,
         installation_id: i64,
         app_slug: String,
+        /// `comment.performed_via_github_app.id` — set when an App authored the
+        /// comment. Unlike `installation.app_slug` this is genuinely present on
+        /// real payloads, so it's the reliable way to recognize our own output.
+        via_app_id: Option<i64>,
+        /// `comment.user.type == "Bot"`
+        commenter_is_bot: bool,
         /// author of the PR (for r+ checks)
         pr_author: String,
         /// issue is a PR?
@@ -119,6 +125,8 @@ pub fn classify(event_header: &str, payload: &Value) -> WebhookEvent {
             let commenter = jstr_or(payload, &["comment", "user", "login"], "");
             let app_slug = jstr_or(payload, &["installation", "app_slug"], "");
             let pr_author = jstr_or(payload, &["issue", "user", "login"], "");
+            let via_app_id = ji64(payload, &["comment", "performed_via_github_app", "id"]);
+            let commenter_is_bot = jstr(payload, &["comment", "user", "type"]) == Some("Bot");
             WebhookEvent::PrComment {
                 repo: repo.to_string(),
                 pr_number,
@@ -126,6 +134,8 @@ pub fn classify(event_header: &str, payload: &Value) -> WebhookEvent {
                 commenter: commenter.to_string(),
                 installation_id,
                 app_slug: app_slug.to_string(),
+                via_app_id,
+                commenter_is_bot,
                 pr_author: pr_author.to_string(),
                 is_pr,
             }
@@ -196,12 +206,15 @@ mod tests {
 
     #[test]
     fn test_classify_pr_comment() {
+        // The `installation` property on an issue_comment payload is GitHub's
+        // *simple installation* object: id and node_id only. It carries no
+        // app_slug, so don't fabricate one here.
         let payload = json!({
             "action": "created",
-            "installation": {"id": 42, "app_slug": "xero-review"},
+            "installation": {"id": 42, "node_id": "MDIzOkludGVncmF0aW9u"},
             "repository": {"full_name": "octocat/hello"},
             "issue": {"number": 7, "pull_request": {"url": "x"}, "user": {"login": "alice"}},
-            "comment": {"body": "@xero-review ping", "user": {"login": "bob"}}
+            "comment": {"body": "@xero-review ping", "user": {"login": "bob", "type": "User"}}
         });
         match classify("issue_comment", &payload) {
             WebhookEvent::PrComment {
@@ -217,6 +230,59 @@ mod tests {
                 assert_eq!(commenter, "bob");
                 assert_eq!(installation_id, 42);
                 assert!(is_pr);
+            }
+            other => panic!("expected PrComment, got {other:?}"),
+        }
+    }
+
+    /// An App-authored comment must be recognizable, since that's how the bot
+    /// avoids executing the commands listed in its own help text.
+    #[test]
+    fn test_classify_marks_app_authored_comment() {
+        let payload = json!({
+            "action": "created",
+            "installation": {"id": 42},
+            "repository": {"full_name": "octocat/hello"},
+            "issue": {"number": 7, "pull_request": {"url": "x"}, "user": {"login": "alice"}},
+            "comment": {
+                "body": "| `@xero-review review` |",
+                "user": {"login": "xero-review[bot]", "type": "Bot"},
+                "performed_via_github_app": {"id": 4768775}
+            }
+        });
+        match classify("issue_comment", &payload) {
+            WebhookEvent::PrComment {
+                commenter,
+                via_app_id,
+                commenter_is_bot,
+                ..
+            } => {
+                assert_eq!(commenter, "xero-review[bot]");
+                assert_eq!(via_app_id, Some(4768775));
+                assert!(commenter_is_bot);
+            }
+            other => panic!("expected PrComment, got {other:?}"),
+        }
+    }
+
+    /// A human comment must not look App-authored.
+    #[test]
+    fn test_classify_human_comment_is_not_app() {
+        let payload = json!({
+            "action": "created",
+            "installation": {"id": 42},
+            "repository": {"full_name": "octocat/hello"},
+            "issue": {"number": 7, "pull_request": {"url": "x"}, "user": {"login": "alice"}},
+            "comment": {"body": "@xero-review ping", "user": {"login": "bob", "type": "User"}}
+        });
+        match classify("issue_comment", &payload) {
+            WebhookEvent::PrComment {
+                via_app_id,
+                commenter_is_bot,
+                ..
+            } => {
+                assert_eq!(via_app_id, None);
+                assert!(!commenter_is_bot);
             }
             other => panic!("expected PrComment, got {other:?}"),
         }

@@ -39,6 +39,16 @@ fn classify_octo_error(e: octocrab::Error) -> GhError {
     GhError::Http(e)
 }
 
+/// Normalize a GitHub login for comparison.
+///
+/// A GitHub App authors comments and reviews as `name[bot]`, so any equality
+/// check against a configured bot name or app slug must strip that suffix —
+/// otherwise it silently never matches.
+pub fn normalize_login(login: &str) -> String {
+    let lower = login.trim().to_lowercase();
+    lower.strip_suffix("[bot]").unwrap_or(&lower).to_string()
+}
+
 fn chrono_now_secs() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

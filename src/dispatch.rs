@@ -5,7 +5,7 @@ use serde_json::Value;
 
 use crate::commands::parse_commands;
 use crate::config::Config;
-use crate::github::Client;
+use crate::github::{normalize_login, Client};
 use crate::handlers::{handle_comment, CommentContext};
 use crate::webhook::{classify, WebhookEvent};
 
@@ -22,20 +22,48 @@ pub fn route_event(cfg: &Config, event_header: &str, payload: &Value) -> Routing
             commenter,
             installation_id,
             app_slug,
+            via_app_id,
+            commenter_is_bot,
             pr_author,
             is_pr,
         } => {
-            // don't react to the bot's own comments
-            let self_login = if app_slug.is_empty() {
-                cfg.bot_name.to_lowercase()
-            } else {
-                app_slug.to_lowercase()
-            };
-            if !commenter.is_empty() && commenter.to_lowercase() == self_login {
-                return Routing::Respond(serde_json::json!({"ignored": "self comment"}));
+            // Don't react to our own comments, or we execute the commands listed
+            // in our own help text. Two independent checks:
+            //
+            // 1. The App id, which is name-independent — this still holds when
+            //    BOT_NAME is misconfigured, which is how the loop got shipped.
+            // 2. The login, which needs the `[bot]` suffix stripped: a GitHub App
+            //    comments as `name[bot]`, so comparing against a bare BOT_NAME
+            //    never matched.
+            if let (Some(via), Ok(own)) = (via_app_id, cfg.app_id.parse::<i64>()) {
+                if via == own {
+                    return Routing::Respond(serde_json::json!({"ignored": "self comment"}));
+                }
+            }
+            if commenter_is_bot && !commenter.is_empty() {
+                let own = normalize_login(&cfg.bot_name);
+                if normalize_login(&commenter) == own || normalize_login(&app_slug) == own {
+                    return Routing::Respond(serde_json::json!({"ignored": "self comment"}));
+                }
             }
 
-            let commands = parse_commands(&cfg.bot_name, &comment_body);
+            // The parser indexes into arbitrary user text. A panic here would kill
+            // the webhook response, and GitHub redelivers on failure — so a single
+            // bad comment becomes a loop. Contain it at the only entry point both
+            // the axum server and the Vercel function share.
+            let parsed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                parse_commands(&cfg.bot_name, &comment_body)
+            }));
+            let commands = match parsed {
+                Ok(c) => c,
+                Err(_) => {
+                    tracing::error!(
+                        "command parser panicked on {repo}#{pr_number} ({} bytes); ignoring",
+                        comment_body.len()
+                    );
+                    return Routing::Respond(serde_json::json!({"ignored": "parse error"}));
+                }
+            };
             if commands.is_empty() {
                 return Routing::Respond(serde_json::json!({"ignored": "no command"}));
             }
@@ -171,6 +199,105 @@ async fn execute_work_inner(cfg: &Config, work: Work) -> Result<(), String> {
             let status = crate::codeql::run_codeql_report(&gh, cfg, &repo, pr_number).await;
             tracing::info!("codeql report {repo}#{pr_number}: {status}");
             Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn cfg() -> Config {
+        let mut c = Config::from_env();
+        c.app_id = "4768775".into();
+        c.bot_name = "xero-team-bot".into();
+        c.webhook_secret = "whsec".into();
+        c
+    }
+
+    /// `comment` overrides are merged over a valid PR-comment payload.
+    fn payload(comment: serde_json::Value) -> serde_json::Value {
+        json!({
+            "action": "created",
+            "installation": {"id": 42},
+            "repository": {"full_name": "Xero-Team/xero-bot"},
+            "issue": {"number": 1, "pull_request": {"url": "x"}, "user": {"login": "alice"}},
+            "comment": comment
+        })
+    }
+
+    fn ignored_reason(r: &Routing) -> Option<String> {
+        match r {
+            Routing::Respond(v) => v
+                .get("ignored")
+                .and_then(|s| s.as_str())
+                .map(String::from),
+            Routing::Act(_) => None,
+        }
+    }
+
+    /// The help text lists every command as `@bot <verb>`, so reacting to our own
+    /// comments executed all of them. The App id catches this regardless of how
+    /// BOT_NAME is configured.
+    #[test]
+    fn self_comment_ignored_via_app_id() {
+        let p = payload(json!({
+            "body": "| `@xero-team-bot review` | `@xero-team-bot label +a -b` |",
+            "user": {"login": "anything-at-all", "type": "Bot"},
+            "performed_via_github_app": {"id": 4768775}
+        }));
+        let r = route_event(&cfg(), "issue_comment", &p);
+        assert_eq!(ignored_reason(&r).as_deref(), Some("self comment"));
+    }
+
+    /// A GitHub App comments as `name[bot]`; comparing that against a bare
+    /// BOT_NAME never matched, which is how the loop shipped.
+    #[test]
+    fn self_comment_ignored_via_bot_suffix_login() {
+        let p = payload(json!({
+            "body": "@xero-team-bot ping",
+            "user": {"login": "xero-team-bot[bot]", "type": "Bot"}
+        }));
+        let r = route_event(&cfg(), "issue_comment", &p);
+        assert_eq!(ignored_reason(&r).as_deref(), Some("self comment"));
+    }
+
+    /// The guard must not swallow humans (or other bots) with similar names.
+    #[test]
+    fn similar_login_not_treated_as_self() {
+        for (login, kind) in [
+            ("xero-team-bot-helper", "User"),
+            ("xero-team-bot-helper[bot]", "Bot"),
+            ("alice", "User"),
+        ] {
+            let p = payload(json!({
+                "body": "@xero-team-bot ping",
+                "user": {"login": login, "type": kind}
+            }));
+            let r = route_event(&cfg(), "issue_comment", &p);
+            assert!(
+                matches!(r, Routing::Act(_)),
+                "{login} must not be treated as the bot itself, got {r:?}"
+            );
+        }
+    }
+
+    /// Bodies that used to panic the parser mid-codepoint must route cleanly.
+    /// A panic here killed the webhook response, and GitHub redelivers on
+    /// failure — so one bad comment became a loop.
+    #[test]
+    fn pathological_body_routes_cleanly() {
+        for body in [
+            "@xero-team-bot \u{212A} x",
+            "@xero-team-bot \u{2126}\u{2126} 中文",
+            "@xero-team-bot cc \u{130} @alice",
+            "@xero-team-bot 谢谢!🎉",
+            "r? \u{212B}",
+        ] {
+            let p = payload(json!({"body": body, "user": {"login": "alice", "type": "User"}}));
+            // The assertion is that this returns at all rather than unwinding.
+            let _ = route_event(&cfg(), "issue_comment", &p);
         }
     }
 }
