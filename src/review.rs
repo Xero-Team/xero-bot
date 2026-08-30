@@ -8,6 +8,18 @@ use serde_json::{json, Value};
 
 use crate::config::Config;
 
+pub const SEVERITIES: [&str; 5] = ["critical", "high", "medium", "low", "info"];
+
+pub fn sev_meta(sev: &str) -> (&'static str, &'static str) {
+    match sev {
+        "critical" => ("🔴", "严重"),
+        "high" => ("🟠", "高"),
+        "medium" => ("🟡", "中"),
+        "low" => ("🔵", "低"),
+        _ => ("⚪", "信息"),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // AI call — three formats
 // ---------------------------------------------------------------------------
@@ -183,6 +195,143 @@ pub fn build_user_prompt(
     format!(
         "PR 标题: {title}\nPR 描述: {body}\n{prev_section}{commits_section}\n以下是 PR 的 unified diff(只关注新增的代码):\n{diff}{note}\n\n请审查上述改动并按指定 JSON schema 输出。"
     )
+}
+
+// ---------------------------------------------------------------------------
+// Rendering & posting
+// ---------------------------------------------------------------------------
+
+pub fn render_summary(verdict: &Value, engine_tag: &str) -> String {
+    let findings = verdict
+        .get("findings")
+        .and_then(|f| f.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let summary = verdict
+        .get("summary")
+        .and_then(|s| s.as_str())
+        .unwrap_or("(无总结)");
+
+    let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for s in SEVERITIES {
+        counts.insert(s, 0);
+    }
+    for f in &findings {
+        let sev = f
+            .get("severity")
+            .and_then(|s| s.as_str())
+            .unwrap_or("info")
+            .to_lowercase();
+        match counts.get_mut(sev.as_str()) {
+            Some(c) => *c += 1,
+            None => *counts.get_mut("info").unwrap() += 1,
+        }
+    }
+
+    let mut table = String::from("| 等级 | 数量 |\n|---|---|\n");
+    for s in SEVERITIES {
+        let (icon, label) = sev_meta(s);
+        table.push_str(&format!("| {icon} {label} | {} |\n", counts[s]));
+    }
+
+    let mut lines = vec![
+        "## 🤖 AI Code Review".to_string(),
+        String::new(),
+        format!("**{summary}**"),
+        String::new(),
+        "### 风险分级".to_string(),
+        String::new(),
+        table,
+    ];
+    if !engine_tag.is_empty() {
+        lines.push(format!("_engine: {engine_tag}_\n"));
+    }
+
+    if findings.is_empty() {
+        lines.push("未发现问题 🎉".to_string());
+        return lines.join("\n");
+    }
+
+    for s in SEVERITIES {
+        let items: Vec<&Value> = findings
+            .iter()
+            .filter(|f| {
+                f.get("severity")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("info")
+                    .to_lowercase()
+                    == s
+            })
+            .collect();
+        if items.is_empty() {
+            continue;
+        }
+        let (icon, label) = sev_meta(s);
+        lines.push(String::new());
+        lines.push(format!("### {icon} {label} ({})", items.len()));
+        lines.push(String::new());
+        for f in items {
+            let file = f.get("file").and_then(|x| x.as_str()).unwrap_or("?");
+            let line = f
+                .get("line")
+                .and_then(|x| x.as_i64())
+                .map(|l| l.to_string())
+                .unwrap_or_else(|| "?".into());
+            let title = f
+                .get("title")
+                .and_then(|x| x.as_str())
+                .unwrap_or("(无标题)");
+            let desc = f.get("description").and_then(|x| x.as_str()).unwrap_or("");
+            let sug = f.get("suggestion").and_then(|x| x.as_str()).unwrap_or("");
+            lines.push(format!("- **`{file}:{line}` — {title}**"));
+            lines.push(format!("  {desc}"));
+            if !sug.is_empty() {
+                lines.push(format!("  💡 {sug}"));
+            }
+        }
+    }
+    lines.join("\n")
+}
+
+pub fn build_inline_comments(
+    verdict: &Value,
+    added_lines: &std::collections::HashMap<String, std::collections::HashSet<i64>>,
+) -> Vec<Value> {
+    let mut inline = Vec::new();
+    let Some(findings) = verdict.get("findings").and_then(|f| f.as_array()) else {
+        return inline;
+    };
+    for f in findings {
+        let Some(file) = f.get("file").and_then(|x| x.as_str()) else {
+            continue;
+        };
+        let Some(line) = f.get("line").and_then(|x| x.as_i64()) else {
+            continue;
+        };
+        if !added_lines
+            .get(file)
+            .map(|set| set.contains(&line))
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let sev = f
+            .get("severity")
+            .and_then(|x| x.as_str())
+            .unwrap_or("info")
+            .to_lowercase();
+        let (icon, _) = sev_meta(&sev);
+        let title = f.get("title").and_then(|x| x.as_str()).unwrap_or("");
+        let desc = f.get("description").and_then(|x| x.as_str()).unwrap_or("");
+        let sug = f.get("suggestion").and_then(|x| x.as_str()).unwrap_or("");
+        inline.push(json!({
+            "path": file,
+            "line": line,
+            "side": "RIGHT",
+            "body": format!("{icon} **{title}**\n\n{desc}\n\n💡 {sug}").trim(),
+        }));
+    }
+    inline
 }
 
 fn extract_ai_text(fmt: &str, out: &Value) -> Result<String, String> {
@@ -372,5 +521,50 @@ index 111..222 100644
         assert!(p.contains("上一轮: 修了 X"));
         assert!(p.contains("新提交"));
         assert!(p.contains("fix: a"));
+    }
+
+    #[test]
+    fn test_render_summary_empty() {
+        let verdict = serde_json::json!({"summary": "clean", "findings": []});
+        let out = render_summary(&verdict, "builtin");
+        assert!(out.contains("clean"));
+        assert!(out.contains("未发现问题"));
+    }
+
+    #[test]
+    fn test_render_summary_findings() {
+        let verdict = serde_json::json!({
+            "summary": "some issues",
+            "findings": [
+                {"severity": "high", "title": "bug", "file": "a.rs", "line": 1,
+                 "description": "desc", "suggestion": "fix it"},
+                {"severity": "info", "title": "nit", "file": "b.rs", "line": 2,
+                 "description": "d2", "suggestion": ""}
+            ]
+        });
+        let out = render_summary(&verdict, "");
+        assert!(out.contains("some issues"));
+        assert!(out.contains("🟠 高 (1)"));
+        assert!(out.contains("`a.rs:1`"));
+        assert!(out.contains("💡 fix it"));
+    }
+
+    #[test]
+    fn test_build_inline_comments_filters_lines() {
+        let verdict = serde_json::json!({
+            "findings": [
+                {"severity": "high", "title": "on added line", "file": "src/main.rs", "line": 3,
+                 "description": "d", "suggestion": "s"},
+                {"severity": "high", "title": "not added line", "file": "src/main.rs", "line": 99,
+                 "description": "d", "suggestion": "s"},
+                {"severity": "high", "title": "other file", "file": "nope.rs", "line": 1,
+                 "description": "d", "suggestion": "s"}
+            ]
+        });
+        let added = parse_added_lines(SAMPLE_DIFF);
+        let inline = build_inline_comments(&verdict, &added);
+        assert_eq!(inline.len(), 1);
+        assert_eq!(inline[0]["path"], "src/main.rs");
+        assert_eq!(inline[0]["line"], 3);
     }
 }
