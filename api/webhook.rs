@@ -13,6 +13,14 @@ use xero_bot::webhook::verify_signature;
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
+    // initialize tracing so background-work errors show in function logs
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "info,xero_bot=debug".into()),
+        )
+        .with_ansi(false)
+        .try_init();
     run(service_fn(handler)).await
 }
 
