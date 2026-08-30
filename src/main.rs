@@ -3,6 +3,8 @@
 //! Routes:
 //!   POST /webhook  — GitHub App webhook (same logic as the Vercel function)
 //!   GET  /health   — liveness
+//!   GET  /cron     — rebase sweep (protect with CRON_SECRET, or bind to
+//!                    localhost and drive it with an external cron)
 //!
 //! Background work runs on tokio::spawn (no time limit).
 
@@ -33,6 +35,20 @@ async fn main() {
         std::process::exit(2);
     }
 
+    // rebase sweep loop
+    if cfg.rebase_sweep_enabled {
+        let sweep_cfg = cfg.clone();
+        tokio::spawn(async move {
+            let interval =
+                std::time::Duration::from_secs(sweep_cfg.rebase_sweep_interval_secs.max(60));
+            // first run after one interval (fresh start; don't hammer on boot)
+            loop {
+                tokio::time::sleep(interval).await;
+                let _ = xero_bot::rebase::sweep(&sweep_cfg).await;
+            }
+        });
+    }
+
     let port = cfg.port;
     let state = AppState { cfg };
 
@@ -40,11 +56,12 @@ async fn main() {
         .route("/", get(health))
         .route("/health", get(health))
         .route("/webhook", post(webhook))
+        .route("/cron", get(cron_sweep))
         .with_state(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     println!(
-        "xero-bot listening on 0.0.0.0:{port} (POST /webhook) — bot: @{}",
+        "xero-bot listening on 0.0.0.0:{port} (POST /webhook, GET /cron) — bot: @{}",
         Config::from_env().bot_name
     );
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
@@ -92,4 +109,28 @@ async fn webhook(
             (StatusCode::OK, Json(json!({"accepted": true})))
         }
     }
+}
+
+async fn cron_sweep(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> (StatusCode, Json<Value>) {
+    // allow: bearer CRON_SECRET, localhost, or no secret configured
+    let auth = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let authorized =
+        state.cfg.cron_secret.is_empty() || auth == format!("Bearer {}", state.cfg.cron_secret);
+    if !authorized {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "unauthorized"})),
+        );
+    }
+    let summary = xero_bot::rebase::sweep(&state.cfg).await;
+    (
+        StatusCode::OK,
+        Json(json!({"ok": true, "summary": summary})),
+    )
 }
