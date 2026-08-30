@@ -17,10 +17,20 @@ pub struct CommentContext {
 pub fn help_text(bot_name: &str) -> String {
     format!(
         "### 🤖 xero-bot 命令参考\n\n\
-        | 命令 | 说明 |\n|---|---|\n\
-        | `@{bot_name} ping` | 健康检查 |\n\
-        | `@{bot_name} help` | 显示本帮助 |\n\n\
-        _更多命令陆续加入。_"
+| 命令 | 说明 |\n|---|---|\n\
+| `@{bot_name} review` | AI 代码审查(增量:结合上一轮审查与新提交) |\n\
+| `@{bot_name} ping` | 健康检查 |\n\
+| `@{bot_name} help` | 显示本帮助 |\n\
+| `r? @user` | 请求 @user 审查(自动指派为 reviewer) |\n\
+| `@{bot_name} cc @user…` | 抄送/通知指定用户 |\n\
+| `@{bot_name} ready` / `?r` | 标记等待审查(打 `waiting-on-review`) |\n\
+| `@{bot_name} author` | 标记等待作者(打 `waiting-on-author`) |\n\
+| `@{bot_name} blocked` | 标记受阻(打 `blocked`) |\n\
+| `@{bot_name} label +a -b` | 添加/移除标签 |\n\
+| `@{bot_name} assign @user` | 指派给 @user |\n\
+| `@{bot_name} claim` | 认领(指派给自己) |\n\
+| `@{bot_name} unclaim` | 释放指派 |\n\n\
+_更多命令陆续加入。_"
     )
 }
 
@@ -53,6 +63,67 @@ async fn handle_one(gh: &Client, cfg: &Config, ctx: &CommentContext, cmd: Comman
             .is_ok()
             .then_some("ok".into())
             .unwrap_or_else(|| "error".into()),
+        Command::Review => {
+            if !ctx_is_pr(ctx) {
+                let _ = gh
+                    .post_issue_comment(&ctx.repo, ctx.pr_number, "⚠️ review 命令只在 PR 上有效。")
+                    .await;
+                return "not-a-pr".into();
+            }
+            if !cfg.ai_ready() && cfg.review_engine == "builtin" {
+                let _ = gh
+                    .post_issue_comment(
+                        &ctx.repo,
+                        ctx.pr_number,
+                        "⚠️ 未配置 AI(缺 AI_BASE_URL/AI_API_KEY/AI_MODEL),无法审查。",
+                    )
+                    .await;
+                return "ai-not-configured".into();
+            }
+            crate::review::run_builtin(gh, cfg, &ctx.repo, ctx.pr_number).await
+        }
+        Command::RequestReview { user } => {
+            // triagebot: assignment is the review request
+            match gh
+                .add_assignees(&ctx.repo, ctx.pr_number, &[user.clone()])
+                .await
+            {
+                Ok(()) => {
+                    let _ = gh
+                        .post_issue_comment(
+                            &ctx.repo,
+                            ctx.pr_number,
+                            &format!("已指派 @{user} 为 reviewer,请审查 🙏"),
+                        )
+                        .await;
+                    "ok".into()
+                }
+                Err(e) => {
+                    let msg = match &e {
+                        GhError::Api { status, .. } if *status == 403 || *status == 422 => format!(
+                            "⚠️ 无法指派 @{user}:用户需要有仓库写权限、或是组织成员、或曾在该 PR 留言。"
+                        ),
+                        _ => format!("⚠️ 指派失败: `{e}`"),
+                    };
+                    let _ = gh.post_issue_comment(&ctx.repo, ctx.pr_number, &msg).await;
+                    format!("error: {e}")
+                }
+            }
+        }
+        Command::Cc { users } => {
+            let mentions: Vec<String> = users.iter().map(|u| format!("@{u}")).collect();
+            let _ = gh
+                .post_issue_comment(
+                    &ctx.repo,
+                    ctx.pr_number,
+                    &format!("cc {} (via @{})", mentions.join(" "), ctx.commenter),
+                )
+                .await;
+            "ok".into()
+        }
+        Command::Ready | Command::Author | Command::Blocked => {
+            set_status_label(gh, cfg, ctx, cmd).await
+        }
         Command::Label { add, remove } => {
             // permission gate: label changes require at least triage access —
             // GitHub enforces this API-side; we just try and report.
@@ -190,49 +261,13 @@ async fn handle_one(gh: &Client, cfg: &Config, ctx: &CommentContext, cmd: Comman
                 }
             }
         }
-        Command::Ready | Command::Author | Command::Blocked => {
-            set_status_label(gh, cfg, ctx, cmd).await
-        }
-        Command::Cc { users } => {
-            let mentions: Vec<String> = users.iter().map(|u| format!("@{u}")).collect();
-            let _ = gh
-                .post_issue_comment(
-                    &ctx.repo,
-                    ctx.pr_number,
-                    &format!("cc {} (via @{})", mentions.join(" "), ctx.commenter),
-                )
-                .await;
-            "ok".into()
-        }
-        Command::RequestReview { user } => {
-            // triagebot: assignment is the review request
-            match gh
-                .add_assignees(&ctx.repo, ctx.pr_number, &[user.clone()])
-                .await
-            {
-                Ok(()) => {
-                    let _ = gh
-                        .post_issue_comment(
-                            &ctx.repo,
-                            ctx.pr_number,
-                            &format!("已指派 @{user} 为 reviewer,请审查 🙏"),
-                        )
-                        .await;
-                    "ok".into()
-                }
-                Err(e) => {
-                    let msg = match &e {
-                        GhError::Api { status, .. } if *status == 403 || *status == 422 => format!(
-                            "⚠️ 无法指派 @{user}:用户需要有仓库写权限、或是组织成员、或曾在该 PR 留言。"
-                        ),
-                        _ => format!("⚠️ 指派失败: `{e}`"),
-                    };
-                    let _ = gh.post_issue_comment(&ctx.repo, ctx.pr_number, &msg).await;
-                    format!("error: {e}")
-                }
-            }
-        }
     }
+}
+
+fn ctx_is_pr(_ctx: &CommentContext) -> bool {
+    // classify() only produces PrComment for issues with a pull_request
+    // pointer; issue comments are filtered earlier. Always true here.
+    true
 }
 
 /// ready/author/blocked: add one status label, remove its siblings.

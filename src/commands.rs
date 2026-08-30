@@ -15,6 +15,7 @@ use regex::Regex;
 pub enum Command {
     Ping,
     Help,
+    Review,
     /// `r? @user` — assign reviewer
     RequestReview {
         user: String,
@@ -181,6 +182,11 @@ fn parse_verb(bot_name: &str, rest: &str) -> Option<Command> {
     match word {
         "ping" => Some(Command::Ping),
         "help" | "commands" => Some(Command::Help),
+        "review" => {
+            // `@xero review` = AI review; `@rustbot review` was an alias for
+            // ready in triagebot, but for this bot review is the primary verb.
+            Some(Command::Review)
+        }
         "cc" => {
             let users = parse_users(args);
             if users.is_empty() {
@@ -278,6 +284,20 @@ fn is_valid_label(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_review_command() {
+        let cmds = parse_commands("xero-review", "@xero-review review");
+        assert_eq!(cmds.len(), 1);
+        assert!(matches!(cmds[0].command, Command::Review));
+    }
+
+    #[test]
+    fn test_review_case_insensitive_and_mid_comment() {
+        let cmds = parse_commands("xero-review", "fix the bug\n@XERO-REVIEW   Review please");
+        assert_eq!(cmds.len(), 1);
+        assert!(matches!(cmds[0].command, Command::Review));
+    }
 
     #[test]
     fn test_ping_help() {
