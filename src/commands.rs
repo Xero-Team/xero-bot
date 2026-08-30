@@ -19,6 +19,10 @@ pub enum Command {
     RequestReview {
         user: String,
     },
+    /// cc users (notify)
+    Cc {
+        users: Vec<String>,
+    },
 }
 
 /// One parsed command plus where it appeared (for ordered execution).
@@ -117,6 +121,14 @@ fn parse_verb(bot_name: &str, rest: &str) -> Option<Command> {
     match word {
         "ping" => Some(Command::Ping),
         "help" | "commands" => Some(Command::Help),
+        "cc" => {
+            let users = parse_users(args);
+            if users.is_empty() {
+                None
+            } else {
+                Some(Command::Cc { users })
+            }
+        }
         _ => {
             // `r? @user` also valid right after mention: `@xero r? @user`
             if word == "r?" {

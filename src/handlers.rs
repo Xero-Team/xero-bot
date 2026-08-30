@@ -53,6 +53,17 @@ async fn handle_one(gh: &Client, cfg: &Config, ctx: &CommentContext, cmd: Comman
             .is_ok()
             .then_some("ok".into())
             .unwrap_or_else(|| "error".into()),
+        Command::Cc { users } => {
+            let mentions: Vec<String> = users.iter().map(|u| format!("@{u}")).collect();
+            let _ = gh
+                .post_issue_comment(
+                    &ctx.repo,
+                    ctx.pr_number,
+                    &format!("cc {} (via @{})", mentions.join(" "), ctx.commenter),
+                )
+                .await;
+            "ok".into()
+        }
         Command::RequestReview { user } => {
             // triagebot: assignment is the review request
             match gh
