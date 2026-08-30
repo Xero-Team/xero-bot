@@ -100,10 +100,13 @@ fn bool_cfg(key: &str, default: bool) -> bool {
 
 fn read_key_pem() -> Option<String> {
     if let Ok(b64) = env::var("PRIVATE_KEY_B64") {
-        use base64::Engine;
-        if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64.trim()) {
-            if let Ok(pem) = String::from_utf8(bytes) {
-                return Some(pem);
+        let b64 = b64.trim();
+        if !b64.is_empty() {
+            use base64::Engine;
+            if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64) {
+                if let Ok(pem) = String::from_utf8(bytes) {
+                    return Some(pem);
+                }
             }
         }
     }
