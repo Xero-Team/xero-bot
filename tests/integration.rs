@@ -295,3 +295,99 @@ async fn test_r_plus_approves_with_write() {
     .await;
     assert_eq!(results, vec!["ok"]);
 }
+
+#[tokio::test]
+async fn test_rebase_check_flags_conflict() {
+    let server = MockServer::start().await;
+
+    // PR is conflicted
+    Mock::given(method("GET"))
+        .and(path("/repos/octocat/hello/pulls/7"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "state": "open",
+            "mergeable": false,
+            "base": {"ref": "main"}
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/octocat/hello/issues/7/labels"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/repos/octocat/hello/issues/7/labels"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/repos/octocat/hello/issues/7/comments"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({"id": 1})))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let crab = octocrab::OctocrabBuilder::new()
+        .personal_token("ghp_test")
+        .base_uri(server.uri())
+        .unwrap()
+        .build()
+        .unwrap();
+    let gh = Client {
+        crab,
+        app_slug: "xero-review".into(),
+    };
+    let cfg = test_cfg();
+    let status = xero_bot::rebase::check_pr(&gh, &cfg, "octocat/hello", 7).await;
+    assert_eq!(status, "flagged");
+}
+
+#[tokio::test]
+async fn test_codeql_report_posts_findings() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/repos/octocat/hello/code-scanning/alerts"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!([
+                {
+                    "rule": {"id": "rs/sql-injection", "severity": "error", "description": "Uncontrolled data used in path expression"},
+                    "most_recent_instance": {"location": {"path": "src/main.rs", "start_line": 10}},
+                    "html_url": "https://github.com/octocat/hello/security/code-scanning/1"
+                }
+            ])),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/octocat/hello/pulls/7/files"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!([{"filename": "src/main.rs", "status": "modified"}])),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/repos/octocat/hello/issues/7/comments"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({"id": 1})))
+        .expect(2) // processing + report
+        .mount(&server)
+        .await;
+
+    let crab = octocrab::OctocrabBuilder::new()
+        .personal_token("ghp_test")
+        .base_uri(server.uri())
+        .unwrap()
+        .build()
+        .unwrap();
+    let gh = Client {
+        crab,
+        app_slug: "xero-review".into(),
+    };
+    let cfg = test_cfg();
+    let status = xero_bot::codeql::run_codeql_report(&gh, &cfg, "octocat/hello", 7).await;
+    assert_eq!(status, "ok");
+}
