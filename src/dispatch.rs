@@ -55,8 +55,8 @@ pub fn route_event(cfg: &Config, event_header: &str, payload: &Value) -> Routing
             let parsed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 parse_commands(&cfg.bot_name, &comment_body)
             }));
-            let commands = match parsed {
-                Ok(c) => c,
+            let parsed = match parsed {
+                Ok(p) => p,
                 Err(_) => {
                     tracing::error!(
                         "command parser panicked on {repo}#{pr_number} ({} bytes); ignoring",
@@ -65,7 +65,7 @@ pub fn route_event(cfg: &Config, event_header: &str, payload: &Value) -> Routing
                     return Routing::Respond(serde_json::json!({"ignored": "parse error"}));
                 }
             };
-            if commands.is_empty() {
+            if parsed.is_empty() {
                 return Routing::Respond(serde_json::json!({"ignored": "no command"}));
             }
             if !is_pr {
@@ -80,7 +80,7 @@ pub fn route_event(cfg: &Config, event_header: &str, payload: &Value) -> Routing
                 installation_id,
                 commenter,
                 pr_author,
-                commands: commands.into_iter().map(|c| c.command).collect(),
+                commands: parsed.commands,
             })
         }
         WebhookEvent::PullRequest {

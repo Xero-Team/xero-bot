@@ -405,7 +405,9 @@ fn test_parse_and_route_end_to_end() {
         ("r? @octocat", "review-request"),
         ("?r", "ready"),
         ("?r cc @alice", "ready+cc"),
+        ("?r @alice", "ready+review-request"),
         ("@xero-review label +bug", "label"),
+        ("@xero-review label +bug -wip; claim; ready", "chained"),
         ("@xero-review claim", "claim"),
         ("@xero-review r+", "approve"),
         ("@xero-review r-", "reject"),
@@ -415,8 +417,13 @@ fn test_parse_and_route_end_to_end() {
         match route_event(&cfg, "issue_comment", &payload) {
             Routing::Act(Work::Comment { commands, .. }) => {
                 let parsed = parse_commands("xero-review", body);
-                assert_eq!(commands.len(), parsed.len(), "for body: {body}");
+                assert_eq!(commands.len(), parsed.commands.len(), "for body: {body}");
                 assert!(!commands.is_empty(), "for body: {body}");
+                assert!(
+                    parsed.diagnostics.is_empty(),
+                    "valid command must not warn: {body} -> {:?}",
+                    parsed.diagnostics
+                );
             }
             other => panic!("expected Act(Comment) for {body}, got {other:?}"),
         }
