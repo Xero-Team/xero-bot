@@ -1,0 +1,50 @@
+name: CI
+
+# The same three commands that gate a local commit. Nothing here needs an AI
+# key, a GitHub App key or a webhook secret: every test that talks to an HTTP
+# endpoint stands up its own wiremock server, and the git tests build their
+# repositories in a temp dir and skip themselves if `git` is missing.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A second push to the same branch makes the first run's verdict irrelevant.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: "fmt, clippy, test"
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      # Keyed on the dependency set, so an unchanged Cargo.toml reuses the
+      # previous run's build instead of compiling tokio, reqwest and octocrab
+      # from scratch every time.
+      - uses: Swatinem/rust-cache@v2
+
+      # First, because it needs no compilation: a formatting failure should not
+      # cost the several minutes a cold build takes.
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+
+      # `--all-targets` so the tests, the examples and all four binaries are
+      # linted, not just the library. `-D warnings` covers plain rustc warnings
+      # (dead code, unused imports) as well as clippy's own lints.
+      - name: cargo clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test --all-targets
