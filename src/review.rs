@@ -183,29 +183,120 @@ pub fn truncate(text: &str, max_bytes: usize) -> (String, bool) {
 // AI call — three formats
 // ---------------------------------------------------------------------------
 
+/// Which wire protocol `API_FORMAT` names.
+///
+/// A parsed value rather than a lowercased string, because two engines have to
+/// agree about it. The agent loop used to skip this decision entirely and
+/// hardcode `/chat/completions`, so an operator whose relay only speaks
+/// `/responses` got a working builtin review and an agent engine that failed
+/// every request — with `API_FORMAT=responses` sitting right there in the
+/// config, apparently honored. Now every branch on the protocol branches on
+/// this enum, and a fourth protocol is a compile error at each of them until
+/// it's handled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Proto {
+    Chat,
+    Responses,
+    Anthropic,
+}
+
+impl Proto {
+    /// Parse `API_FORMAT` — case- and whitespace-insensitive, since it comes
+    /// from a hand-edited `.env`.
+    pub fn parse(raw: &str) -> Result<Proto, String> {
+        match raw.trim().to_lowercase().as_str() {
+            "chat" => Ok(Proto::Chat),
+            "responses" => Ok(Proto::Responses),
+            "anthropic" => Ok(Proto::Anthropic),
+            other => Err(format!(
+                "unknown API_FORMAT {other:?} (expected chat, responses or anthropic)"
+            )),
+        }
+    }
+
+    /// The name it goes by in `.env` and in messages to the operator.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Proto::Chat => "chat",
+            Proto::Responses => "responses",
+            Proto::Anthropic => "anthropic",
+        }
+    }
+
+    /// The path appended to `AI_BASE_URL`.
+    pub fn path(self) -> &'static str {
+        match self {
+            Proto::Chat => "/chat/completions",
+            Proto::Responses => "/responses",
+            // Anthropic's base URL carries no version segment, so the version
+            // lives in the path here.
+            Proto::Anthropic => "/v1/messages",
+        }
+    }
+}
+
+/// Build a header value out of operator-supplied text.
+///
+/// `.parse().unwrap()` looks harmless until you ask where the key comes from: a
+/// `.env` line someone pasted. A stray newline or non-ASCII byte in
+/// `AI_API_KEY` panicked the task that built the request — and a panic inside
+/// `tokio::spawn` only kills that task, so the review simply never happened and
+/// nothing said why.
+fn header_value(what: &str, raw: &str) -> Result<reqwest::header::HeaderValue, String> {
+    raw.parse().map_err(|_| {
+        format!(
+            "{what} cannot go in an HTTP header — check it for line breaks or non-ASCII characters"
+        )
+    })
+}
+
+/// The URL and headers for one protocol, shared by both AI engines so they
+/// can't disagree about where the AI lives or how to authenticate to it.
+pub(crate) fn ai_endpoint(
+    cfg: &Config,
+    proto: Proto,
+) -> Result<(String, reqwest::header::HeaderMap), String> {
+    let url = format!("{}{}", cfg.ai_base_url.trim_end_matches('/'), proto.path());
+    let mut headers = reqwest::header::HeaderMap::new();
+    match proto {
+        Proto::Chat | Proto::Responses => {
+            headers.insert(
+                reqwest::header::AUTHORIZATION,
+                header_value("AI_API_KEY", &format!("Bearer {}", cfg.ai_api_key))?,
+            );
+        }
+        Proto::Anthropic => {
+            headers.insert(
+                reqwest::header::HeaderName::from_static("x-api-key"),
+                header_value("AI_API_KEY", &cfg.ai_api_key)?,
+            );
+            headers.insert(
+                reqwest::header::HeaderName::from_static("anthropic-version"),
+                reqwest::header::HeaderValue::from_static("2023-06-01"),
+            );
+        }
+    }
+    headers.insert(
+        reqwest::header::CONTENT_TYPE,
+        reqwest::header::HeaderValue::from_static("application/json"),
+    );
+    Ok((url, headers))
+}
+
 pub async fn call_ai(
     cfg: &Config,
     system_prompt: &str,
     user_prompt: &str,
 ) -> Result<String, String> {
-    let base = cfg.ai_base_url.trim_end_matches('/');
-    let fmt = cfg.api_format.to_lowercase();
+    let proto = Proto::parse(&cfg.api_format)?;
+    let (url, headers) = ai_endpoint(cfg, proto)?;
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(300))
         .build()
         .map_err(|e| e.to_string())?;
 
-    let url;
-    let mut headers = reqwest::header::HeaderMap::new();
-    let body: Value;
-
-    if fmt == "chat" {
-        url = format!("{base}/chat/completions");
-        headers.insert(
-            reqwest::header::AUTHORIZATION,
-            format!("Bearer {}", cfg.ai_api_key).parse().unwrap(),
-        );
-        body = json!({
+    let body = match proto {
+        Proto::Chat => json!({
             "model": cfg.ai_model,
             "messages": [
                 {"role": "system", "content": system_prompt},
@@ -213,43 +304,20 @@ pub async fn call_ai(
             ],
             "temperature": 0.2,
             "response_format": {"type": "json_object"},
-        });
-    } else if fmt == "responses" {
-        url = format!("{base}/responses");
-        headers.insert(
-            reqwest::header::AUTHORIZATION,
-            format!("Bearer {}", cfg.ai_api_key).parse().unwrap(),
-        );
-        body = json!({
+        }),
+        Proto::Responses => json!({
             "model": cfg.ai_model,
             "input": user_prompt,
             "instructions": system_prompt,
             "text": {"format": {"type": "json_object"}},
-        });
-    } else if fmt == "anthropic" {
-        url = format!("{base}/v1/messages");
-        headers.insert(
-            reqwest::header::HeaderName::from_static("x-api-key"),
-            cfg.ai_api_key.parse().unwrap(),
-        );
-        headers.insert(
-            reqwest::header::HeaderName::from_static("anthropic-version"),
-            "2023-06-01".parse().unwrap(),
-        );
-        body = json!({
+        }),
+        Proto::Anthropic => json!({
             "model": cfg.ai_model,
             "max_tokens": 4096,
             "system": system_prompt,
             "messages": [{"role": "user", "content": user_prompt}],
-        });
-    } else {
-        return Err(format!("unknown api_format: {}", cfg.api_format));
-    }
-
-    headers.insert(
-        reqwest::header::CONTENT_TYPE,
-        "application/json".parse().unwrap(),
-    );
+        }),
+    };
 
     let resp = client
         .post(&url)
@@ -273,17 +341,17 @@ pub async fn call_ai(
     let out: Value =
         serde_json::from_str(&text).map_err(|e| format!("AI response not JSON: {e}"))?;
 
-    extract_ai_text(&fmt, &out)
+    extract_ai_text(proto, &out)
 }
 
-fn extract_ai_text(fmt: &str, out: &Value) -> Result<String, String> {
-    match fmt {
-        "chat" => out
+fn extract_ai_text(proto: Proto, out: &Value) -> Result<String, String> {
+    match proto {
+        Proto::Chat => out
             .pointer("/choices/0/message/content")
             .and_then(|c| c.as_str())
             .map(String::from)
             .ok_or_else(|| format!("chat API: no content in {out}")),
-        "responses" => {
+        Proto::Responses => {
             if let Some(t) = out.get("output_text").and_then(|t| t.as_str()) {
                 return Ok(t.to_string());
             }
@@ -305,7 +373,7 @@ fn extract_ai_text(fmt: &str, out: &Value) -> Result<String, String> {
             }
             Err(format!("responses API: no text in {out}"))
         }
-        "anthropic" => {
+        Proto::Anthropic => {
             if let Some(content) = out.get("content").and_then(|c| c.as_array()) {
                 for block in content {
                     if block.get("type").and_then(|t| t.as_str()) == Some("text") {
@@ -319,7 +387,6 @@ fn extract_ai_text(fmt: &str, out: &Value) -> Result<String, String> {
             }
             Err(format!("anthropic API: no text in {out}"))
         }
-        _ => Err("unknown format".into()),
     }
 }
 
@@ -1061,5 +1128,55 @@ diff --git a/gone.rs b/gone.rs
             "{}",
             system_prompt(Lang::En)
         );
+    }
+
+    #[test]
+    fn api_format_names_a_protocol_or_says_so() {
+        assert_eq!(Proto::parse("chat"), Ok(Proto::Chat));
+        assert_eq!(Proto::parse("responses"), Ok(Proto::Responses));
+        assert_eq!(Proto::parse("anthropic"), Ok(Proto::Anthropic));
+        // it comes from a hand-edited .env
+        assert_eq!(Proto::parse("  Chat \n"), Ok(Proto::Chat));
+        let err = Proto::parse("gpt").unwrap_err();
+        assert!(err.contains("gpt") && err.contains("responses"), "{err}");
+    }
+
+    fn cfg_for(base: &str, key: &str) -> Config {
+        let mut c = Config::from_env();
+        c.ai_base_url = base.into();
+        c.ai_api_key = key.into();
+        c
+    }
+
+    #[test]
+    fn each_protocol_has_its_own_endpoint_and_auth_header() {
+        let cfg = cfg_for("https://relay.example/v1/", "k-secret-value");
+
+        let (url, headers) = ai_endpoint(&cfg, Proto::Chat).unwrap();
+        assert_eq!(url, "https://relay.example/v1/chat/completions");
+        assert_eq!(headers["authorization"], "Bearer k-secret-value");
+
+        let (url, headers) = ai_endpoint(&cfg, Proto::Responses).unwrap();
+        assert_eq!(url, "https://relay.example/v1/responses");
+        assert_eq!(headers["authorization"], "Bearer k-secret-value");
+
+        // Anthropic authenticates with its own header, not a bearer token.
+        let (url, headers) = ai_endpoint(&cfg, Proto::Anthropic).unwrap();
+        assert_eq!(url, "https://relay.example/v1/v1/messages");
+        assert_eq!(headers["x-api-key"], "k-secret-value");
+        assert_eq!(headers["anthropic-version"], "2023-06-01");
+        assert!(!headers.contains_key("authorization"));
+    }
+
+    /// A pasted key with a newline in it used to panic the task building the
+    /// request, and inside `tokio::spawn` that means the review vanishes
+    /// without a word in the log.
+    #[test]
+    fn an_unusable_key_is_an_error_not_a_panic() {
+        let cfg = cfg_for("https://relay.example/v1", "sk-abc\ndef");
+        for proto in [Proto::Chat, Proto::Responses, Proto::Anthropic] {
+            let err = ai_endpoint(&cfg, proto).unwrap_err();
+            assert!(err.contains("AI_API_KEY"), "{proto:?}: {err}");
+        }
     }
 }
