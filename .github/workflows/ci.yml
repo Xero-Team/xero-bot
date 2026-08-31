@@ -43,8 +43,12 @@ jobs:
       # `--all-targets` so the tests, the examples and all four binaries are
       # linted, not just the library. `-D warnings` covers plain rustc warnings
       # (dead code, unused imports) as well as clippy's own lints.
+      # `--locked` here and below: Cargo.lock is tracked, so a run that goes red
+      # is the diff and not an upstream release that happened to land today. It
+      # also fails loudly, instead of quietly re-resolving, if someone edits
+      # Cargo.toml without regenerating the lock.
       - name: cargo clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
 
       - name: cargo test
-        run: cargo test --all-targets
+        run: cargo test --locked --all-targets

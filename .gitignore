@@ -5,7 +5,12 @@
 
 # Rust
 /target/
-Cargo.lock
+# Cargo.lock is tracked on purpose. This crate is not a library — it ships four
+# binaries — so the exact resolved versions are part of what gets deployed, and
+# CI, Docker and Vercel should all build the set that was actually tested.
+# The vendored crate carries a lock file of its own; it plays no part in this
+# build, since the root lock resolves the whole graph including the patch.
+vendor/*/Cargo.lock
 
 # Data dir (self-hosted repos cache / pi sessions)
 /data/
