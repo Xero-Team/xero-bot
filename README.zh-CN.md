@@ -206,7 +206,7 @@ curl http://localhost:8080/health        # {"status":"ok",...}
 ## 本地开发
 
 ```bash
-cargo test                    # 45 单元 + 7 集成(wiremock mock GitHub API)
+cargo test                    # 149 单元 + 65 集成(wiremock mock GitHub API)
 cargo run                     # 自托管模式跑在 :8080
 cargo run --example send_webhook -- issue-comment "@xero-review ping"
 cargo run --example send_webhook -- issue-comment "r? @octocat"

@@ -213,7 +213,7 @@ All environment variables are documented in [.env.example](.env.example). Highli
 ## Local development
 
 ```bash
-cargo test                    # 45 unit + 7 integration tests (wiremock mocks the GitHub API)
+cargo test                    # 149 unit + 65 integration tests (wiremock mocks the GitHub API)
 cargo run                     # self-hosted mode on :8080
 cargo run --example send_webhook -- issue-comment "@xero-review ping"
 cargo run --example send_webhook -- issue-comment "r? @octocat"
