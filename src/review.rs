@@ -283,19 +283,13 @@ pub(crate) fn ai_endpoint(
     Ok((url, headers))
 }
 
-pub async fn call_ai(
-    cfg: &Config,
-    system_prompt: &str,
-    user_prompt: &str,
-) -> Result<String, String> {
-    let proto = Proto::parse(&cfg.api_format)?;
-    let (url, headers) = ai_endpoint(cfg, proto)?;
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(300))
-        .build()
-        .map_err(|e| e.to_string())?;
-
-    let body = match proto {
+/// The request body for one protocol.
+///
+/// Shared by [`call_ai`] and [`preflight`] so the two can't drift: a startup
+/// check that asked for a different response format than the real call does
+/// would report a health it hasn't actually tested.
+fn ai_body(cfg: &Config, proto: Proto, system_prompt: &str, user_prompt: &str) -> Value {
+    match proto {
         Proto::Chat => json!({
             "model": cfg.ai_model,
             "messages": [
@@ -317,7 +311,21 @@ pub async fn call_ai(
             "system": system_prompt,
             "messages": [{"role": "user", "content": user_prompt}],
         }),
-    };
+    }
+}
+
+pub async fn call_ai(
+    cfg: &Config,
+    system_prompt: &str,
+    user_prompt: &str,
+) -> Result<String, String> {
+    let proto = Proto::parse(&cfg.api_format)?;
+    let (url, headers) = ai_endpoint(cfg, proto)?;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(300))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let body = ai_body(cfg, proto, system_prompt, user_prompt);
 
     let resp = client
         .post(&url)
@@ -395,6 +403,142 @@ fn extract_ai_text(proto: Proto, out: &Value) -> Result<String, String> {
             Err(format!("anthropic API: no text in {out}"))
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Startup self-check
+// ---------------------------------------------------------------------------
+
+/// The result of one throwaway request to the configured AI endpoint.
+pub struct Probe {
+    /// What was tested, in operator terms.
+    pub what: String,
+    /// The full URL. This is log-only output, so it isn't redacted — the log
+    /// belongs to the operator, and the endpoint is the thing they need to see.
+    pub url: String,
+    /// `Ok(detail)` if a review would get through; `Err(detail)` otherwise.
+    pub verdict: Result<String, String>,
+}
+
+/// Both prompts name JSON on purpose.
+///
+/// Every format's request asks for a `json_object`, and OpenAI-compatible
+/// providers reject that with HTTP 400 unless the *input messages* ask for JSON
+/// — a system prompt doesn't count under `API_FORMAT=responses`, where it
+/// travels as `instructions` instead. A real review satisfies the rule through
+/// [`build_user_prompt`]'s closing line; a probe that didn't would report 400 on
+/// a perfectly healthy configuration, which is worse than not probing at all.
+const PREFLIGHT_SYSTEM: &str = "Reply with the JSON object {\"ok\":true} and nothing else.";
+const PREFLIGHT_USER: &str = "Health check. Reply with the JSON object {\"ok\":true}.";
+
+/// Boot must not hang on an unresponsive provider, so this is far shorter than
+/// the 300s a real review allows.
+const PREFLIGHT_TIMEOUT_SECS: u64 = 20;
+
+/// Send one throwaway request to the endpoint the AI engines will use.
+///
+/// Without this, a wrong key or a mismatched `API_FORMAT` stays invisible until
+/// someone asks for a review — and then surfaces as a failed review on a real
+/// PR, which is both slower to notice and public. The answer is discarded; what
+/// is being tested is reachability, authentication, and that the reply has the
+/// shape `API_FORMAT` claims. Tool-calling support isn't probed, so a provider
+/// that serves plain completions but refuses `tools` still fails on first use —
+/// the agent engine falls back to builtin there, which is why that is worth
+/// less than a boot-time round trip costs.
+///
+/// `None` when no AI is configured: the r+/label/rebase commands don't need
+/// one, so a bot running without AI is a valid deployment, not a failure.
+pub async fn preflight(cfg: &Config) -> Option<Probe> {
+    if !cfg.ai_ready() {
+        return None;
+    }
+    let what = format!("API_FORMAT={}", cfg.api_format.trim());
+    let proto = match Proto::parse(&cfg.api_format) {
+        Ok(p) => p,
+        Err(e) => {
+            return Some(Probe {
+                what,
+                url: String::new(),
+                verdict: Err(e),
+            })
+        }
+    };
+    let (url, verdict) = probe_endpoint(cfg, proto).await;
+    Some(Probe { what, url, verdict })
+}
+
+async fn probe_endpoint(cfg: &Config, proto: Proto) -> (String, Result<String, String>) {
+    let (url, headers) = match ai_endpoint(cfg, proto) {
+        Ok(pair) => pair,
+        Err(e) => return (String::new(), Err(e)),
+    };
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(PREFLIGHT_TIMEOUT_SECS))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => return (url, Err(format!("cannot build an HTTP client: {e}"))),
+    };
+
+    let body = ai_body(cfg, proto, PREFLIGHT_SYSTEM, PREFLIGHT_USER);
+    let resp = match client.post(&url).headers(headers).json(&body).send().await {
+        Ok(r) => r,
+        Err(e) if e.is_timeout() => {
+            return (
+                url,
+                Err(format!("no response within {PREFLIGHT_TIMEOUT_SECS}s")),
+            )
+        }
+        Err(e) => return (url, Err(format!("unreachable: {}", e.without_url()))),
+    };
+
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    let snippet: String = text.chars().take(200).collect();
+
+    if !status.is_success() {
+        return (url, Err(diagnose(cfg, status, &snippet)));
+    }
+    // 200 with the wrong body shape means `API_FORMAT` names a protocol this
+    // provider doesn't speak here — a review would reach the model and then
+    // fail to read the answer, which looks nothing like a config mistake.
+    match serde_json::from_str::<Value>(&text)
+        .map_err(|e| format!("reply was not JSON: {e}"))
+        .and_then(|v| extract_ai_text(proto, &v))
+    {
+        Ok(_) => (url, Ok(format!("ok ({status})"))),
+        Err(e) => (
+            url,
+            Err(format!(
+                "authenticated, but the reply doesn't match the '{}' response shape \
+                 — check API_FORMAT against what this provider serves ({e})",
+                proto.as_str()
+            )),
+        ),
+    }
+}
+
+/// Turn a failing status into the configuration mistake it usually means.
+fn diagnose(cfg: &Config, status: reqwest::StatusCode, snippet: &str) -> String {
+    let hint = match status.as_u16() {
+        401 | 403 => {
+            "the provider rejected AI_API_KEY — verify the key itself, that it is enabled \
+             for AI_MODEL, and that it belongs to this AI_BASE_URL"
+        }
+        404 => {
+            "no such endpoint — AI_BASE_URL and API_FORMAT disagree with this provider \
+             (note that API_FORMAT=anthropic appends /v1/messages, so a base URL already \
+             ending in /v1 posts to /v1/v1/messages)"
+        }
+        429 => "rate-limited or out of quota",
+        400 | 422 => "the endpoint answered but rejected the request — AI_MODEL is the usual cause",
+        500..=599 => "the provider is failing on its side",
+        _ => "unexpected status",
+    };
+    format!(
+        "HTTP {status}: {hint}. Model: {}. Body: {snippet}",
+        cfg.ai_model
+    )
 }
 
 // ---------------------------------------------------------------------------

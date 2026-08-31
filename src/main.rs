@@ -56,6 +56,26 @@ async fn main() {
         );
     }
 
+    // One throwaway AI request before serving. A bad key or a mismatched
+    // API_FORMAT otherwise stays hidden until the first `@bot review`, where it
+    // surfaces as a failed review on someone's PR. A failure here is a warning,
+    // not an exit: the non-AI commands (r+, labels, rebase checks) still work,
+    // and refusing to boot would take those down over an unrelated outage.
+    match xero_bot::review::preflight(&cfg).await {
+        Some(probe) => match probe.verdict {
+            Ok(detail) => tracing::info!("AI check — {}: {detail} [{}]", probe.what, probe.url),
+            Err(detail) => tracing::warn!(
+                "AI check FAILED — {}: {detail} [{}] — reviews will fail until this is fixed",
+                probe.what,
+                probe.url
+            ),
+        },
+        None => tracing::info!(
+            "AI check skipped: AI_BASE_URL / AI_API_KEY / AI_MODEL are not all set \
+             (non-AI commands still work)"
+        ),
+    }
+
     // rebase sweep loop
     if cfg.rebase_sweep_enabled {
         let sweep_cfg = cfg.clone();
