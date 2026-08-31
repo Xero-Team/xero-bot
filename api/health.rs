@@ -11,7 +11,7 @@ async fn main() -> Result<(), Error> {
 }
 
 async fn handler(_req: Request, _state: AppState) -> Result<Response<ResponseBody>, Error> {
-    let _ = load_dotenv(".env");
+    load_dotenv(".env");
     let cfg = Config::from_env();
     let ready = cfg.validate().is_ok();
     Ok(Response::builder()

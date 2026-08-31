@@ -25,7 +25,7 @@ async fn main() -> Result<(), Error> {
 }
 
 async fn handler(req: Request, state: AppState) -> Result<Response<ResponseBody>, Error> {
-    let _ = load_dotenv(".env");
+    load_dotenv(".env");
     let cfg = Config::from_env();
 
     // The self-hosted server exits at startup on a bad config; a serverless

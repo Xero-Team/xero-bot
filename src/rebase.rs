@@ -133,7 +133,11 @@ pub async fn check_pr(gh: &Client, cfg: &Config, repo: &str, pr_number: i64) -> 
     match decide(mergeable, has_label) {
         RebaseDecision::Flag => {
             if let Err(e) = gh
-                .add_labels(repo, pr_number, &[cfg.label_needs_rebase.clone()])
+                .add_labels(
+                    repo,
+                    pr_number,
+                    std::slice::from_ref(&cfg.label_needs_rebase),
+                )
                 .await
             {
                 return CheckOutcome::Error(format!("add-label-error: {e}"));

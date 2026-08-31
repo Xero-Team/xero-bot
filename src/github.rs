@@ -374,7 +374,7 @@ impl Client {
             .map_err(|e| GhError::BadShape(e.to_string()))?
             .to_bytes();
         let text = String::from_utf8_lossy(&body).into_owned();
-        if status >= 200 && status < 300 {
+        if (200..300).contains(&status) {
             Ok(text)
         } else {
             Err(GhError::Api {
@@ -423,7 +423,7 @@ impl Client {
             .json()
             .await
             .map_err(|e| GhError::BadShape(e.to_string()))?;
-        if status < 200 || status >= 300 {
+        if !(200..300).contains(&status) {
             return Err(GhError::Api {
                 status,
                 message: v.to_string(),

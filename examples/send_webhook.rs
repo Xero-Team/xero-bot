@@ -34,7 +34,6 @@ fn main() {
     let comment_body = rest.get(1).map(|s| s.as_str()).unwrap_or("");
 
     let secret = std::env::var("WEBHOOK_SECRET").unwrap_or_else(|_| "dev-secret".into());
-    let bot_name = std::env::var("BOT_NAME").unwrap_or_else(|_| "xero-review".into());
 
     let (event_header, payload) = match event.as_str() {
         "issue-comment" => (

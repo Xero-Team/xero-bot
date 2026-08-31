@@ -23,7 +23,7 @@ async fn main() -> Result<(), Error> {
 }
 
 async fn handler(req: Request, _state: AppState) -> Result<Response<ResponseBody>, Error> {
-    let _ = load_dotenv(".env");
+    load_dotenv(".env");
     let cfg = Config::from_env();
 
     if let Err(e) = cfg.validate() {

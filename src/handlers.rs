@@ -427,7 +427,7 @@ async fn unclaim(gh: &Client, ctx: &CommentContext) -> String {
     }
 
     let (msg, status) = match gh
-        .remove_assignees(&ctx.repo, ctx.pr_number, &[who.clone()])
+        .remove_assignees(&ctx.repo, ctx.pr_number, std::slice::from_ref(who))
         .await
     {
         Ok(after) if !contains_login(&after, who) => (
@@ -588,7 +588,7 @@ async fn set_status_label(gh: &Client, cfg: &Config, ctx: &CommentContext, cmd: 
 
     let mut ok = true;
     if let Err(e) = gh
-        .add_labels(&ctx.repo, ctx.pr_number, &[add.clone()])
+        .add_labels(&ctx.repo, ctx.pr_number, std::slice::from_ref(add))
         .await
     {
         tracing::warn!("add label {add} on {}#{}: {e}", ctx.repo, ctx.pr_number);

@@ -576,10 +576,10 @@ async fn execute_tool(gh: &Client, repo: &str, base_ref: &str, name: &str, args:
                 Ok(entries) => {
                     let lines: Vec<String> = entries
                         .iter()
-                        .filter_map(|e| {
+                        .map(|e| {
                             let ename = e.get("name").and_then(|n| n.as_str()).unwrap_or("?");
                             let etype = e.get("type").and_then(|t| t.as_str()).unwrap_or("?");
-                            Some(format!("{etype}\t{ename}"))
+                            format!("{etype}\t{ename}")
                         })
                         .collect();
                     if lines.is_empty() {
@@ -619,10 +619,7 @@ async fn execute_tool(gh: &Client, repo: &str, base_ref: &str, name: &str, args:
                     } else {
                         items
                             .iter()
-                            .filter_map(|i| {
-                                let p = i.get("path").and_then(|p| p.as_str()).unwrap_or("?");
-                                Some(p.to_string())
-                            })
+                            .map(|i| i.get("path").and_then(|p| p.as_str()).unwrap_or("?"))
                             .collect::<Vec<_>>()
                             .join("\n")
                     }
