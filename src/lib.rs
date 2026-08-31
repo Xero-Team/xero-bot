@@ -8,5 +8,6 @@ pub mod github;
 pub mod handlers;
 pub mod lang;
 pub mod rebase;
+pub mod redact;
 pub mod review;
 pub mod webhook;

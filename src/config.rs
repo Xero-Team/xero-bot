@@ -164,6 +164,16 @@ fn read_key_pem() -> Option<String> {
 
 impl Config {
     pub fn from_env() -> Config {
+        let cfg = Config::read_env();
+        // Registered here rather than at each call site: every entry point —
+        // the server, each Vercel function, the cron sweep — builds its config
+        // through this one function, so this is the only place that cannot be
+        // forgotten when a new one is added.
+        crate::redact::register(&cfg);
+        cfg
+    }
+
+    fn read_env() -> Config {
         Config {
             app_id: cfg("APP_ID", ""),
             private_key_pem: read_key_pem(),

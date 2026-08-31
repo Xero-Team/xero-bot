@@ -325,17 +325,24 @@ pub async fn call_ai(
         .json(&body)
         .send()
         .await
-        .map_err(|e| format!("AI request failed to {url}: {e}"))?;
+        .map_err(|e| {
+            // The URL goes to the log, which is ours; the returned string can
+            // end up in a PR comment, so it names the protocol instead.
+            // `without_url` is why: reqwest's Display includes the full URL.
+            tracing::error!("AI request to {url} failed: {e}");
+            format!("AI request failed: {}", e.without_url())
+        })?;
     let status = resp.status();
     let text = resp
         .text()
         .await
-        .map_err(|e| format!("AI read failed: {e}"))?;
+        .map_err(|e| format!("AI read failed: {}", e.without_url()))?;
     if !status.is_success() {
+        let snippet = text.chars().take(400).collect::<String>();
+        tracing::error!("AI request to {url} failed ({status}): {snippet}");
         return Err(format!(
-            "AI request failed ({}) to {url}: {}",
-            status,
-            &text.chars().take(400).collect::<String>()
+            "AI request failed ({status}) at the {} endpoint: {snippet}",
+            proto.as_str()
         ));
     }
     let out: Value =

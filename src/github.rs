@@ -445,6 +445,10 @@ impl Client {
         issue: i64,
         body: &str,
     ) -> Result<(), GhError> {
+        // Everything the bot says in public passes through here or through
+        // `post_review`, so this is where secrets get taken out — see
+        // [`crate::redact`] for why the guard sits at the boundary.
+        let body = crate::redact::scrub(body);
         self.post(
             &format!("/repos/{repo}/issues/{issue}/comments"),
             Some(json!({"body": body})),
@@ -757,7 +761,19 @@ impl Client {
         inline: Vec<Value>,
     ) -> Result<ReviewPostMode, GhError> {
         let route = format!("/repos/{repo}/pulls/{number}/reviews");
-        let body = format!("{body}\n\n{REVIEW_MARKER}");
+        // The summary *and* every inline comment: both carry model text, and an
+        // error report can reach either one.
+        let body = crate::redact::scrub(&format!("{body}\n\n{REVIEW_MARKER}"));
+        let inline: Vec<Value> = inline
+            .into_iter()
+            .map(|mut c| {
+                if let Some(b) = c.get("body").and_then(|b| b.as_str()) {
+                    let scrubbed = crate::redact::scrub(b);
+                    c["body"] = json!(scrubbed);
+                }
+                c
+            })
+            .collect();
         match self
             .post(
                 &route,

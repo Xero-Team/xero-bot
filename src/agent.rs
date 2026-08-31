@@ -492,14 +492,20 @@ Use the tools to learn the project's structure first, then review the diff below
             .json(&convo.body(cfg))
             .send()
             .await
-            .map_err(|e| format!("agent step failed: {e}"))?;
+            .map_err(|e| {
+                // Log the URL, don't return it: this string is quoted verbatim
+                // in the "falling back to the basic review" comment.
+                tracing::error!("agent step to {url} failed: {e}");
+                format!("agent step failed: {}", e.without_url())
+            })?;
         let status = resp.status();
-        let text = resp.text().await.map_err(|e| e.to_string())?;
+        let text = resp.text().await.map_err(|e| e.without_url().to_string())?;
         if !status.is_success() {
+            let snippet = text.chars().take(300).collect::<String>();
+            tracing::error!("agent step to {url} failed ({status}): {snippet}");
             return Err(format!(
-                "agent step HTTP {status} at the {} endpoint: {}",
-                proto.as_str(),
-                text.chars().take(300).collect::<String>()
+                "agent step HTTP {status} at the {} endpoint: {snippet}",
+                proto.as_str()
             ));
         }
         let out: Value =
