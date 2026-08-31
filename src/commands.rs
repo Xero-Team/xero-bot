@@ -35,6 +35,10 @@ pub mod parse;
 mod resolve;
 
 pub use diag::Diagnostic;
+/// Re-exported for callers that put a login into a URL path or credit it on an
+/// approval: the shape check belongs in one place, and the lexer's is the one
+/// the parser already trusts.
+pub use lex::is_valid_login;
 pub use parse::ParsedCommand;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -743,12 +747,16 @@ mod tests {
         // Both tables: the English one lists the same commands, so it is the
         // same trap in a different language.
         for lang in [crate::lang::Lang::En, crate::lang::Lang::Zh] {
-            let help = crate::handlers::help_text("bot", lang);
-            let out = parse_commands("bot", &help);
-            assert!(
-                out.commands.is_empty() && out.diagnostics.is_empty(),
-                "{lang:?} help text must be inert, got {out:?}"
-            );
+            // Both settings of the on-behalf gate: it rewrites a row of the
+            // table, and a row is exactly where a live command would hide.
+            for on_behalf in [false, true] {
+                let help = crate::handlers::help_text("bot", lang, on_behalf);
+                let out = parse_commands("bot", &help);
+                assert!(
+                    out.commands.is_empty() && out.diagnostics.is_empty(),
+                    "{lang:?} help text (on_behalf={on_behalf}) must be inert, got {out:?}"
+                );
+            }
         }
     }
 

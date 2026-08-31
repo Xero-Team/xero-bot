@@ -8,7 +8,7 @@
 
 use crate::commands::Command;
 use crate::config::Config;
-use crate::github::{Client, GhError};
+use crate::github::{normalize_login, Client, GhError};
 use crate::lang::Lang;
 use crate::t;
 
@@ -26,7 +26,10 @@ pub struct CommentContext {
     pub lang: Lang,
 }
 
-pub fn help_text(bot_name: &str, lang: Lang) -> String {
+/// `on_behalf` is `cfg.r_plus_allow_on_behalf`: the table promised
+/// `r+ as @user` unconditionally, and with the gate closed by default that is a
+/// command the help advertises and the bot then refuses.
+pub fn help_text(bot_name: &str, lang: Lang, on_behalf: bool) -> String {
     match lang {
         Lang::En => format!(
             "### xero-bot commands\n\n\
@@ -45,9 +48,14 @@ pub fn help_text(bot_name: &str, lang: Lang) -> String {
 | `@{bot_name} claim` | Claim (assign to yourself) |\n\
 | `@{bot_name} unclaim` | Release the assignment |\n\
 | `@{bot_name} r+` | Relay an approval (needs write; the bot APPROVEs in your name) |\n\
-| `@{bot_name} r+ as @user` | Relay an approval crediting @user |\n\
+| `@{bot_name} r+ as @user` | {on_behalf_help} |\n\
 | `@{bot_name} r-` | Withdraw the bot's approval |\n\n\
-_Conflicted PRs are labelled `needs-rebase` automatically, with a reminder._"
+_Conflicted PRs are labelled `needs-rebase` automatically, with a reminder._",
+            on_behalf_help = if on_behalf {
+                "Relay an approval crediting @user (they need write access too)"
+            } else {
+                "**Disabled in this deployment** — set `R_PLUS_ALLOW_ON_BEHALF=true` to enable"
+            }
         ),
         Lang::Zh => format!(
             "### xero-bot 命令参考\n\n\
@@ -66,9 +74,14 @@ _Conflicted PRs are labelled `needs-rebase` automatically, with a reminder._"
 | `@{bot_name} claim` | 认领(指派给自己) |\n\
 | `@{bot_name} unclaim` | 释放指派 |\n\
 | `@{bot_name} r+` | 代审批(需 write 权限;bot 以你的名义提交 APPROVE) |\n\
-| `@{bot_name} r+ as @user` | 以 @user 名义代审批(用于转发他处给出的批准) |\n\
+| `@{bot_name} r+ as @user` | {on_behalf_help} |\n\
 | `@{bot_name} r-` | 撤回 bot 的审批 |\n\n\
-_冲突的 PR 会被自动打上 `needs-rebase` 标签并提醒。_"
+_冲突的 PR 会被自动打上 `needs-rebase` 标签并提醒。_",
+            on_behalf_help = if on_behalf {
+                "以 @user 名义代审批(该用户同样需要 write 权限)"
+            } else {
+                "**本部署已禁用** —— 需设置 `R_PLUS_ALLOW_ON_BEHALF=true` 开启"
+            }
         ),
     }
 }
@@ -162,8 +175,12 @@ async fn handle_one(gh: &Client, cfg: &Config, ctx: &CommentContext, cmd: Comman
         ),
         Command::Help => labeled(
             "help reply",
-            gh.post_issue_comment(&ctx.repo, ctx.pr_number, &help_text(&cfg.bot_name, lang))
-                .await,
+            gh.post_issue_comment(
+                &ctx.repo,
+                ctx.pr_number,
+                &help_text(&cfg.bot_name, lang, cfg.r_plus_allow_on_behalf),
+            )
+            .await,
         ),
         Command::Review => {
             if !cfg.ai_ready() && cfg.review_engine == "builtin" {
@@ -613,14 +630,75 @@ async fn set_status_label(gh: &Client, cfg: &Config, ctx: &CommentContext, cmd: 
 }
 
 /// r+: permission-gated approval relay (bors-style).
+///
+/// The gates run cheapest-first, and that order is part of the guarantee: a
+/// request that is refused on configuration or on who asked never reaches the
+/// API at all, so a refusal cannot be turned into an information leak (whether
+/// a login exists, what permission it holds) or into rate-limit pressure.
 async fn handle_approve(
     gh: &Client,
-    _cfg: &Config,
+    cfg: &Config,
     ctx: &CommentContext,
     on_behalf_of: Option<String>,
 ) -> String {
     let lang = ctx.lang;
-    // 1. commenter must have write/maintain/admin
+
+    // 1. Crediting someone else is off unless the deployment turned it on.
+    //
+    // The review is posted by the App, so branch protection counts it as a
+    // genuine approval. Left open, any holder of write access could satisfy a
+    // required-review rule in a colleague's name without that colleague ever
+    // seeing the PR — the approval would carry their login and nothing would
+    // record that they hadn't given it. Plain `r+` is unaffected: it credits
+    // the commenter, who needs write access anyway.
+    if let Some(other) = &on_behalf_of {
+        if !cfg.r_plus_allow_on_behalf {
+            let _ = gh
+                .post_issue_comment(
+                    &ctx.repo,
+                    ctx.pr_number,
+                    &t!(
+                        lang,
+                        "⚠️ Approving on behalf of @{other} is disabled here. A relayed \
+approval counts toward branch protection under someone else's name, so it has to be \
+switched on deliberately: set `R_PLUS_ALLOW_ON_BEHALF=true` in the deployment. \
+Plain `r+` (crediting you) still works.",
+                        "⚠️ 本部署未开启代 @{other} 审批。代审批会以他人名义计入分支保护,\
+因此需要显式开启:在部署中设置 `R_PLUS_ALLOW_ON_BEHALF=true`。\
+普通 `r+`(归功于你自己)不受影响。"
+                    ),
+                )
+                .await;
+            return "on-behalf-disabled".into();
+        }
+    }
+
+    // 2. The author never gets to have the bot approve their own PR.
+    //
+    // GitHub blocks a real self-approval, but here the *App* is the review
+    // author, so the rule has to be enforced by hand. Checked on the commenter
+    // and not only on the credited login: `r+ as @teammate` from the author is
+    // the same act with an extra step. `normalize_login` because a `[bot]`
+    // suffix or stray case must not be a way around it.
+    if normalize_login(&ctx.commenter) == normalize_login(&ctx.pr_author) {
+        let commenter = &ctx.commenter;
+        let _ = gh
+            .post_issue_comment(
+                &ctx.repo,
+                ctx.pr_number,
+                &t!(
+                    lang,
+                    "⚠️ @{commenter} authored this PR, so `r+` here would be a \
+self-approval — including on behalf of someone else. Ask a reviewer to run it.",
+                    "⚠️ @{commenter} 是本 PR 作者,`r+` 属于自我审批(代他人审批同理)。\
+请由其他审查者执行。"
+                ),
+            )
+            .await;
+        return "self-approve".into();
+    }
+
+    // 3. commenter must have write/maintain/admin
     let perm = match gh.collaborator_permission(&ctx.repo, &ctx.commenter).await {
         Ok(p) => p,
         Err(e) => {
@@ -654,11 +732,10 @@ async fn handle_approve(
         return "denied".into();
     }
 
-    // 2. PR author cannot approve their own PR (GitHub itself blocks this for
-    //    the real author; here the bot is the author of the review, so we
-    //    enforce the semantic manually)
+    // 4. The credited login must be someone who could have approved this PR
+    //    themselves — a name we put on an approval has to be able to carry it.
     let credited = on_behalf_of.unwrap_or_else(|| ctx.commenter.clone());
-    if credited.eq_ignore_ascii_case(&ctx.pr_author) {
+    if normalize_login(&credited) == normalize_login(&ctx.pr_author) {
         let _ = gh
             .post_issue_comment(
                 &ctx.repo,
@@ -672,8 +749,60 @@ async fn handle_approve(
             .await;
         return "self-approve".into();
     }
+    if credited != ctx.commenter {
+        // Shape first, so a typo or an injected string never becomes a path
+        // segment. The permission check was missing entirely: an approval could
+        // be credited to a login with read-only access, or to no account at all.
+        if !crate::commands::is_valid_login(&credited) {
+            let _ = gh
+                .post_issue_comment(
+                    &ctx.repo,
+                    ctx.pr_number,
+                    &t!(
+                        lang,
+                        "⚠️ `{credited}` isn't a valid GitHub login, so there's nobody to credit.",
+                        "⚠️ `{credited}` 不是合法的 GitHub 用户名,无法归功。"
+                    ),
+                )
+                .await;
+            return "invalid-credited".into();
+        }
+        let their_perm = match gh.collaborator_permission(&ctx.repo, &credited).await {
+            Ok(p) => p,
+            Err(e) => {
+                let _ = gh
+                    .post_issue_comment(
+                        &ctx.repo,
+                        ctx.pr_number,
+                        &t!(
+                            lang,
+                            "⚠️ Could not check @{credited}'s permissions: `{e}`",
+                            "⚠️ 无法校验 @{credited} 的权限: `{e}`"
+                        ),
+                    )
+                    .await;
+                return format!("error: {e}");
+            }
+        };
+        if !matches!(their_perm.as_str(), "admin" | "maintain" | "write") {
+            let _ = gh
+                .post_issue_comment(
+                    &ctx.repo,
+                    ctx.pr_number,
+                    &t!(
+                        lang,
+                        "⚠️ Cannot credit the approval to @{credited}: they need write access \
+or above to approve this PR (currently: {their_perm}).",
+                        "⚠️ 无法将审批归功于 @{credited}:该用户需要 write 及以上权限才能审批本 PR\
+(当前: {their_perm})。"
+                    ),
+                )
+                .await;
+            return "credited-denied".into();
+        }
+    }
 
-    // 3. post APPROVE review, crediting the human. Kept in English in both
+    // 5. post APPROVE review, crediting the human. Kept in English in both
     //    cases: this line is the audit trail for who approved what, and it is
     //    also what shows up in GitHub's review list.
     let body = if credited == ctx.commenter {

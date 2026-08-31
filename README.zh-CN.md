@@ -34,14 +34,29 @@ Xero-Team 的组织级 GitHub App 机器人。Rust 实现,单二进制,双部署
 | `@xero-review label +bug -wip` | 添加/移除标签 |
 | `@xero-review assign @user` | 指派给 @user |
 | `@xero-review claim` / `unclaim` | 认领/释放(指派给自己/移除自己) |
-| `@xero-review r+` | 代审批:bot 校验评论者有 write 权限后,以其名义提交 APPROVE review |
-| `@xero-review r+ as @user` | 以 @user 名义代审批(用于转发在其他渠道给出的批准,即 bors 的 `r=`) |
+| `@xero-review r+` | 代审批:bot 校验评论者有 write 权限、且不是本 PR 作者后,以其名义提交 APPROVE review |
+| `@xero-review r+ as @user` | 以 @user 名义代审批(即 bors 的 `r=`,用于转发在其他渠道给出的批准)。**未设 `R_PLUS_ALLOW_ON_BEHALF=true` 时一律拒绝** —— 见[审批](#审批) |
 | `@xero-review r-` | 撤回 bot 之前的 APPROVE(dismiss) |
 
 自动行为(无需命令):
 - PR push/reopen 后检测冲突 → 打 `needs-rebase` + 提醒评论;冲突解决 → 摘标签
 - 周期 sweep(Vercel Cron 每日 / 自托管默认 6h)兜底检测
 - 给 PR 打 `codeql` 标签(若配置了 `CODEQL_LABEL`)→ 自动生成 CodeQL 报告
+
+### 审批
+
+由 App 提交的 APPROVE review 是一次**真实**批准:要求 1 个批准的分支保护规则会把它计入。
+所以 `r+` 是一次特权写入,不是一条评论。三条规则:
+
+- **评论者必须具备 write 及以上权限**,在提交任何内容之前先向仓库核实。
+- **PR 作者永远不能批准自己的 PR**,直接 `r+` 与 `r+ as @其他人` 一并拒绝。GitHub 会为人类
+  审查强制这一点,但这里的 review 作者是 App,只能由 bot 自己把关。
+- **代他人归功默认关闭。** 设置 `R_PLUS_ALLOW_ON_BEHALF=true` 后,`r+ as @user` 会把批准
+  归功于 @user —— 该用户同样需要 write 权限。若默认开启,任何 write 权限持有者都能以同事的
+  名义凭空制造一个批准、满足必需审查规则,而该同事根本没看过这个 PR,因此发行版默认关闭。
+  普通 `r+` 无论开关如何都不受影响。
+
+被拒绝的 `r+` 除上述校验外不会产生额外 API 调用;`help` 表会说明本部署处于开关的哪一侧。
 
 ### 回复语言
 

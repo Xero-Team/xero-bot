@@ -259,9 +259,10 @@ async fn request_review_calls_both_endpoints() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path(format!("/repos/{REPO}/pulls/7/requested_reviewers")))
-        .respond_with(ResponseTemplate::new(201).set_body_json(
-            json!({"requested_reviewers": [{"login": "carol"}]}),
-        ))
+        .respond_with(
+            ResponseTemplate::new(201)
+                .set_body_json(json!({"requested_reviewers": [{"login": "carol"}]})),
+        )
         .expect(1)
         .mount(&server)
         .await;
@@ -297,7 +298,9 @@ async fn request_review_reports_each_half_separately() {
     Mock::given(method("POST"))
         .and(path(format!("/repos/{REPO}/pulls/7/requested_reviewers")))
         .respond_with(
-            ResponseTemplate::new(422).set_body_json(json!({"message": "Reviews may only be requested from collaborators."})),
+            ResponseTemplate::new(422).set_body_json(
+                json!({"message": "Reviews may only be requested from collaborators."}),
+            ),
         )
         .expect(1)
         .mount(&server)
@@ -447,7 +450,10 @@ async fn review_403_falls_back_to_a_plain_comment() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path(format!("/repos/{REPO}/pulls/7/reviews")))
-        .respond_with(ResponseTemplate::new(403).set_body_json(json!({"message": "Resource not accessible by integration"})))
+        .respond_with(
+            ResponseTemplate::new(403)
+                .set_body_json(json!({"message": "Resource not accessible by integration"})),
+        )
         .expect(1)
         .mount(&server)
         .await;

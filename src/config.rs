@@ -42,6 +42,16 @@ pub struct Config {
     // Cron (Vercel)
     pub cron_secret: String,
 
+    /// May `r+ as @someone-else` credit its approval to another user?
+    ///
+    /// Default **false**, because the approval is posted by the App and a
+    /// branch-protection rule counts it as a real one: with this on, anyone
+    /// holding write access can manufacture an approval in a third party's name
+    /// and satisfy a required-review rule without that person seeing the PR.
+    /// Plain `r+` — crediting the commenter, who had to have write access
+    /// anyway — is unaffected and stays enabled.
+    pub r_plus_allow_on_behalf: bool,
+
     // Rebase detection
     pub rebase_check_delay_secs: u64,
     pub rebase_sweep_enabled: bool,
@@ -171,6 +181,7 @@ impl Config {
             data_dir: cfg("XERO_DATA_DIR", "/tmp/xero"),
 
             cron_secret: cfg("CRON_SECRET", ""),
+            r_plus_allow_on_behalf: bool_cfg("R_PLUS_ALLOW_ON_BEHALF", false),
 
             rebase_check_delay_secs: int_cfg("REBASE_CHECK_DELAY_SECS", 10),
             rebase_sweep_enabled: bool_cfg("REBASE_SWEEP_ENABLED", true),

@@ -766,7 +766,10 @@ impl Client {
             .await
         {
             Ok(_) => return Ok(ReviewPostMode::Full),
-            Err(GhError::Api { status: 422, message }) => {
+            Err(GhError::Api {
+                status: 422,
+                message,
+            }) => {
                 tracing::warn!(
                     "review on {repo}#{number} rejected (422: {message}); \
                      retrying without the {} inline comment(s)",

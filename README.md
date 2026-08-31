@@ -35,14 +35,33 @@ assignment, since an issue has no reviewers.
 | `@xero-review label +bug -wip` | Add/remove labels |
 | `@xero-review assign @user` | Assign to @user |
 | `@xero-review claim` / `unclaim` | Claim/release (assign to self / remove self) |
-| `@xero-review r+` | Approve on behalf: the bot verifies the commenter has write access, then submits an APPROVE review in their name |
-| `@xero-review r+ as @user` | Approve in @user's name (for forwarding an approval given elsewhere — bors' `r=`) |
+| `@xero-review r+` | Approve on behalf: the bot checks the commenter has write access and did not author the PR, then submits an APPROVE review in their name |
+| `@xero-review r+ as @user` | Approve in @user's name (bors' `r=`, for relaying an approval given elsewhere). **Refused unless `R_PLUS_ALLOW_ON_BEHALF=true`** — see [Approvals](#approvals) |
 | `@xero-review r-` | Withdraw a previous bot APPROVE (dismiss) |
 
 Automatic behavior (no command needed):
 - After a PR push/reopen, checks for conflicts → adds `needs-rebase` + a reminder comment; once resolved → removes the label
 - Periodic sweep (Vercel Cron daily / self-hosted default 6h) as a fallback check
 - Adding the `CODEQL_LABEL` label to a PR (if configured) → auto-generates a CodeQL report
+
+### Approvals
+
+An APPROVE review submitted by the App is a real approval: a branch-protection rule that
+requires one counts it, so `r+` is a privileged write and not a comment. Three rules apply.
+
+- **The commenter needs write access or above**, checked against the repo before anything is
+  posted.
+- **The PR author can never approve their own PR**, not directly and not via `r+ as @someone`.
+  GitHub enforces this for human reviews, but the review author here is the App, so the bot
+  has to enforce it itself.
+- **Relaying an approval to another login is off by default.** With
+  `R_PLUS_ALLOW_ON_BEHALF=true`, `r+ as @user` credits the approval to @user — who must also
+  have write access. Left enabled, anyone with write access can manufacture an approval in a
+  colleague's name and satisfy a required-review rule without that colleague ever seeing the
+  PR, which is why it ships off. Plain `r+` is unaffected either way.
+
+A refused `r+` costs no API call beyond the checks above, and the `help` table says which side
+of the switch the deployment is on.
 
 ### Reply language
 

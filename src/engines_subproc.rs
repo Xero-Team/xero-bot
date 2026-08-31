@@ -50,7 +50,11 @@ pub async fn engine_available(binary: &str) -> bool {
 /// the failure has to be an error, not `unwrap_or_default()` — an empty token
 /// goes into the clone URL and comes back as an authentication failure with no
 /// indication that the token was what went missing.
-async fn installation_token(gh: &Client, cfg: &Config, installation_id: i64) -> Result<String, String> {
+async fn installation_token(
+    gh: &Client,
+    cfg: &Config,
+    installation_id: i64,
+) -> Result<String, String> {
     gh.installation_token(cfg, installation_id)
         .await
         .map_err(|e| format!("could not get an installation token: {e}"))
