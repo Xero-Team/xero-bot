@@ -38,6 +38,13 @@ pub struct Config {
     pub codex_path: String,
     pub codex_args: String,
     pub data_dir: String,
+    /// How much history to fetch for a review checkout.
+    ///
+    /// Deep enough that the PR and its base branch usually share an ancestor —
+    /// without one, `git diff base...HEAD` has no left side and the model is
+    /// shown the whole branch instead of the change. When it isn't enough the
+    /// checkout deepens once and carries on rather than paying for a full clone.
+    pub checkout_depth: u32,
 
     // Cron (Vercel)
     pub cron_secret: String,
@@ -179,6 +186,7 @@ impl Config {
             codex_path: cfg("CODEX_PATH", "codex"),
             codex_args: cfg("CODEX_ARGS", ""),
             data_dir: cfg("XERO_DATA_DIR", "/tmp/xero"),
+            checkout_depth: int_cfg("CHECKOUT_DEPTH", 100) as u32,
 
             cron_secret: cfg("CRON_SECRET", ""),
             r_plus_allow_on_behalf: bool_cfg("R_PLUS_ALLOW_ON_BEHALF", false),

@@ -172,7 +172,15 @@ Then: **generate a private key** (downloads a `.pem` file), note the numeric **A
 4. **Webhook URL**: `https://<your-host>/webhook` — must be reachable from the internet (GitHub delivers events to it; for a home server use a reverse proxy or tunnel).
 
 What you get in the container:
-- A `/data` named volume (`xero-data`) caches repo checkouts and `pi` sessions — this is the bot's **incremental memory**; wiping it loses review context. Leave it alone or back it up.
+- A `/data` named volume (`xero-data`) caches repo checkouts and `pi` sessions — this is the bot's **incremental memory**; wiping it loses review context. Leave it alone or back it up. The layout:
+
+  | Path | Contents | Safe to delete? |
+  |---|---|---|
+  | `repos/{owner}__{repo}/pr-{n}` | One shallow checkout per PR (depth `CHECKOUT_DEPTH`, default 100) | Yes — a merged PR's directory can go |
+  | `sessions/{owner}__{repo}` | `pi` sessions, **shared per repository** = the incremental project understanding | No |
+  | `codex/{owner}__{repo}-pr{n}-{sha}.md` | One `codex` run's output, deleted once read | Nothing to manage |
+
+  Per PR rather than per repository is required, not tidiness: the tree sits at a PR's head, so one shared directory meant two concurrent reviews could each be reading the other's code. Disk use is therefore roughly *concurrently active PRs × shallow clone size*. A duplicate `@bot review` on the same PR is turned away with a note rather than paying for the model twice.
 - Both `pi` and `codex` CLIs are preinstalled, so all five engines work out of the box (`REVIEW_ENGINE=auto` probes pi → codex → agent → builtin). If an npm install fails during the image build, that engine is skipped gracefully and selection falls through.
 - A built-in rebase sweep loop (`REBASE_SWEEP_ENABLED=true`, every `REBASE_SWEEP_INTERVAL_SECS` = 6h by default) — no external cron required. Optionally, belt-and-braces via host crontab:
   ```bash

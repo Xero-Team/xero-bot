@@ -165,7 +165,15 @@ GitHub → Settings → Developer settings → GitHub Apps → **New GitHub App*
 4. **Webhook URL**:`https://<your-host>/webhook` — 必须能被公网访问(GitHub 要向它推送事件;家用服务器需反代或内网穿透)。
 
 容器内的既有能力:
-- `/data` 具名卷(`xero-data`)缓存仓库 checkout 与 `pi` 会话 — 这是 bot 的**增量记忆**,删掉就丢审查上下文,不要轻易清理。
+- `/data` 具名卷(`xero-data`)缓存仓库 checkout 与 `pi` 会话 — 这是 bot 的**增量记忆**,删掉就丢审查上下文,不要轻易清理。布局:
+
+  | 路径 | 内容 | 可否清理 |
+  |---|---|---|
+  | `repos/{owner}__{repo}/pr-{编号}` | 每个 PR 一份浅 checkout(深度 `CHECKOUT_DEPTH`,默认 100) | 可以 — 已合并的 PR 目录可安全删除 |
+  | `sessions/{owner}__{repo}` | `pi` 会话,**按仓库共享** = 项目理解的增量记忆 | 不要删 |
+  | `codex/{owner}__{repo}-pr{编号}-{sha}.md` | `codex` 单轮输出,读完即删 | 无需管理 |
+
+  checkout 按 PR 而非按仓库分开是必须的:工作树停在某个 PR 的 head 上,共用一份会让并发的两轮审查读到对方的代码。磁盘占用因此约为「同时活跃的 PR 数 × 浅克隆大小」。同一个 PR 的重复 `@bot review` 会被直接回绝(回一条"已有一轮审查正在进行"),不会重复花模型钱。
 - `pi` 和 `codex` 两个 CLI 都已预装,五个引擎开箱即用(`REVIEW_ENGINE=auto` 依次探测 pi → codex → agent → builtin)。若镜像构建时某个 npm 安装失败,对应引擎会被优雅跳过,探测链继续往下走。
 - 内置 rebase sweep 循环(`REBASE_SWEEP_ENABLED=true`,默认每 `REBASE_SWEEP_INTERVAL_SECS`=6h 一轮),无需外部 cron。也可在宿主机 crontab 里再加一道兜底:
   ```bash
