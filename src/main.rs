@@ -71,6 +71,7 @@ async fn main() {
     }
 
     let port = cfg.port;
+    let bot_name = cfg.bot_name.clone();
     let state = AppState { cfg };
 
     let app = Router::new()
@@ -80,13 +81,25 @@ async fn main() {
         .route("/cron", get(cron_sweep))
         .with_state(state);
 
+    // Bind *before* announcing it. The other order printed "listening on
+    // 0.0.0.0:8080" and then panicked on `AddrInUse`, so the log's last
+    // successful-looking line described something that never happened.
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
-    println!(
-        "xero-bot listening on 0.0.0.0:{port} (POST /webhook, GET /cron) — bot: @{}",
-        Config::from_env().bot_name
-    );
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    let listener = match tokio::net::TcpListener::bind(addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            // Not a panic: a busy port is an operator's mistake, not a bug, and
+            // a backtrace buries the one line that says which port and why.
+            eprintln!("ERROR: cannot bind 0.0.0.0:{port}: {e}");
+            std::process::exit(2);
+        }
+    };
+    println!("xero-bot listening on 0.0.0.0:{port} (POST /webhook, GET /cron) — bot: @{bot_name}");
+
+    if let Err(e) = axum::serve(listener, app).await {
+        eprintln!("ERROR: server stopped: {e}");
+        std::process::exit(1);
+    }
 }
 
 async fn health() -> Json<Value> {
