@@ -1,7 +1,7 @@
 //! Environment configuration, loaded once and passed by reference.
 //!
-//! Mirrors the Python bot's semantics: values in `.env` never override real
-//! environment variables (so Vercel's dashboard config always wins there).
+//! Values in `.env` never override real environment variables, so an
+//! orchestrator's `environment:` block (docker compose) always wins.
 
 use std::env;
 use std::path::Path;
@@ -27,6 +27,16 @@ pub struct Config {
     /// and [`crate::review::truncate`] now cuts in the same unit it checks.
     pub max_diff_chars: usize,
 
+    /// Adversarial re-check of the model's own findings.
+    ///
+    /// A second AI call, blind to the first verdict, is asked to *refute* each
+    /// critical/high/medium finding against the diff alone. Findings it cannot
+    /// confirm are demoted, not published as fact. Off by default because it
+    /// multiplies the model spend roughly by the number of findings; turn it on
+    /// with `REVIEW_VERIFY=true` on deployments that prefer precision over
+    /// latency.
+    pub review_verify: bool,
+
     // Review engines
     pub review_engine: String, // auto | builtin | agent | pi | codex
     pub agent_max_turns: usize,
@@ -46,7 +56,7 @@ pub struct Config {
     /// checkout deepens once and carries on rather than paying for a full clone.
     pub checkout_depth: u32,
 
-    // Cron (Vercel)
+    // Cron endpoint (/cron Bearer secret)
     pub cron_secret: String,
 
     /// May `r+ as @someone-else` credit its approval to another user?
@@ -166,9 +176,9 @@ impl Config {
     pub fn from_env() -> Config {
         let cfg = Config::read_env();
         // Registered here rather than at each call site: every entry point —
-        // the server, each Vercel function, the cron sweep — builds its config
-        // through this one function, so this is the only place that cannot be
-        // forgotten when a new one is added.
+        // the server, the cron sweep — builds its config through this one
+        // function, so this is the only place that cannot be forgotten when a
+        // new one is added.
         crate::redact::register(&cfg);
         cfg
     }
@@ -186,6 +196,7 @@ impl Config {
             ai_model: cfg("AI_MODEL", ""),
             api_format: cfg("API_FORMAT", "chat"),
             max_diff_chars: int_cfg("MAX_DIFF_CHARS", 60_000) as usize,
+            review_verify: bool_cfg("REVIEW_VERIFY", false),
 
             review_engine: cfg("REVIEW_ENGINE", "auto"),
             agent_max_turns: int_cfg("AGENT_MAX_TURNS", 8) as usize,

@@ -10,4 +10,5 @@ pub mod lang;
 pub mod rebase;
 pub mod redact;
 pub mod review;
+pub mod verify;
 pub mod webhook;

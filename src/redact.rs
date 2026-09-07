@@ -213,6 +213,7 @@ mod tests {
             ai_model: String::new(),
             api_format: String::new(),
             max_diff_chars: 0,
+            review_verify: false,
             review_engine: String::new(),
             agent_max_turns: 0,
             agent_timeout_secs: 0,

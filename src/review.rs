@@ -545,6 +545,19 @@ fn diagnose(cfg: &Config, status: reqwest::StatusCode, snippet: &str) -> String 
 // Verdict parsing (robust, three-tier fallback)
 // ---------------------------------------------------------------------------
 
+/// The checker's system line. Mentioning JSON on purpose: a provider asked for
+/// `json_object` rejects the *request* unless the input asks for JSON, and the
+/// checker travels through [`call_ai`], which always sets that response format.
+pub fn verify_checker_system(lang: Lang) -> &'static str {
+    lang.pick(
+        "You are an independent second reviewer. Reply with JSON {\"answer\": \"CONFIRM or \
+REFUTE\", \"reason\": \"one sentence\"}. REFUTE means the claim is wrong, unsupported by the \
+diff, or describes intended behaviour rather than a defect.",
+        "你是独立二审。回复 JSON {\"answer\": \"CONFIRM 或 REFUTE\", \"reason\": \"一句话\"}。\
+REFUTE 表示该断言错误、diff 中无依据、或描述的是有意行为而非缺陷。",
+    )
+}
+
 pub fn parse_verdict(text: &str) -> Option<Value> {
     if text.is_empty() {
         return None;
@@ -587,16 +600,21 @@ real problems; do not invent findings to fill the list. \
 Your output must be strict JSON (no explanatory prose, no markdown fence). \
 JSON schema: \
 {\"summary\": \"one-sentence overall assessment\", \
-\"findings\": [{\"severity\": \"critical|high|medium|low|info\", \
+\"findings\": [{\"id\": assigned by the system, omit it, \
+\"severity\": \"critical|high|medium|low|info\", \
+\"type\": \"security|bug|resource|race|error-handling|performance|style|question\", \
 \"title\": \"short title\", \"file\": \"path of a file in the diff\", \
 \"line\": integer line number (one of the added lines; use 1 if not applicable), \
-\"description\": \"the problem and its potential impact\", \
+\"description\": \"the problem, its potential impact, and the code evidence that \
+establishes it (quote the exact lines)\", \
 \"suggestion\": \"a concrete fix\"}]}. \
 Severity guide: critical=security hole (injection/RCE/auth bypass/data loss); \
 high=logic bug/resource leak/race/core functionality broken; \
 medium=edge case/missing error handling; low=style/maintainability; \
 info=suggestion/question/nit. \
 Write `summary`, `description` and `suggestion` in English. \
+Every description must cite the code it is about — a finding without evidence in \
+the diff will be discarded by the second reviewer. \
 If there is nothing to report, `findings` is an empty array.",
         "你是一名资深、严谨的安全与代码质量审查员。审查 pull request 的代码改动,\
 按风险分级输出问题。只报告真实问题,不要为了凑数编造。\
@@ -604,14 +622,17 @@ If there is nothing to report, `findings` is an empty array.",
 JSON schema: \
 {\"summary\": \"一句话总体评价\", \
 \"findings\": [{\"severity\": \"critical|high|medium|low|info\", \
+\"type\": \"security|bug|resource|race|error-handling|performance|style|question\", \
 \"title\": \"简短标题\", \"file\": \"改动中的文件路径\", \
 \"line\": 整数行号(改动新增行之一,若不适用填1), \
-\"description\": \"问题描述与潜在影响\", \
+\"description\": \"问题描述、潜在影响,以及支撑它的代码证据(引用具体行)\", \
 \"suggestion\": \"具体修复建议\"}]}。\
 severity 标准: critical=安全漏洞(注入/RCE/鉴权绕过/数据丢失); \
 high=逻辑bug/资源泄漏/竞态/核心功能损坏; \
 medium=边界条件/错误处理缺失; low=风格/可维护性; info=建议/疑问/nit。\
-用中文输出 summary、description 和 suggestion。若无问题, findings 为空数组。",
+用中文输出 summary、description 和 suggestion。\
+每条 description 必须引用它所针对的代码 —— 没有证据支撑的发现会被二审驳回。\
+若无问题, findings 为空数组。",
     )
 }
 
@@ -643,9 +664,12 @@ pub fn build_user_prompt(
         .map(|p| {
             t!(
                 lang,
-                "\n## Previous review (check whether these were fixed; don't repeat findings \
-that were resolved or rejected, and confirm the fixes in your summary):\n{p}\n",
-                "\n## 上一轮审查意见(检查这些是否已修复;避免重复已被解决/驳回的发现,如已修复请在总结中确认):\n{p}\n"
+                "\n## Previous review (audit trail — for every finding in it, check the \
+current diff and state in your summary whether it is now fixed, still present, or was \
+rejected as a false positive. Don't repeat findings that were resolved; do repeat any that \
+are still present, marking them carried over):\n{p}\n",
+                "\n## 上一轮审查意见(对账依据 —— 对其中的每一条 finding,核对本轮 diff,并在总结中 \
+逐条说明:已修复/仍存在/被判误报。已解决的不要重复;仍存在的要重复提出并标注为遗留):\n{p}\n"
             )
         })
         .unwrap_or_default();
@@ -736,6 +760,8 @@ pub fn render_summary(verdict: &Value, engine_tag: &str, lang: Lang) -> String {
         lines.push(format!("### {icon} {label} ({})", items.len()));
         lines.push(String::new());
         for f in items {
+            let id = f.get("id").and_then(|x| x.as_str()).unwrap_or("");
+            let ftype = f.get("type").and_then(|x| x.as_str()).unwrap_or("");
             let file = f.get("file").and_then(|x| x.as_str()).unwrap_or("?");
             let line = f
                 .get("line")
@@ -748,7 +774,15 @@ pub fn render_summary(verdict: &Value, engine_tag: &str, lang: Lang) -> String {
                 .unwrap_or(lang.pick("(no title)", "(无标题)"));
             let desc = f.get("description").and_then(|x| x.as_str()).unwrap_or("");
             let sug = f.get("suggestion").and_then(|x| x.as_str()).unwrap_or("");
-            lines.push(format!("- **`{file}:{line}` — {title}**"));
+            // The id tags the finding across rounds — this is what makes
+            // "XRV-… still present in round 3" sayable. Omitted entirely when
+            // the verdict carried none (older engines, tests).
+            let tag = match (id.is_empty(), ftype.is_empty()) {
+                (false, false) => format!("`{id}` · {ftype} · "),
+                (false, true) => format!("`{id}` · "),
+                _ => String::new(),
+            };
+            lines.push(format!("- {tag}**`{file}:{line}` — {title}**"));
             lines.push(format!("  {desc}"));
             if !sug.is_empty() {
                 lines.push(format!("  💡 {sug}"));
@@ -864,7 +898,7 @@ async fn run_builtin_inner(
     );
 
     let raw = call_ai(cfg, system_prompt(lang), &user_prompt).await?;
-    let Some(verdict) = parse_verdict(&raw) else {
+    let Some(mut verdict) = parse_verdict(&raw) else {
         let body = t!(
             lang,
             "## 🤖 AI Code Review\n\n⚠️ Couldn't parse the model's JSON; raw output below:\n\n```\n{raw}\n```",
@@ -874,7 +908,18 @@ async fn run_builtin_inner(
         return Ok("parse-failed".into());
     };
 
-    let summary = render_summary(&verdict, "builtin", lang);
+    // The adversarial second pass. Gated on config: it costs one AI call per
+    // significant finding, so a deployment that prefers cheap reviews leaves
+    // it off and publishes the first pass as-is. One shared entry so the other
+    // engines cannot drift apart on when the pass runs.
+    let verify_tag = crate::verify::verify_and_stamp(&mut verdict, cfg, &diff, lang, |prompt| {
+        let cfg = cfg.clone();
+        async move { call_ai(&cfg, verify_checker_system(lang), &prompt).await }
+    })
+    .await;
+    let engine_tag = format!("builtin{verify_tag}");
+
+    let summary = render_summary(&verdict, &engine_tag, lang);
     let inline = build_inline_comments(&verdict, &added);
     let mode = gh
         .post_review(repo, pr_number, &summary, inline)

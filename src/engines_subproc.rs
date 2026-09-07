@@ -469,7 +469,7 @@ async fn post_subproc_result(
     engine_tag: &str,
     lang: Lang,
 ) -> String {
-    let Some(verdict) = parse_verdict(raw_output) else {
+    let Some(mut verdict) = parse_verdict(raw_output) else {
         // Scrubbed as well: this is model output on its way into a public
         // comment, and the model can read the repository's git config.
         let raw = redact_any(&raw_output.chars().take(4000).collect::<String>());
@@ -481,9 +481,20 @@ async fn post_subproc_result(
         let _ = gh.post_issue_comment(repo, pr_number, &body).await;
         return "parse-failed".into();
     };
-    let summary = render_summary(&verdict, engine_tag, lang);
     let diff = gh.get_pr_diff(repo, pr_number).await.unwrap_or_default();
-    let added = parse_added_lines(&truncate(&diff, cfg.max_diff_chars).0);
+    let truncated_diff = truncate(&diff, cfg.max_diff_chars).0;
+    let verify_tag =
+        crate::verify::verify_and_stamp(&mut verdict, cfg, &truncated_diff, lang, |prompt| {
+            let cfg = cfg.clone();
+            async move {
+                crate::review::call_ai(&cfg, crate::review::verify_checker_system(lang), &prompt)
+                    .await
+            }
+        })
+        .await;
+    let engine_tag = format!("{engine_tag}{verify_tag}");
+    let summary = render_summary(&verdict, &engine_tag, lang);
+    let added = parse_added_lines(&truncated_diff);
     let inline = build_inline_comments(&verdict, &added);
     match gh.post_review(repo, pr_number, &summary, inline).await {
         Ok(mode) => mode.to_string(),

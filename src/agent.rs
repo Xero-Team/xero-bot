@@ -1,9 +1,9 @@
 //! Native review agent: a tool-calling loop where the model explores the
 //! project through GitHub API tools before reviewing the diff.
 //!
-//! This is the Vercel-friendly engine — no subprocesses, no local clone.
-//! "Incremental" comes from injecting the bot's previous review on this PR
-//! plus the commits since, fetched from GitHub itself (no other state).
+//! No subprocesses, no local clone. "Incremental" comes from injecting the
+//! bot's previous review on this PR plus the commits since, fetched from
+//! GitHub itself (no other state).
 
 use serde_json::{json, Value};
 
@@ -676,11 +676,29 @@ pub async fn run_agent_review(
 
     match outcome {
         Ok(o) => {
-            if let Some(verdict) = o.verdict {
-                let engine = format!("agent ({} turns)", o.turns_used);
+            if let Some(mut verdict) = o.verdict {
+                let diff = gh.get_pr_diff(repo, pr_number).await.unwrap_or_default();
+                let verify_tag = crate::verify::verify_and_stamp(
+                    &mut verdict,
+                    cfg,
+                    &crate::review::truncate(&diff, cfg.max_diff_chars).0,
+                    lang,
+                    |prompt| {
+                        let cfg = cfg.clone();
+                        async move {
+                            crate::review::call_ai(
+                                &cfg,
+                                crate::review::verify_checker_system(lang),
+                                &prompt,
+                            )
+                            .await
+                        }
+                    },
+                )
+                .await;
+                let engine = format!("agent ({} turns){verify_tag}", o.turns_used);
                 let summary = render_summary(&verdict, &engine, lang);
-                let full_diff = gh.get_pr_diff(repo, pr_number).await.unwrap_or_default();
-                let added = parse_added_lines(&truncate(&full_diff, cfg.max_diff_chars).0);
+                let added = parse_added_lines(&truncate(&diff, cfg.max_diff_chars).0);
                 let inline = build_inline_comments(&verdict, &added);
                 // The mode is the status: "ok" hides that the inline comments
                 // were dropped or that this went out as a plain comment.
