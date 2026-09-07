@@ -899,6 +899,37 @@ impl Client {
         .await
     }
 
+    /// CI check runs for one commit (GitHub Actions and anything else that
+    /// reports through the Checks API).
+    ///
+    /// A 403 is a normal answer here, not a malfunction: the App may not have
+    /// been granted `Checks: read`, and every caller must treat the CI state
+    /// as *unknown* rather than as "all green" when this fails. That asymmetry
+    /// is the whole point of the return type — see [`CiState`].
+    pub async fn check_runs(&self, repo: &str, sha: &str) -> Result<Vec<Value>, GhError> {
+        let v = self
+            .get(&format!(
+                "/repos/{repo}/commits/{sha}/check-runs?per_page=100"
+            ))
+            .await?;
+        Ok(v.get("check_runs")
+            .and_then(|c| c.as_array())
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    /// Commit statuses for one commit (the older Status API — Travis-style
+    /// reporters and anything that predates check runs).
+    ///
+    /// Read alongside [`Client::check_runs`]; the two APIs partition the CI
+    /// world between them and neither alone is the truth.
+    pub async fn commit_statuses(&self, repo: &str, sha: &str) -> Result<Vec<Value>, GhError> {
+        self.get_all(&format!(
+            "/repos/{repo}/commits/{sha}/statuses?per_page=100"
+        ))
+        .await
+    }
+
     // -------------------------------------------------------------------
     // Repo content (agent tools)
     // -------------------------------------------------------------------

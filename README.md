@@ -123,6 +123,18 @@ verifiable new evidence that answers the rebuttal, and if the model believes the
 wrong it must argue that in the summary rather than silently re-report. Attributions are
 kept verbatim (`@user: "quote"`), so teammates' views are not laundered into the author's.
 
+### CI as the ground truth about "does it build"
+
+The bot has no execution environment, so "does it compile" is not its question — CI's
+answer is read from the head commit's check runs and commit statuses and stated to the
+model as fact: green CI means compilation and imports were *executed and passed*, and a
+prompt section forbids `invalid syntax` / `does not compile` / `cannot be imported`
+findings outright, naming the newer-grammar hypothesis (Python 3.14's paren-less
+multi-exception except, which AstrBot #5 and #64 both misjudged as critical). Failed
+checks are named instead of re-reported; a commit with no CI renders no section — silence
+is never presented as success. Requires the App to have `Checks: read`; without it the
+section is simply absent and the scope rule in the review brief still applies.
+
 With `REVIEW_VERIFY=true`, each critical/high/medium finding additionally goes through a
 blind second pass: a separate AI call that sees the diff and the claim only — never the
 first verdict — and is asked to *refute* it. A finding the checker confirms is marked
@@ -163,7 +175,7 @@ GitHub → Settings → Developer settings → GitHub Apps → **New GitHub App*
 | Webhook URL | `https://<host>/webhook` |
 | Webhook secret | any random string — must match `WEBHOOK_SECRET` |
 | Subscribed events | **Issue comment** + **Pull request** |
-| Permissions | Contents: R · Pull requests: RW · Issues: RW · **Code scanning alerts: R** |
+| Permissions | Contents: R · Pull requests: RW · Issues: RW · **Checks: R** · **Code scanning alerts: R** |
 
 Then: **generate a private key** (downloads a `.pem` file), note the numeric **App ID** and the bot's @-name (for `BOT_NAME`), and install the App on the target org/repos.
 

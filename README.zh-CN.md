@@ -108,6 +108,16 @@ PR 作者可能不同意某条发现 —— 在内联评论下回复反驳(如 A
 回应反驳的可验证新证据;若模型认为作者是错的,必须在总结中给出论证,而不是默默重报。
 归因保留原文(`@用户: "引用"`),队友的意见不会被混写成作者的立场。
 
+### CI 是"能否编译"的既定事实
+
+bot 没有执行环境,"能否编译"不是它的问题 —— CI 的答案才是。bot 读取 PR head 提交的
+check runs 与 commit statuses,并作为事实注入 prompt:CI 全绿意味着编译、导入与测试已
+**实际执行并通过**,prompt 段明令禁止 `语法非法` / `无法编译` / `无法导入` 类 finding,
+并点名"新语法假设"(Python 3.14 允许无括号多异常 except —— AstrBot #5 与 #64 都把它误判
+成了 critical)。CI 失败的检查按名字列出而不重报;没有 CI 的提交不渲染该段 —— 静默永远不会
+被当作成功。需要 App 有 `Checks: read` 权限;没有时该段缺席,审查 brief 中的职责边界规则
+仍然生效。
+
 设置 `REVIEW_VERIFY=true` 后,critical/high/medium 级别的每条发现还会经过一次**盲态二次证伪**:
 独立的第二次 AI 调用,只拿到 diff 和该条断言(看不到第一轮结论),任务是设法**推翻**它。
 复核通过的发现标注 `[已复核]`;被驳回的发现降一级并标注 `[复核未确认]`,而不是删除 ——
@@ -147,7 +157,7 @@ GitHub → Settings → Developer settings → GitHub Apps → **New GitHub App*
 | Webhook URL | `https://<host>/webhook` |
 | Webhook secret | 任意随机字符串 — 必须与 `WEBHOOK_SECRET` 一致 |
 | 订阅事件 | **Issue comment** + **Pull request** |
-| 权限 | Contents: R · Pull requests: RW · Issues: RW · **Code scanning alerts: R** |
+| 权限 | Contents: R · Pull requests: RW · Issues: RW · **Checks: R** · **Code scanning alerts: R** |
 
 然后:**生成私钥**(会下载 `.pem` 文件),记下数字 **App ID** 与 bot 的 @-名(填 `BOT_NAME`),并把 App 安装到目标组织/仓库。
 

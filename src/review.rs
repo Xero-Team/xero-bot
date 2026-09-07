@@ -612,6 +612,12 @@ Severity guide: critical=security hole (injection/RCE/auth bypass/data loss); \
 high=logic bug/resource leak/race/core functionality broken; \
 medium=edge case/missing error handling; low=style/maintainability; \
 info=suggestion/question/nit. \
+Scope: whether the code compiles, parses or imports is CI's question, not yours — you \
+have no execution environment, and you may not know the project's language version. \
+Never report \"invalid syntax\" / \"does not compile\" / \"cannot be imported\" as a \
+finding; when a CI section is provided and it says green, such a claim is wrong by \
+construction, and your first hypothesis should be that a construct you don't recognize \
+is newer language grammar. \
 Write `summary`, `description` and `suggestion` in English. \
 Every description must cite the code it is about — a finding without evidence in \
 the diff will be discarded by the second reviewer. \
@@ -630,6 +636,9 @@ JSON schema: \
 severity 标准: critical=安全漏洞(注入/RCE/鉴权绕过/数据丢失); \
 high=逻辑bug/资源泄漏/竞态/核心功能损坏; \
 medium=边界条件/错误处理缺失; low=风格/可维护性; info=建议/疑问/nit。\
+职责边界: 代码能否编译/解析/导入是 CI 的问题,不是你的 —— 你没有执行环境,也未必了解\
+项目的语言版本。绝不要把\"语法非法\"/\"无法编译\"/\"无法导入\"作为 finding 提出;若提供了\
+CI 段且显示通过,这类断言必然错误,你的第一假设应当是你不认识的结构是新的语言语法。\
 用中文输出 summary、description 和 suggestion。\
 每条 description 必须引用它所针对的代码 —— 没有证据支撑的发现会被二审驳回。\
 若无问题, findings 为空数组。",
@@ -644,29 +653,31 @@ pub fn build_user_prompt(
     new_commits: Option<&str>,
     lang: Lang,
 ) -> String {
-    build_user_prompt_with_feedback(
+    build_user_prompt_with_sections(
         diff,
         pr_meta,
         truncated,
         previous_review,
         new_commits,
-        None,
+        &[],
         lang,
     )
 }
 
-/// [`build_user_prompt`] with the author-feedback section.
+/// [`build_user_prompt`] with extra context sections.
 ///
-/// `feedback` is the already-rendered section from
-/// [`author_feedback_section`]; `None` for a first review or when the author
-/// raised no objections.
-pub fn build_user_prompt_with_feedback(
+/// `sections` are already-rendered blocks (CI status, author feedback) that
+/// ride between the incremental context and the diff. Order matters: each
+/// section's claims are about what precedes it — the CI section may reference
+/// the previous review's findings, the feedback section definitely does — so
+/// callers append in that order.
+pub fn build_user_prompt_with_sections(
     diff: &str,
     pr_meta: &Value,
     truncated: bool,
     previous_review: Option<&str>,
     new_commits: Option<&str>,
-    feedback: Option<&str>,
+    sections: &[String],
     lang: Lang,
 ) -> String {
     let title = pr_meta.get("title").and_then(|t| t.as_str()).unwrap_or("");
@@ -707,14 +718,14 @@ are still present, marking them carried over):\n{p}\n",
             )
         })
         .unwrap_or_default();
-    // The feedback section carries its own binding instruction, so it rides
-    // in as rendered — but ordered after the previous review, because its
-    // claims are about that review's findings.
-    let feedback_section = feedback.map(|f| format!("\n{f}\n")).unwrap_or_default();
+    let extra = sections
+        .iter()
+        .map(|s| format!("\n{s}\n"))
+        .collect::<String>();
     t!(
         lang,
-        "PR title: {title}\nPR description: {body}\n{prev_section}{commits_section}{feedback_section}\nBelow is the PR's unified diff (look only at the added code):\n{diff}{note}\n\nReview the change above and answer with the JSON schema given.",
-        "PR 标题: {title}\nPR 描述: {body}\n{prev_section}{commits_section}{feedback_section}\n以下是 PR 的 unified diff(只关注新增的代码):\n{diff}{note}\n\n请审查上述改动并按指定 JSON schema 输出。"
+        "PR title: {title}\nPR description: {body}\n{prev_section}{commits_section}{extra}\nBelow is the PR's unified diff (look only at the added code):\n{diff}{note}\n\nReview the change above and answer with the JSON schema given.",
+        "PR 标题: {title}\nPR 描述: {body}\n{prev_section}{commits_section}{extra}\n以下是 PR 的 unified diff(只关注新增的代码):\n{diff}{note}\n\n请审查上述改动并按指定 JSON schema 输出。"
     )
 }
 
@@ -920,14 +931,19 @@ async fn run_builtin_inner(
     // per-PR context, not a model change: the same pushback that was written
     // into a thread (AstrBot #5's PEP 758 rebuttal) stops being re-reported.
     let feedback = author_feedback_section(gh, cfg, repo, pr_number, lang).await;
+    // What CI already proved about this commit. This is the fence against the
+    // recurring "SyntaxError on green CI" false positive (#5, #64): the model
+    // is told what has actually executed, not asked to guess.
+    let ci = ci_section(gh, cfg, repo, pr_number, lang).await;
+    let sections: Vec<String> = [ci, feedback].into_iter().flatten().collect();
 
-    let user_prompt = build_user_prompt_with_feedback(
+    let user_prompt = build_user_prompt_with_sections(
         &diff,
         &meta,
         truncated,
         previous_review.as_deref(),
         new_commits.as_deref(),
-        feedback.as_deref(),
+        &sections,
         lang,
     );
 
@@ -1236,6 +1252,239 @@ pub async fn author_feedback_section(
     // Budget it like every other context section: a thread that turned into a
     // shouting match must not eat the diff's prompt share. Half of what the
     // previous review gets, which has proven enough for disagreement prose.
+    Some(truncate(&section, cfg.max_diff_chars / 4).0)
+}
+
+// ---------------------------------------------------------------------------
+// CI state — the ground truth about "does it build"
+// ---------------------------------------------------------------------------
+
+/// What CI says about the commit under review, as far as we can see.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CiState {
+    /// Every check that ran succeeded. The names travel because the prompt
+    /// cites them: "CI passed (build, tests)" is an argument, "CI passed" is
+    /// a vibe.
+    Green(Vec<String>),
+    /// At least one check failed.
+    Failed(Vec<String>),
+    /// Checks exist but none has reached a verdict yet.
+    Pending(Vec<String>),
+    /// No checks are configured, or the App cannot read them. Deliberately
+    /// distinct from `Green`: silence is not success, and a review that
+    /// treats it so would repeat exactly the mistake this section exists to
+    /// prevent.
+    Unknown,
+}
+
+impl CiState {
+    /// Fold the Checks API and the Status API into one state.
+    ///
+    /// A failed check wins over anything else; green requires *every* signal
+    /// we can see to be green, with at least one present. Both endpoints
+    /// partition the CI world between them, so only the union is the truth.
+    pub fn combine(checks: &[Value], statuses: &[Value]) -> CiState {
+        let check_states = |conclusion: &str| {
+            checks
+                .iter()
+                .any(|c| c.get("conclusion").and_then(|x| x.as_str()) == Some(conclusion))
+        };
+        let status_states = |state: &str| {
+            statuses
+                .iter()
+                .any(|s| s.get("state").and_then(|x| x.as_str()) == Some(state))
+        };
+
+        if check_states("failure")
+            || check_states("timed_out")
+            || check_states("action_required")
+            || status_states("failure")
+            || status_states("error")
+        {
+            let mut names: Vec<String> = checks
+                .iter()
+                .filter(|c| {
+                    matches!(
+                        c.get("conclusion").and_then(|x| x.as_str()),
+                        Some("failure") | Some("timed_out") | Some("action_required")
+                    )
+                })
+                .filter_map(|c| c.get("name").and_then(|n| n.as_str()))
+                .chain(
+                    statuses
+                        .iter()
+                        .filter(|s| {
+                            matches!(
+                                s.get("state").and_then(|x| x.as_str()),
+                                Some("failure") | Some("error")
+                            )
+                        })
+                        .filter_map(|s| s.get("context").and_then(|n| n.as_str())),
+                )
+                .map(String::from)
+                .collect();
+            names.sort();
+            names.dedup();
+            return CiState::Failed(names);
+        }
+
+        let green_names = || -> Vec<String> {
+            let mut names: Vec<String> = checks
+                .iter()
+                .filter(|c| c.get("conclusion").and_then(|x| x.as_str()) == Some("success"))
+                .filter_map(|c| c.get("name").and_then(|n| n.as_str()))
+                .chain(
+                    statuses
+                        .iter()
+                        .filter(|s| s.get("state").and_then(|x| x.as_str()) == Some("success"))
+                        .filter_map(|s| s.get("context").and_then(|n| n.as_str())),
+                )
+                .map(String::from)
+                .collect();
+            names.sort();
+            names.dedup();
+            names
+        };
+
+        // Anything still running (queued/in_progress, pending status) is a
+        // reason not to claim green even if some checks passed.
+        let pending = check_states("queued")
+            || check_states("in_progress")
+            || check_states("pending")
+            || status_states("pending");
+        if pending {
+            return CiState::Pending(green_names());
+        }
+
+        let green = green_names();
+        if green.is_empty() {
+            CiState::Unknown
+        } else {
+            CiState::Green(green)
+        }
+    }
+}
+
+/// Fetch the CI state of one commit, or [`CiState::Unknown`] when it cannot
+/// be read.
+///
+/// Permission errors (no `Checks: read`), network errors and empty configs
+/// all land in `Unknown` rather than propagating: the review must never fail
+/// because a context section couldn't load, and — critically — must never
+/// read a load failure as success.
+pub async fn ci_state_for(gh: &Client, repo: &str, sha: &str) -> CiState {
+    let checks = match gh.check_runs(repo, sha).await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!("ci state: check-runs of {repo}@{sha}: {e}");
+            return CiState::Unknown;
+        }
+    };
+    let statuses = match gh.commit_statuses(repo, sha).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!("ci state: statuses of {repo}@{sha}: {e}");
+            // The Checks half can still be meaningful on its own; only an
+            // empty union is Unknown.
+            return CiState::combine(&checks, &[]);
+        }
+    };
+    CiState::combine(&checks, &statuses)
+}
+
+/// The prompt section that states what CI already verified.
+///
+/// The binding rule is the fix for the recurring false positive (AstrBot #5
+/// and #64, both critical "SyntaxError" claims on code whose CI had passed):
+/// whether code compiles is CI's question, not the reviewer's. A reviewer
+/// with no execution environment who sees green CI and believes a syntax
+/// error should first doubt its own knowledge of the language version — new
+/// grammar is legal somewhere — and say so in `summary` instead of filing a
+/// critical finding.
+pub fn render_ci_section(state: &CiState, lang: Lang) -> Option<String> {
+    match state {
+        CiState::Green(names) => {
+            let list = names.join(", ");
+            Some(match lang {
+                Lang::En => format!(
+                    "## CI status (ground truth about whether the code builds)\n\n\
+CI has **passed** on this exact commit — compilation, imports and the test suite were \
+executed and succeeded ({list}). Do NOT report findings of the form \"this does not \
+compile\", \"invalid syntax\", or \"the module cannot be imported\": those are CI's \
+questions, and CI has already answered them. If you believe a construct is a syntax \
+error while CI is green, assume your knowledge of the language version is stale — newer \
+grammar (e.g. Python 3.14's paren-less multi-exception except) is legal — and at most \
+mention the doubt in `summary`, never as a finding."
+                ),
+                Lang::Zh => format!(
+                    "## CI 状态(关于代码能否编译的既定事实)\n\n\
+CI 已在本提交上**通过** —— 编译、导入与测试套件均已实际执行并成功({list})。\
+不要报告\"无法编译\"、\"语法非法\"、\"模块无法导入\"之类的 finding:这些是 CI 的问题,CI 已经作答。\
+若你认为某处是语法错误而 CI 全绿,应首先怀疑自己对语言版本的了解已过时 —— 新语法\
+(如 Python 3.14 允许无括号的多异常 except)是合法的 —— 至多在 `summary` 中提出疑问,\
+绝不能作为 finding 提出。"
+                ),
+            })
+        }
+        CiState::Failed(names) => {
+            let list = names.join(", ");
+            Some(match lang {
+                Lang::En => format!(
+                    "## CI status (ground truth about whether the code builds)\n\n\
+These checks **failed** on this commit: {list}. Do not re-report what a failing CI run \
+already proves; if you have something to say about those failures, add information the \
+CI log does not contain, and keep the severity honest — a CI failure that the author's \
+own checklist already explains is not a critical finding."
+                ),
+                Lang::Zh => format!(
+                    "## CI 状态(关于代码能否编译的既定事实)\n\n\
+以下检查在本提交上**失败**: {list}。不要重复报告失败的 CI 已经证明的问题;若对这些失败 \
+有补充,请提供 CI 日志中没有的信息,并保持严重度诚实 —— 作者说明里已解释的 CI 失败不是 \
+critical。"
+                ),
+            })
+        }
+        CiState::Pending(names) => {
+            let list = names.join(", ");
+            Some(match lang {
+                Lang::En => format!(
+                    "## CI status\n\n\
+CI has not reached a verdict yet (passed so far: {list}). Report code problems as code \
+problems; do not claim the code does or does not compile, and treat \"this will break \
+the build\" as a hypothesis to phrase in `summary`, not a finding."
+                ),
+                Lang::Zh => format!(
+                    "## CI 状态\n\n\
+CI 尚未给出结论(目前已通过: {list})。请以代码问题本身作答;不要断言代码能否编译,\
+\"这会破坏构建\"只能作为 `summary` 中的假设表述,不能作为 finding。"
+                ),
+            })
+        }
+        CiState::Unknown => None,
+    }
+}
+
+/// The CI section for a prompt: fetched from the PR's head, `None` when the
+/// state is unknown (no checks configured, or no permission to read them).
+pub async fn ci_section(
+    gh: &Client,
+    cfg: &Config,
+    repo: &str,
+    pr_number: i64,
+    lang: Lang,
+) -> Option<String> {
+    let sha = match gh.get_pr(repo, pr_number).await {
+        Ok(meta) => meta
+            .pointer("/head/sha")
+            .and_then(|s| s.as_str())
+            .map(String::from)?,
+        Err(e) => {
+            tracing::warn!("ci state: head sha of {repo}#{pr_number}: {e}");
+            return None;
+        }
+    };
+    let state = ci_state_for(gh, repo, &sha).await;
+    let section = render_ci_section(&state, lang)?;
     Some(truncate(&section, cfg.max_diff_chars / 4).0)
 }
 
@@ -1598,13 +1847,13 @@ parentheses."
     #[test]
     fn feedback_section_lands_in_the_prompt_after_the_previous_review() {
         let meta = serde_json::json!({"title": "T", "body": "B"});
-        let p = build_user_prompt_with_feedback(
+        let p = build_user_prompt_with_sections(
             "d",
             &meta,
             false,
             Some("prev review body"),
             None,
-            Some("## Author feedback\n\n- `f.rs`:1 — @bob: \"not a bug\""),
+            &["## Author feedback\n\n- `f.rs`:1 — @bob: \"not a bug\"".to_string()],
             Lang::En,
         );
         assert!(p.contains("Author feedback"), "{p}");
@@ -1623,6 +1872,100 @@ parentheses."
         assert_eq!(normalize_bot("xero-team-bot"), "xero-team-bot");
         assert_eq!(normalize_bot("xero-team-bot[bot]"), "xero-team-bot");
         assert_eq!(normalize_bot(" Xero-Team-Bot "), "xero-team-bot");
+    }
+
+    // ---- CI state ---------------------------------------------------------
+
+    fn check(name: &str, conclusion: &str) -> Value {
+        json!({"name": name, "conclusion": conclusion})
+    }
+
+    fn status(context: &str, state: &str) -> Value {
+        json!({"context": context, "state": state})
+    }
+
+    /// The false positive this whole section exists to prevent is a
+    /// "SyntaxError" critical on a commit whose CI ran green. The combine
+    /// rules must put every observable signal into that decision.
+    #[test]
+    fn ci_state_combines_checks_and_statuses() {
+        // All green across both APIs.
+        let s = CiState::combine(
+            &[check("build", "success"), check("tests", "success")],
+            &[status("coverage", "success")],
+        );
+        assert_eq!(
+            s,
+            CiState::Green(vec!["build".into(), "coverage".into(), "tests".into()]),
+            "{s:?}"
+        );
+
+        // A failure anywhere wins, and its name is reported.
+        let s = CiState::combine(&[check("build", "success"), check("tests", "failure")], &[]);
+        assert_eq!(s, CiState::Failed(vec!["tests".into()]), "{s:?}");
+        // Status-API failures count too.
+        let s = CiState::combine(&[check("build", "success")], &[status("lint", "error")]);
+        assert_eq!(s, CiState::Failed(vec!["lint".into()]), "{s:?}");
+
+        // Pending beats green: some checks passed but one is still running.
+        let s = CiState::combine(&[check("build", "success"), check("deploy", "queued")], &[]);
+        assert!(matches!(s, CiState::Pending(_)), "{s:?}");
+
+        // Nothing at all is Unknown — silence is not success.
+        assert_eq!(CiState::combine(&[], &[]), CiState::Unknown);
+        // A 403'd checks call with no statuses is also Unknown, not Green.
+        assert_eq!(CiState::combine(&[], &[]), CiState::Unknown);
+    }
+
+    /// The rendered section must bind the model: no compile findings on green
+    /// CI, and the newer-grammar hypothesis named (the AstrBot #5/#64 lesson).
+    #[test]
+    fn green_ci_section_forbids_compile_findings() {
+        let state = CiState::Green(vec!["build".into(), "pytest".into()]);
+        let en = render_ci_section(&state, Lang::En).expect("some");
+        assert!(en.contains("CI has **passed**"), "{en}");
+        assert!(en.contains("build, pytest"), "{en}");
+        assert!(en.contains("does not compile"), "{en}");
+        assert!(en.contains("Python 3.14"), "{en}");
+
+        let zh = render_ci_section(&state, Lang::Zh).expect("some");
+        assert!(zh.contains("CI 已在本提交上**通过**"), "{zh}");
+        assert!(zh.contains("不要报告"), "{zh}");
+    }
+
+    #[test]
+    fn failed_ci_section_names_the_failures() {
+        let state = CiState::Failed(vec!["tests".into()]);
+        let en = render_ci_section(&state, Lang::En).expect("some");
+        assert!(en.contains("tests"), "{en}");
+        assert!(en.contains("failed"), "{en}");
+    }
+
+    /// Unknown CI renders nothing: a review without signal stays quiet about
+    /// CI rather than inventing one.
+    #[test]
+    fn unknown_ci_is_no_section() {
+        assert_eq!(render_ci_section(&CiState::Unknown, Lang::En), None);
+        assert_eq!(render_ci_section(&CiState::Unknown, Lang::Zh), None);
+    }
+
+    /// The scope rule now lives in both language briefs, so neither language
+    /// produces the compile-findings false positive.
+    #[test]
+    fn system_prompt_draws_the_ci_scope_boundary() {
+        for p in [system_prompt(Lang::En), system_prompt(Lang::Zh)] {
+            assert!(p.contains("CI"), "{p}");
+        }
+        assert!(
+            system_prompt(Lang::En).contains("does not compile"),
+            "{}",
+            system_prompt(Lang::En)
+        );
+        assert!(
+            system_prompt(Lang::Zh).contains("无法编译"),
+            "{}",
+            system_prompt(Lang::Zh)
+        );
     }
 
     /// Both briefs must describe the same schema, or one language silently

@@ -406,7 +406,7 @@ fn build_review_prompt(
     meta: &Value,
     previous_review: Option<&str>,
     new_commits: Option<&str>,
-    feedback: Option<&str>,
+    sections: &[String],
     lang: Lang,
 ) -> String {
     let title = meta.get("title").and_then(|t| t.as_str()).unwrap_or("");
@@ -435,29 +435,40 @@ fn build_review_prompt(
             )
         })
         .unwrap_or_default();
-    let feedback_section = feedback.map(|f| format!("\n{f}\n")).unwrap_or_default();
+    // Rendered sections (CI status, author feedback) ride in the same order
+    // the API engines append them: each section's claims are about the
+    // context above it.
+    let extra = sections
+        .iter()
+        .map(|s| format!("\n{s}\n"))
+        .collect::<String>();
     let base = base_ref(meta);
     t!(
         lang,
         "Review the changes in PR #{pr_number} of the repository checked out here ({repo}).\n\
-PR title: {title}\nPR description: {body}{prev}{commits}{feedback_section}\n\
+PR title: {title}\nPR description: {body}{prev}{commits}{extra}\n\
 The working tree is at this PR's head commit; the base branch is origin/{base}. Use \
 `git diff origin/{base}...HEAD` or read the files to see the change.\n\n\
 Requirements:\n\
 1. Get a quick sense of the project first (root layout, build config, the modules involved), then review the change.\n\
 2. Report only real problems, graded by risk.\n\
-3. Your final output must be strict JSON (no explanatory prose, no markdown fence), schema:\n\
+3. Do NOT report \"invalid syntax\" / \"does not compile\" / \"cannot be imported\" findings: \
+whether the code compiles is CI's question, and you have no execution environment. When the \
+CI section says green, such a claim is wrong by construction — your first hypothesis for a \
+construct you don't recognize should be newer language grammar.\n\
+4. Your final output must be strict JSON (no explanatory prose, no markdown fence), schema:\n\
 {{\"summary\": \"one-sentence overall assessment (in English)\", \"findings\": [{{\"severity\": \"critical|high|medium|low|info\", \"title\": \"short title\", \"file\": \"file path\", \"line\": line number, \"description\": \"description (in English)\", \"suggestion\": \"fix (in English)\"}}]}}\n\
-4. If there is nothing to report, `findings` is an empty array. Output the JSON only.",
+5. If there is nothing to report, `findings` is an empty array. Output the JSON only.",
         "请审查当前仓库中 PR #{pr_number} 的改动({repo})。\n\
-PR 标题: {title}\nPR 描述: {body}{prev}{commits}{feedback_section}\n\
+PR 标题: {title}\nPR 描述: {body}{prev}{commits}{extra}\n\
 改动内容: 本仓库工作区已检出该 PR 的最新提交,基准分支为 origin/{base}。请用 `git diff origin/{base}...HEAD` 或读取文件来查看改动。\n\n\
 要求:\n\
 1. 先快速了解项目结构(根目录、构建配置、相关模块),再审查改动。\n\
 2. 只报告真实问题,按风险分级。\n\
-3. 最终输出必须是严格的 JSON(无解释文字、无 markdown 围栏),schema:\n\
+3. 不要报告\"语法非法\"/\"无法编译\"/\"无法导入\"类 finding: 代码能否编译是 CI 的问题,而你没有执行环境。CI 段显示通过时,这类断言必然错误 —— 对不认识的结构,第一假设应当是新的语言语法。\n\
+4. 最终输出必须是严格的 JSON(无解释文字、无 markdown 围栏),schema:\n\
 {{\"summary\": \"一句话总体评价(中文)\", \"findings\": [{{\"severity\": \"critical|high|medium|low|info\", \"title\": \"简短标题\", \"file\": \"文件路径\", \"line\": 行号, \"description\": \"描述(中文)\", \"suggestion\": \"修复建议(中文)\"}}]}}\n\
-4. 若无问题, findings 为空数组。只输出 JSON。"
+5. 若无问题, findings 为空数组。只输出 JSON。"
     )
 }
 
@@ -587,15 +598,18 @@ async fn run_pi_inner(
     let (previous_review, new_commits) =
         crate::review::fetch_incremental_context(gh, repo, pr_number, cfg.max_diff_chars).await;
     // Same learning source as the API engines: a rebuttal the author wrote
-    // into an inline thread stops being re-reported here too.
+    // into an inline thread stops being re-reported here too. The CI state
+    // rides along for the same reason it does for builtin/agent.
     let feedback = crate::review::author_feedback_section(gh, cfg, repo, pr_number, lang).await;
+    let ci = crate::review::ci_section(gh, cfg, repo, pr_number, lang).await;
+    let sections: Vec<String> = [ci, feedback].into_iter().flatten().collect();
     let prompt = build_review_prompt(
         repo,
         pr_number,
         &meta,
         previous_review.as_deref(),
         new_commits.as_deref(),
-        feedback.as_deref(),
+        &sections,
         lang,
     );
 
@@ -706,13 +720,15 @@ async fn run_codex_inner(
     let (previous_review, new_commits) =
         crate::review::fetch_incremental_context(gh, repo, pr_number, cfg.max_diff_chars).await;
     let feedback = crate::review::author_feedback_section(gh, cfg, repo, pr_number, lang).await;
+    let ci = crate::review::ci_section(gh, cfg, repo, pr_number, lang).await;
+    let sections: Vec<String> = [ci, feedback].into_iter().flatten().collect();
     let prompt = build_review_prompt(
         repo,
         pr_number,
         &meta,
         previous_review.as_deref(),
         new_commits.as_deref(),
-        feedback.as_deref(),
+        &sections,
         lang,
     );
 
@@ -851,7 +867,10 @@ mod tests {
             &meta,
             Some("上一轮: X"),
             Some("fix: y"),
-            Some("## 作者对上一轮审查的反馈"),
+            &[
+                "## CI 状态".to_string(),
+                "## 作者对上一轮审查的反馈".to_string(),
+            ],
             Lang::Zh,
         );
         assert!(p.contains("PR #7"));
@@ -859,6 +878,7 @@ mod tests {
         assert!(p.contains("上一轮: X"));
         assert!(p.contains("fix: y"));
         assert!(p.contains("作者对上一轮审查的反馈"));
+        assert!(p.contains("CI 状态"));
         assert!(p.contains("findings"));
 
         let en = build_review_prompt(
@@ -867,13 +887,14 @@ mod tests {
             &meta,
             Some("prev: X"),
             Some("fix: y"),
-            Some("## Author feedback"),
+            &["## CI status".to_string(), "## Author feedback".to_string()],
             Lang::En,
         );
         assert!(en.contains("PR #7"), "{en}");
         assert!(en.contains("findings"), "{en}");
         assert!(en.contains("in English"), "{en}");
         assert!(en.contains("Author feedback"), "{en}");
+        assert!(en.contains("CI status"), "{en}");
         assert!(
             !en.chars().any(|c| ('\u{4E00}'..='\u{9FFF}').contains(&c)),
             "{en}"
@@ -888,7 +909,7 @@ mod tests {
             "title": "t", "body": "b", "base": {"ref": "develop"}
         });
         for lang in [Lang::En, Lang::Zh] {
-            let p = build_review_prompt("o/r", 1, &meta, None, None, None, lang);
+            let p = build_review_prompt("o/r", 1, &meta, None, None, &[], lang);
             assert!(p.contains("origin/develop...HEAD"), "{p}");
             assert!(!p.contains("origin/main"), "{p}");
         }

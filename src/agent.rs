@@ -52,7 +52,13 @@ Severity guide: critical=security hole (injection/RCE/auth bypass/data loss); hi
 bug/resource leak/race/core functionality broken; medium=edge case/missing error handling; \
 low=style/maintainability; info=suggestion/question/nit. If there is nothing to report, \
 `findings` is an empty array. If a \"Previous review\" section is provided, check which of \
-those were fixed and don't repeat findings that are already resolved.";
+those were fixed and don't repeat findings that are already resolved.
+
+Scope: whether the code compiles, parses or imports is CI's question, not yours — you have \
+no execution environment and may not know the project's language version. Never report \
+\"invalid syntax\" / \"does not compile\" / \"cannot be imported\" as a finding; when a CI \
+section says the checks passed, such a claim is wrong by construction, and your first \
+hypothesis should be that a construct you don't recognize is newer language grammar.";
 
 const AGENT_SYSTEM_PROMPT_ZH: &str = "\
 你是一名资深、严谨的代码审查员,在 GitHub PR 审查工作流中工作。
@@ -74,7 +80,9 @@ submit_review 的 verdict 参数必须符合 schema:
    \"line\": 整数行号(改动新增行之一,若不适用填1),
    \"description\": \"问题描述与潜在影响(中文)\", \"suggestion\": \"具体修复建议(中文)\"}]}
 
-severity 标准: critical=安全漏洞(注入/RCE/鉴权绕过/数据丢失); high=逻辑bug/资源泄漏/竞态/核心功能损坏; medium=边界条件/错误处理缺失; low=风格/可维护性; info=建议/疑问/nit。若无问题, findings 为空数组。若提供\"上一轮审查意见\",核对哪些已修复、避免重复已解决的发现。";
+severity 标准: critical=安全漏洞(注入/RCE/鉴权绕过/数据丢失); high=逻辑bug/资源泄漏/竞态/核心功能损坏; medium=边界条件/错误处理缺失; low=风格/可维护性; info=建议/疑问/nit。若无问题, findings 为空数组。若提供\"上一轮审查意见\",核对哪些已修复、避免重复已解决的发现。
+
+职责边界: 代码能否编译/解析/导入是 CI 的问题,不是你的 —— 你没有执行环境,也未必了解项目的语言版本。绝不要把\"语法非法\"/\"无法编译\"/\"无法导入\"作为 finding 提出;若 CI 段显示通过,这类断言必然错误,你的第一假设应当是你不认识的结构是新的语言语法。";
 
 /// The tools the model gets, as `(name, description, JSON-Schema parameters)`.
 ///
@@ -424,8 +432,11 @@ pub async fn run_agent(
         crate::review::fetch_incremental_context(gh, repo, pr_number, cfg.max_diff_chars).await;
     // The author's recorded disagreements with the previous round — same
     // learning source as the builtin engine, so neither engine re-reports a
-    // rebutted finding the other already dropped.
+    // rebutted finding the other already dropped. The CI state rides along:
+    // it is the fence against the "SyntaxError on green CI" false positive
+    // (AstrBot #5, #64).
     let feedback = crate::review::author_feedback_section(gh, cfg, repo, pr_number, lang).await;
+    let ci = crate::review::ci_section(gh, cfg, repo, pr_number, lang).await;
 
     let title = meta.get("title").and_then(|t| t.as_str()).unwrap_or("");
     let body: String = meta
@@ -460,11 +471,12 @@ pub async fn run_agent(
     };
 
     let feedback_section = feedback.map(|f| format!("\n{f}\n")).unwrap_or_default();
+    let ci_section_text = ci.map(|f| format!("\n{f}\n")).unwrap_or_default();
     let user_prompt = t!(
         lang,
-        "Repository: {repo}\nBase branch: {base_ref}\nPR title: {title}\nPR description: {body}{prev_section}{commits_section}{feedback_section}\n\n\
+        "Repository: {repo}\nBase branch: {base_ref}\nPR title: {title}\nPR description: {body}{prev_section}{commits_section}{ci_section_text}{feedback_section}\n\n\
 Use the tools to learn the project's structure first, then review the diff below{trunc_note}. Call submit_review when you're done:\n\n{diff}",
-        "仓库: {repo}\n基准分支: {base_ref}\nPR 标题: {title}\nPR 描述: {body}{prev_section}{commits_section}{feedback_section}\n\n\
+        "仓库: {repo}\n基准分支: {base_ref}\nPR 标题: {title}\nPR 描述: {body}{prev_section}{commits_section}{ci_section_text}{feedback_section}\n\n\
 先用工具了解项目结构,再审查以下 diff{trunc_note}。完成后调用 submit_review 提交:\n\n{diff}"
     );
 

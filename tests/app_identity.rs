@@ -338,3 +338,82 @@ async fn author_pushback_collects_thread_replies_and_downvotes() {
         "{section}"
     );
 }
+
+/// The CI fence, end to end: a PR whose head commit's checks are green
+/// produces a prompt section that binds the reviewer — "CI passed" is a fact
+/// the model must respect, the exact fence against the AstrBot #5/#64
+/// "SyntaxError on green CI" critical false positives.
+#[tokio::test]
+async fn green_ci_renders_the_binding_section() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/repos/octocat/hello/pulls/7"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "head": {"sha": "abc123"}
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/octocat/hello/commits/abc123/check-runs"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "check_runs": [
+                {"name": "build", "conclusion": "success"},
+                {"name": "pytest", "conclusion": "success"}
+            ]
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/octocat/hello/commits/abc123/statuses"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            {"context": "coverage", "state": "success"}
+        ])))
+        .mount(&server)
+        .await;
+
+    let gh = client_for(&server, "xero-review");
+    let cfg = test_cfg();
+    let section =
+        xero_bot::review::ci_section(&gh, &cfg, "octocat/hello", 7, xero_bot::lang::Lang::En)
+            .await
+            .expect("green CI must render a section");
+    assert!(section.contains("CI has **passed**"), "{section}");
+    assert!(section.contains("build, coverage, pytest"), "{section}");
+    assert!(
+        section.contains("does not compile"),
+        "the binding rule must be in the prompt: {section}"
+    );
+}
+
+/// A commit with no CI at all renders no section — silence is never
+/// presented to the model as success.
+#[tokio::test]
+async fn a_commit_with_no_ci_renders_nothing() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/repos/octocat/hello/pulls/7"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "head": {"sha": "abc123"}
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/octocat/hello/commits/abc123/check-runs"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"check_runs": []})))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/octocat/hello/commits/abc123/statuses"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .mount(&server)
+        .await;
+
+    let gh = client_for(&server, "xero-review");
+    let cfg = test_cfg();
+    let section =
+        xero_bot::review::ci_section(&gh, &cfg, "octocat/hello", 7, xero_bot::lang::Lang::En).await;
+    assert_eq!(
+        section, None,
+        "no CI is Unknown, and Unknown renders nothing"
+    );
+}
