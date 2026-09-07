@@ -1,7 +1,7 @@
 //! Self-hosted server (Docker / VPS): axum HTTP server.
 //!
 //! Routes:
-//!   POST /webhook  — GitHub App webhook (same logic as the Vercel function)
+//!   POST /webhook  — GitHub App webhook receiver
 //!   GET  /health   — liveness
 //!   GET  /cron     — rebase sweep (protect with CRON_SECRET, or bind to
 //!                    localhost and drive it with an external cron)

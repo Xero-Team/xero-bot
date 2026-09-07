@@ -6,9 +6,7 @@ FROM rust:1-slim-bookworm AS builder
 WORKDIR /build
 # cache deps
 COPY Cargo.toml Cargo.lock ./
-COPY vendor ./vendor
 COPY src ./src
-COPY api ./api
 RUN cargo build --release --bin server
 
 # ---- runtime stage ----

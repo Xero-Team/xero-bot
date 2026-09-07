@@ -8,7 +8,6 @@ license = "MIT"
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 axum = "0.8"
-vercel_runtime = { version = "2.4", features = ["axum"] }
 octocrab = "0.44"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1.0", features = ["derive"] }
@@ -36,29 +35,10 @@ wiremock = "0.6"
 tokio-test = "0.4"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking"] }
 
-# vendored vercel_runtime 2.4.0: upstream compiles on unix only (std::env
-# imported under #[cfg(unix)] but env::var used unconditionally). One-line
-# fix; behaviour otherwise identical. See vendor/vercel_runtime/src/lib.rs.
-[patch.crates-io]
-vercel_runtime = { path = "vendor/vercel_runtime" }
-
 # --- self-hosted server binary (docker / VPS) ---
 [[bin]]
 name = "server"
 path = "src/main.rs"
-
-# --- Vercel function entrypoints ---
-[[bin]]
-name = "webhook"
-path = "api/webhook.rs"
-
-[[bin]]
-name = "cron"
-path = "api/cron.rs"
-
-[[bin]]
-name = "health"
-path = "api/health.rs"
 
 [profile.release]
 codegen-units = 1
