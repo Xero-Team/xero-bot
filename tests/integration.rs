@@ -4,7 +4,7 @@
 //! flows run end-to-end without touching real GitHub.
 
 use serde_json::{json, Value};
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use xero_bot::commands::parse_commands;
@@ -157,10 +157,22 @@ async fn test_ready_label_flow_with_mock() {
         .expect(1)
         .mount(&server)
         .await;
+    // Ready on a PR now asks who is attached as reviewer. Nobody is, and no
+    // past reviewer exists either, so the reply says how to pick one.
+    Mock::given(method("GET"))
+        .and(path("/repos/octocat/hello/pulls/7/requested_reviewers"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"users": []})))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/octocat/hello/pulls/7/reviews"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .mount(&server)
+        .await;
     Mock::given(method("POST"))
         .and(path("/repos/octocat/hello/issues/7/comments"))
         .respond_with(ResponseTemplate::new(201).set_body_json(json!({"id": 1})))
-        .expect(1)
+        .expect(2) // status update + the how-to-pick-a-reviewer note
         .mount(&server)
         .await;
 
@@ -183,6 +195,246 @@ async fn test_ready_label_flow_with_mock() {
         installation_id: 42,
         is_pr: true,
         lang: xero_bot::lang::Lang::Zh,
+    };
+    let results = xero_bot::handlers::handle_comment(
+        &gh,
+        &cfg,
+        &ctx,
+        vec![xero_bot::commands::Command::Ready],
+        vec![],
+    )
+    .await;
+    assert_eq!(results, vec!["ok"]);
+}
+
+/// The case behind the feature: a reviewer added by hand in the GitHub UI.
+/// `?r` must re-request them — that POST is what pings them — and say who it
+/// pinged.
+#[tokio::test]
+async fn ready_re_requests_the_hand_picked_reviewer() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/repos/octocat/hello/issues/7/labels"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/repos/octocat/hello/issues/7/labels"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .mount(&server)
+        .await;
+    // Carol was added as a reviewer by hand.
+    Mock::given(method("GET"))
+        .and(path("/repos/octocat/hello/pulls/7/requested_reviewers"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"users": [{"login": "carol"}]})),
+        )
+        .mount(&server)
+        .await;
+    // The re-request is the notification.
+    Mock::given(method("POST"))
+        .and(path("/repos/octocat/hello/pulls/7/requested_reviewers"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({"requested_reviewers": []})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/repos/octocat/hello/issues/7/comments"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({"id": 1})))
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let crab = xero_bot::github::client_builder()
+        .personal_token("ghp_test")
+        .base_uri(server.uri())
+        .unwrap()
+        .build()
+        .unwrap();
+    let gh = Client {
+        crab,
+        app_slug: "xero-review".into(),
+    };
+    let cfg = test_cfg();
+    let ctx = xero_bot::handlers::CommentContext {
+        repo: "octocat/hello".into(),
+        pr_number: 7,
+        commenter: "alice".into(),
+        pr_author: "bob".into(),
+        installation_id: 42,
+        is_pr: true,
+        lang: xero_bot::lang::Lang::En,
+    };
+    let results = xero_bot::handlers::handle_comment(
+        &gh,
+        &cfg,
+        &ctx,
+        vec![xero_bot::commands::Command::Ready],
+        vec![],
+    )
+    .await;
+    assert_eq!(results, vec!["ok"]);
+
+    // The nudge names the reviewer, and the re-request body carried them.
+    let requests = server.received_requests().await.unwrap();
+    let re_request = requests
+        .iter()
+        .find(|r| r.url.path().ends_with("/requested_reviewers") && r.method == "POST")
+        .expect("the reviewer must be re-requested");
+    let body = serde_json::from_slice::<Value>(&re_request.body).unwrap();
+    assert_eq!(body["reviewers"], json!(["carol"]));
+    // The last comment is the reviewer nudge; the first is the status update.
+    let comment = requests
+        .iter()
+        .rev()
+        .find(|r| r.url.path().ends_with("/comments"))
+        .map(|r| {
+            serde_json::from_slice::<Value>(&r.body).unwrap()["body"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .expect("a confirmation comment");
+    assert!(comment.contains("@carol"), "{comment}");
+}
+
+/// With no reviewer attached, a past CHANGES_REQUESTED review is the next
+/// best answer to "who should look at this" — that's the person who asked
+/// for changes, and `?r` is the moment they asked for.
+#[tokio::test]
+async fn ready_falls_back_to_the_past_reviewer() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/repos/octocat/hello/issues/7/labels"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/repos/octocat/hello/issues/7/labels"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .mount(&server)
+        .await;
+    // Nobody is currently requested...
+    Mock::given(method("GET"))
+        .and(path("/repos/octocat/hello/pulls/7/requested_reviewers"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"users": []})))
+        .mount(&server)
+        .await;
+    // ...but carol left a CHANGES_REQUESTED review, and the author left a
+    // COMMENTED one — only carol counts.
+    Mock::given(method("GET"))
+        .and(path("/repos/octocat/hello/pulls/7/reviews"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            {"state": "CHANGES_REQUESTED", "user": {"login": "carol"}},
+            {"state": "COMMENTED", "user": {"login": "bob"}}
+        ])))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/repos/octocat/hello/pulls/7/requested_reviewers"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({"requested_reviewers": []})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/repos/octocat/hello/issues/7/comments"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({"id": 1})))
+        .mount(&server)
+        .await;
+
+    let crab = xero_bot::github::client_builder()
+        .personal_token("ghp_test")
+        .base_uri(server.uri())
+        .unwrap()
+        .build()
+        .unwrap();
+    let gh = Client {
+        crab,
+        app_slug: "xero-review".into(),
+    };
+    let cfg = test_cfg();
+    let ctx = xero_bot::handlers::CommentContext {
+        repo: "octocat/hello".into(),
+        pr_number: 7,
+        // alice runs `?r`; carol is the person who left the changes-requested
+        // review, and so the one to nudge.
+        commenter: "alice".into(),
+        pr_author: "bob".into(),
+        installation_id: 42,
+        is_pr: true,
+        lang: xero_bot::lang::Lang::En,
+    };
+    let results = xero_bot::handlers::handle_comment(
+        &gh,
+        &cfg,
+        &ctx,
+        vec![xero_bot::commands::Command::Ready],
+        vec![],
+    )
+    .await;
+    assert_eq!(results, vec!["ok"]);
+
+    let requests = server.received_requests().await.unwrap();
+    let re_request = requests
+        .iter()
+        .find(|r| r.url.path().ends_with("/requested_reviewers") && r.method == "POST")
+        .expect("the past reviewer must be re-requested");
+    let body = serde_json::from_slice::<Value>(&re_request.body).unwrap();
+    assert_eq!(body["reviewers"], json!(["carol"]));
+}
+
+/// `?r` on an issue stays what it always was — a label and nothing else.
+/// There are no reviewers on an issue, so the notification machinery must
+/// not run at all.
+#[tokio::test]
+async fn ready_on_an_issue_does_not_touch_the_reviewers_endpoints() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/repos/octocat/hello/issues/7/labels"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/repos/octocat/hello/issues/7/labels"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/repos/octocat/hello/issues/7/comments"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({"id": 1})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    // The pulls endpoints must not be asked, and nothing must be posted to
+    // them even by accident.
+    Mock::given(method("GET"))
+        .and(path_regex(r".*/pulls/7/requested_reviewers$"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"users": []})))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let crab = xero_bot::github::client_builder()
+        .personal_token("ghp_test")
+        .base_uri(server.uri())
+        .unwrap()
+        .build()
+        .unwrap();
+    let gh = Client {
+        crab,
+        app_slug: "xero-review".into(),
+    };
+    let cfg = test_cfg();
+    let ctx = xero_bot::handlers::CommentContext {
+        repo: "octocat/hello".into(),
+        pr_number: 7,
+        commenter: "alice".into(),
+        pr_author: "bob".into(),
+        installation_id: 42,
+        is_pr: false,
+        lang: xero_bot::lang::Lang::En,
     };
     let results = xero_bot::handlers::handle_comment(
         &gh,

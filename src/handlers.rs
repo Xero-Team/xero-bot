@@ -562,6 +562,9 @@ async fn request_review(gh: &Client, ctx: &CommentContext, user: &str) -> String
 }
 
 /// ready/author/blocked: add one status label, remove its siblings.
+///
+/// `ready` on a PR additionally notifies whoever is expected to review — see
+/// [`notify_ready_reviewers`]; a label alone reaches nobody.
 async fn set_status_label(gh: &Client, cfg: &Config, ctx: &CommentContext, cmd: Command) -> String {
     let lang = ctx.lang;
     let (add, label_desc) = match cmd {
@@ -623,9 +626,128 @@ async fn set_status_label(gh: &Client, cfg: &Config, ctx: &CommentContext, cmd: 
             .await;
     }
     if ok {
+        if let Command::Ready = cmd {
+            // On a PR the label is half the job: it says "waiting for
+            // review" but notifies nobody. The reviewers endpoint is what
+            // pings a human, so find who that should be and request them.
+            if ctx.is_pr {
+                notify_ready_reviewers(gh, ctx).await;
+            }
+        }
         "ok".into()
     } else {
         "error".into()
+    }
+}
+
+/// A bare `?r`/`ready` has to reach a reviewer somehow.
+///
+/// The order of attempts is who is already attached to the PR, because the
+/// question "who should look at this?" has usually already been answered:
+///
+/// 1. **open review requests** — the PR's Reviewers field, whether filled by
+///    this bot's `r?` or by hand in the GitHub UI. Re-requesting a reviewer
+///    who is already listed re-pings them; this is the path that makes a
+///    hand-picked reviewer actually receive the ready nudge.
+/// 2. **past human reviewers** — anyone who left a CHANGES_REQUESTED or
+///    APPROVED review. They asked for changes; "ready" is the moment they
+///    asked for.
+///
+/// If neither names anyone, the reply says so and asks for `?r @user` — a
+/// PR with no reviewer history has no one to guess.
+async fn notify_ready_reviewers(gh: &Client, ctx: &CommentContext) {
+    let lang = ctx.lang;
+    let who = match gh.requested_reviewers(&ctx.repo, ctx.pr_number).await {
+        Ok(users) if !users.is_empty() => users,
+        Ok(_) => match gh.list_pr_reviews(&ctx.repo, ctx.pr_number).await {
+            Ok(reviews) => {
+                let mut seen: Vec<String> = Vec::new();
+                for r in &reviews {
+                    let state = r.get("state").and_then(|s| s.as_str()).unwrap_or("");
+                    if state != "CHANGES_REQUESTED" && state != "APPROVED" {
+                        continue;
+                    }
+                    let login = r
+                        .pointer("/user/login")
+                        .and_then(|l| l.as_str())
+                        .unwrap_or("");
+                    // The bot's own approval (r+) is not a reviewer to ping,
+                    // and neither is the PR author or the person typing ?r.
+                    if login.is_empty()
+                        || crate::github::normalize_login(login).is_empty()
+                        || login.ends_with("[bot]")
+                        || crate::github::normalize_login(login)
+                            == crate::github::normalize_login(&ctx.pr_author)
+                        || login.eq_ignore_ascii_case(&ctx.commenter)
+                        || seen.iter().any(|s| s.eq_ignore_ascii_case(login))
+                    {
+                        continue;
+                    }
+                    seen.push(login.to_string());
+                }
+                seen
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "ready: past reviewers of {}#{}: {e}",
+                    ctx.repo,
+                    ctx.pr_number
+                );
+                Vec::new()
+            }
+        },
+        Err(e) => {
+            tracing::warn!(
+                "ready: requested reviewers of {}#{}: {e}",
+                ctx.repo,
+                ctx.pr_number
+            );
+            Vec::new()
+        }
+    };
+
+    if who.is_empty() {
+        let body = t!(
+            lang,
+            "ℹ️ No reviewer is attached to this PR yet — say `?r @user` (or `r? @user`) \
+to pick one and they'll be notified.",
+            "ℹ️ 本 PR 还没有挂 reviewer —— 用 `?r @用户`(或 `r? @用户`)指定一个,对方会收到通知。"
+        );
+        let _ = gh.post_issue_comment(&ctx.repo, ctx.pr_number, &body).await;
+        return;
+    }
+
+    // Re-requesting an already-listed reviewer is how GitHub nudges them, so
+    // this POST is the notification, not a bookkeeping step. A failure here is
+    // not fatal — the label was still set — but the reader deserves the truth
+    // rather than a silent skip.
+    match gh.request_reviewers(&ctx.repo, ctx.pr_number, &who).await {
+        Ok(_) => {
+            let mentions = who
+                .iter()
+                .map(|u| format!("@{u}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let body = t!(
+                lang,
+                "🔔 {mentions} — the PR is marked ready for review.",
+                "🔔 {mentions} —— 本 PR 已标记为等待审查。"
+            );
+            let _ = gh.post_issue_comment(&ctx.repo, ctx.pr_number, &body).await;
+        }
+        Err(e) => {
+            tracing::warn!(
+                "ready: re-request of {who:?} on {}#{}: {e}",
+                ctx.repo,
+                ctx.pr_number
+            );
+            let body = t!(
+                lang,
+                "⚠️ The PR is marked ready, but notifying the reviewer(s) failed: `{e}`",
+                "⚠️ 已标记为等待审查,但通知 reviewer 失败: `{e}`"
+            );
+            let _ = gh.post_issue_comment(&ctx.repo, ctx.pr_number, &body).await;
+        }
     }
 }
 

@@ -735,6 +735,30 @@ impl Client {
             .unwrap_or_default())
     }
 
+    /// The review requests currently open on a pull request.
+    ///
+    /// A user added as a reviewer by hand — the GitHub UI's "Reviewers"
+    /// control, not this bot — sits here. `?r`'s notification story depends on
+    /// reading it: a label notifies nobody, but re-requesting these logins
+    /// pings each of them.
+    pub async fn requested_reviewers(
+        &self,
+        repo: &str,
+        number: i64,
+    ) -> Result<Vec<String>, GhError> {
+        let v = self
+            .get(&format!("/repos/{repo}/pulls/{number}/requested_reviewers"))
+            .await?;
+        Ok(v.get("users")
+            .and_then(|a| a.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|u| u.get("login").and_then(|l| l.as_str()).map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
     /// Publish a review (COMMENT event) with inline comments, degrading in the
     /// one direction that is safe.
     ///
