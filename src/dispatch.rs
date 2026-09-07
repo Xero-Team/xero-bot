@@ -1,5 +1,4 @@
-//! Shared webhook dispatch used by both entry modes (Vercel function and
-//! self-hosted axum server).
+//! Webhook dispatch, shared by the axum server's /webhook handler.
 
 use serde_json::Value;
 
@@ -50,8 +49,7 @@ pub fn route_event(cfg: &Config, event_header: &str, payload: &Value) -> Routing
 
             // The parser indexes into arbitrary user text. A panic here would kill
             // the webhook response, and GitHub redelivers on failure — so a single
-            // bad comment becomes a loop. Contain it at the only entry point both
-            // the axum server and the Vercel function share.
+            // bad comment becomes a loop. Contain it at the entry point.
             let parsed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 parse_commands(&cfg.bot_name, &comment_body)
             }));
@@ -75,7 +73,19 @@ pub fn route_event(cfg: &Config, event_header: &str, payload: &Value) -> Routing
             // `@bot reviwe` produces nothing to run and one thing to say. Saying
             // it is the point — silently dropping near-misses is what left users
             // believing a mistyped command had worked.
-            if parsed.commands.is_empty() && diagnostics.is_empty() {
+            //
+            // A bare command with no mention (`review`, `r+`) is the other
+            // case worth carrying: once a session has been opened on this
+            // issue with one real `@bot` command, the session's commands
+            // don't need the mention anymore. Whether that session is in
+            // fact open is only knowable from the API, so the candidate
+            // travels in the work item and is checked when it executes.
+            let bare = if parsed.commands.is_empty() && diagnostics.is_empty() {
+                crate::commands::bare_command_candidate(&comment_body)
+            } else {
+                None
+            };
+            if parsed.commands.is_empty() && diagnostics.is_empty() && bare.is_none() {
                 return Routing::Respond(serde_json::json!({"ignored": "no command"}));
             }
             // Issues used to be rejected wholesale, which is how `@bot claim`
@@ -98,6 +108,7 @@ pub fn route_event(cfg: &Config, event_header: &str, payload: &Value) -> Routing
                 commands: parsed.commands,
                 diagnostics,
                 comment_lang,
+                bare,
             })
         }
         WebhookEvent::PullRequest {
@@ -158,6 +169,12 @@ pub enum Work {
         /// The language of the triggering comment, if it said. Only consulted
         /// when the commits don't settle it.
         comment_lang: Option<crate::lang::Lang>,
+        /// A command this comment *could* be, if its author's session on this
+        /// issue is open (see [`crate::commands::bare_command_candidate`]).
+        /// `None` for everything else, so the session check below — one
+        /// paginated API call — only ever runs for comments shaped like a
+        /// bare command.
+        bare: Option<crate::commands::Command>,
     },
     RebaseCheck {
         repo: String,
@@ -170,6 +187,46 @@ pub enum Work {
         pr_number: i64,
         installation_id: i64,
     },
+}
+
+/// Has `commenter` ever commanded the bot on this issue?
+///
+/// A session opens the moment one of the user's comments parses into
+/// commands with the bot addressed — a mention plus a verb, or one of the
+/// mention-free forms the parser accepts anywhere (`r? @user`, `?r`). It
+/// never closes: the PR's comment history is the state, and GitHub keeps it
+/// longer than any cache would.
+///
+/// The scan reads only the requester's own comments; a colleague's commands
+/// don't open someone else's session. First hit wins, so on an active PR the
+/// usual cost is one paginated read of recent comments.
+async fn session_open(
+    gh: &Client,
+    cfg: &Config,
+    repo: &str,
+    issue: i64,
+    commenter: &str,
+) -> Result<bool, String> {
+    let comments = gh
+        .list_issue_comments(repo, issue)
+        .await
+        .map_err(|e| e.to_string())?;
+    for c in &comments {
+        let author = c
+            .pointer("/user/login")
+            .and_then(|l| l.as_str())
+            .unwrap_or("");
+        if !author.eq_ignore_ascii_case(commenter) {
+            continue;
+        }
+        let Some(body) = c.get("body").and_then(|b| b.as_str()) else {
+            continue;
+        };
+        if !parse_commands(&cfg.bot_name, body).commands.is_empty() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Execute background work. Never panics; all errors are logged.
@@ -192,10 +249,12 @@ async fn execute_work_inner(cfg: &Config, work: Work) -> Result<(), String> {
             commands,
             diagnostics,
             comment_lang,
+            bare,
         } => {
             let gh = Client::installation_resolved(cfg, installation_id)
                 .await
                 .map_err(|e| format!("installation client: {e}"))?;
+
             // An issue has no commits, and asking for them is a guaranteed 404
             // per comment, so the comment is the only signal there is.
             let lang = if is_pr {
@@ -203,6 +262,51 @@ async fn execute_work_inner(cfg: &Config, work: Work) -> Result<(), String> {
             } else {
                 comment_lang.unwrap_or_default()
             };
+
+            // The no-mention path. The comment carried a bare command
+            // candidate and nothing else the parser recognized, so this is
+            // the one point where "does this user have a session here?" is
+            // worth an API call: scan their comments on this issue for one
+            // that parsed as commands when addressed to the bot. Their
+            // earlier comment is the session opener; the flag lives in
+            // GitHub, so it survives restarts and needs no database.
+            let mut commands = commands;
+            if commands.is_empty() && diagnostics.is_empty() {
+                if let Some(cmd) = bare {
+                    match session_open(&gh, cfg, &repo, pr_number, &commenter).await {
+                        Ok(true) => commands.push(cmd),
+                        Ok(false) => {
+                            tracing::info!(
+                                "bare command by @{commenter} on {repo}#{pr_number} ignored: \
+                                 no session (mention @{bot} once to open one)",
+                                bot = cfg.bot_name
+                            );
+                            // The comment *looks* like a command, so silence
+                            // reads as a broken bot. One line teaching the
+                            // one-mention rule, in the PR's language.
+                            let bot = &cfg.bot_name;
+                            let body = match lang {
+                                crate::lang::Lang::En => format!(
+                                    "💡 To run commands without mentioning me, run one \
+command *with* a mention first — `@{bot} help` — here on this PR. After that, bare \
+commands like yours work without the mention."
+                                ),
+                                crate::lang::Lang::Zh => format!(
+                                    "💡 想不 @ 直接下命令,请先在本 PR 上带 @ 执行一次命令 \
+(如 `@{bot} help`)。之后本 PR 上即可免 @ 使用指令。"
+                                ),
+                            };
+                            let _ = gh.post_issue_comment(&repo, pr_number, &body).await;
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "session check for @{commenter} on {repo}#{pr_number}: {e}"
+                            );
+                        }
+                    }
+                }
+            }
+
             let ctx = CommentContext {
                 repo: repo.clone(),
                 pr_number,
@@ -486,5 +590,101 @@ mod tests {
             // The assertion is that this returns at all rather than unwinding.
             let _ = route_event(&cfg(), "issue_comment", &p);
         }
+    }
+
+    // ---- bare-command sessions -------------------------------------------
+
+    use crate::commands::Command;
+
+    /// A bare, mention-less comment that reads as a command is not answered
+    /// at routing time — it is carried as a candidate for the session check.
+    /// A mention-form comment runs directly and carries no candidate.
+    #[test]
+    fn a_bare_command_is_carried_as_a_candidate() {
+        for (body, want) in [
+            ("review", Some(Command::Review)),
+            ("ready", Some(Command::Ready)),
+            ("codeql", Some(Command::Codeql)),
+            ("r+", Some(Command::Approve { on_behalf_of: None })),
+            ("r-", Some(Command::Reject)),
+            ("- review", Some(Command::Review)), // list bullet before the verb
+        ] {
+            let p = payload(json!({"body": body, "user": {"login": "alice", "type": "User"}}));
+            match route_event(&cfg(), "issue_comment", &p) {
+                Routing::Act(Work::Comment { commands, bare, .. }) => {
+                    assert_eq!(bare, want, "candidate for {body:?}");
+                    assert!(
+                        commands.is_empty(),
+                        "{body:?} must wait for the session check"
+                    );
+                }
+                other => panic!("expected Act(Comment) for {body:?}, got {other:?}"),
+            }
+        }
+        // The mention form is executed at routing time; no session needed.
+        let p = payload(json!({
+            "body": "@xero-team-bot review",
+            "user": {"login": "alice", "type": "User"}
+        }));
+        match route_event(&cfg(), "issue_comment", &p) {
+            Routing::Act(Work::Comment { commands, bare, .. }) => {
+                assert_eq!(commands.len(), 1);
+                assert!(bare.is_none());
+            }
+            other => panic!("expected Act(Comment), got {other:?}"),
+        }
+    }
+
+    /// Prose that merely contains a whitelisted word is not a candidate.
+    /// The line has to open with it.
+    #[test]
+    fn prose_is_not_a_bare_command() {
+        for body in [
+            "这个 review 不错",
+            "I think we are ready to merge",
+            "claim 是什么意思?",
+            "please review this again",
+            "```\nreview\n```",
+            "> review",
+        ] {
+            let p = payload(json!({"body": body, "user": {"login": "alice", "type": "User"}}));
+            match route_event(&cfg(), "issue_comment", &p) {
+                Routing::Respond(v) => {
+                    assert_eq!(
+                        v.get("ignored").and_then(|s| s.as_str()),
+                        Some("no command")
+                    )
+                }
+                Routing::Act(Work::Comment { bare, .. }) => {
+                    assert!(
+                        bare.is_none(),
+                        "{body:?} must not be a candidate, got {bare:?}"
+                    )
+                }
+                other => panic!("expected a plain response for {body:?}, got {other:?}"),
+            }
+        }
+    }
+
+    /// `bare_command_candidate` reads the first line only and skips leading
+    /// punctuation, so a comment whose first line is prose with the verb on
+    /// a later line stays quiet — that's the mixed-comment interference the
+    /// session feature was built to avoid.
+    #[test]
+    fn only_the_first_line_opens_a_bare_command() {
+        for body in [
+            "looks good\nreview", // prose first
+            "r? @alice\nreview",  // already a command; not the bare path
+        ] {
+            assert!(
+                crate::commands::bare_command_candidate(body).is_none() || body.starts_with("r?"),
+                "{body:?}"
+            );
+        }
+        // First line wins: everything after is ignored.
+        assert_eq!(
+            crate::commands::bare_command_candidate("review\nclaim 是什么意思"),
+            Some(Command::Review)
+        );
     }
 }

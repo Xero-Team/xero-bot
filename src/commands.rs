@@ -140,6 +140,55 @@ pub fn parse_commands(bot_name: &str, text: &str) -> ParseOutput {
     }
 }
 
+/// The verbs a session can invoke without re-mentioning the bot, and the
+/// command each stands for.
+///
+/// Deliberately a small list. Every entry is a word that, opening a line,
+/// is almost certainly addressed at the bot; the argument-taking verbs
+/// (`claim`, `label`, `cc`, `assign`) stay out of it — they collide with
+/// ordinary prose ("claim 是什么意思?"), and a misfired command is worse
+/// than an un-executed one. Bare `r?` / `?r` don't appear here because the
+/// parser already runs them anywhere, mention or not.
+fn bare_verbs(word: &str) -> Option<Command> {
+    Some(match word {
+        "review" => Command::Review,
+        "codeql" => Command::Codeql,
+        "ready" => Command::Ready,
+        "author" => Command::Author,
+        "blocked" => Command::Blocked,
+        "ping" => Command::Ping,
+        "help" => Command::Help,
+        _ => return None,
+    })
+}
+
+/// Would `text` open with a command a session could run without a mention?
+///
+/// Reads the first line only, over masked text, so fenced code, quotes and
+/// inline code are already gone. A leading run of punctuation — a list
+/// bullet, a stray comma — is skipped, but prose is not: a line starting
+/// with words is prose, not a command. The rest of the line is ignored, so
+/// `review` / `review 一下` both match; the verb itself is the signal.
+///
+/// `None` for everything else, which includes comment text that the regular
+/// parser already handled — callers check that first.
+pub fn bare_command_candidate(text: &str) -> Option<Command> {
+    use lex::Tok;
+    let masked = mask::mask_noncommand_regions(text);
+    let first_line = masked.lines().next().unwrap_or("");
+    let tokens = lex::lex("", first_line);
+    let mut tokens = tokens
+        .iter()
+        .skip_while(|t| matches!(t.tok, Tok::Punct))
+        .peekable();
+    match tokens.next()?.tok.clone() {
+        Tok::Word(w) => bare_verbs(&w),
+        Tok::Approve => Some(Command::Approve { on_behalf_of: None }),
+        Tok::Reject => Some(Command::Reject),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
