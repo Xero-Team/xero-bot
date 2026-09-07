@@ -881,6 +881,24 @@ impl Client {
         .await
     }
 
+    /// The inline (diff-anchored) review comments of a pull request.
+    ///
+    /// This is the `pulls/{n}/comments` list, not the issue-comment list: each
+    /// entry sits on a diff line and may carry a `reactions` object, which is
+    /// what the author-feedback learner reads. `reactions` is included in the
+    /// default response shape of this endpoint, so no special Accept header is
+    /// needed.
+    pub async fn list_review_comments(
+        &self,
+        repo: &str,
+        number: i64,
+    ) -> Result<Vec<Value>, GhError> {
+        self.get_all(&format!(
+            "/repos/{repo}/pulls/{number}/comments?per_page=100"
+        ))
+        .await
+    }
+
     // -------------------------------------------------------------------
     // Repo content (agent tools)
     // -------------------------------------------------------------------

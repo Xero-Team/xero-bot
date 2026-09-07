@@ -113,6 +113,16 @@ PR is reviewed again, the prompt requires the model to audit the previous round'
 one by one and state, in the summary, whether each is now **fixed**, **still present**, or
 **rejected as a false positive** — an audit trail instead of a fresh list every time.
 
+### Learning from author pushback
+
+The PR's author sometimes disagrees with a finding — a thread reply ("this is the Python
+3.14 syntax", as in AstrBot #5) or a 👎 on the inline comment. Both are read back before
+the next review and injected into the prompt as a binding `Author feedback` section: a
+rebutted finding is not repeated at the same place unless the current diff contains
+verifiable new evidence that answers the rebuttal, and if the model believes the author is
+wrong it must argue that in the summary rather than silently re-report. Attributions are
+kept verbatim (`@user: "quote"`), so teammates' views are not laundered into the author's.
+
 With `REVIEW_VERIFY=true`, each critical/high/medium finding additionally goes through a
 blind second pass: a separate AI call that sees the diff and the claim only — never the
 first verdict — and is asked to *refute* it. A finding the checker confirms is marked

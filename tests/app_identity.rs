@@ -266,3 +266,75 @@ async fn configured_app_slug_is_used_without_calling_the_api() {
     let slug = xero_bot::github::resolve_app_slug(&cfg).await;
     assert_eq!(slug, "configured-name");
 }
+
+// ---------------------------------------------------------------------------
+// Author pushback — the learning source for the next review round
+// ---------------------------------------------------------------------------
+
+/// The AstrBot #5 shape: the bot posted a critical finding inline; the author
+/// replied in the thread rebutting it and thumbs-downed the comment. The
+/// next round must learn that position instead of re-reporting the finding.
+#[tokio::test]
+async fn author_pushback_collects_thread_replies_and_downvotes() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/repos/octocat/hello/pulls/7/comments"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            // Our own finding comment, carrying the author's 👎.
+            {
+                "id": 10,
+                "path": "astrbot/core/tools/web_search_tools.py",
+                "line": 1432,
+                "body": "🔴 **Invalid multiple-exception syntax**",
+                "user": {"login": "xero-review[bot]"},
+                "reactions": {"-1": 1}
+            },
+            // A teammate's unrelated comment must not be picked up as ours.
+            {
+                "id": 11,
+                "path": "src/main.rs",
+                "line": 1,
+                "body": "typo here",
+                "user": {"login": "someone-else"}
+            },
+            // The rebuttal, threaded under the finding.
+            {
+                "id": 12,
+                "in_reply_to_id": 10,
+                "path": "astrbot/core/tools/web_search_tools.py",
+                "line": 1432,
+                "body": "It's the python 3.14 syntax. Exceptions can be used without parentheses.",
+                "user": {"login": "BegoniaHe"}
+            },
+            // An old thread with no reply and no reaction carries nothing.
+            {
+                "id": 13,
+                "path": "src/quiet.rs",
+                "line": 5,
+                "body": "⚪ **nit**",
+                "user": {"login": "xero-review[bot]"}
+            }
+        ])))
+        .mount(&server)
+        .await;
+
+    let gh = client_for(&server, "xero-review");
+    let items =
+        xero_bot::review::fetch_author_pushback(&gh, "octocat/hello", 7, "xero-review").await;
+    assert_eq!(items.len(), 1, "only the rebutted thread: {items:?}");
+    let item = &items[0];
+    assert_eq!(item.author, "BegoniaHe");
+    assert!(item.reply.contains("python 3.14"), "{item:?}");
+    assert_eq!(item.downvotes, 1);
+    assert_eq!(item.path, "astrbot/core/tools/web_search_tools.py");
+    assert_eq!(item.line, 1432);
+
+    // And the section the model sees binds it.
+    let section = xero_bot::review::render_author_feedback(&items, xero_bot::lang::Lang::En)
+        .expect("non-empty");
+    assert!(section.contains("BegoniaHe"), "{section}");
+    assert!(
+        section.contains("Do NOT repeat") || section.contains("do NOT repeat"),
+        "{section}"
+    );
+}

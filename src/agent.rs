@@ -422,6 +422,10 @@ pub async fn run_agent(
 
     let (previous_review, new_commits) =
         crate::review::fetch_incremental_context(gh, repo, pr_number, cfg.max_diff_chars).await;
+    // The author's recorded disagreements with the previous round — same
+    // learning source as the builtin engine, so neither engine re-reports a
+    // rebutted finding the other already dropped.
+    let feedback = crate::review::author_feedback_section(gh, cfg, repo, pr_number, lang).await;
 
     let title = meta.get("title").and_then(|t| t.as_str()).unwrap_or("");
     let body: String = meta
@@ -455,11 +459,12 @@ pub async fn run_agent(
         ""
     };
 
+    let feedback_section = feedback.map(|f| format!("\n{f}\n")).unwrap_or_default();
     let user_prompt = t!(
         lang,
-        "Repository: {repo}\nBase branch: {base_ref}\nPR title: {title}\nPR description: {body}{prev_section}{commits_section}\n\n\
+        "Repository: {repo}\nBase branch: {base_ref}\nPR title: {title}\nPR description: {body}{prev_section}{commits_section}{feedback_section}\n\n\
 Use the tools to learn the project's structure first, then review the diff below{trunc_note}. Call submit_review when you're done:\n\n{diff}",
-        "仓库: {repo}\n基准分支: {base_ref}\nPR 标题: {title}\nPR 描述: {body}{prev_section}{commits_section}\n\n\
+        "仓库: {repo}\n基准分支: {base_ref}\nPR 标题: {title}\nPR 描述: {body}{prev_section}{commits_section}{feedback_section}\n\n\
 先用工具了解项目结构,再审查以下 diff{trunc_note}。完成后调用 submit_review 提交:\n\n{diff}"
     );
 

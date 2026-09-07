@@ -644,6 +644,31 @@ pub fn build_user_prompt(
     new_commits: Option<&str>,
     lang: Lang,
 ) -> String {
+    build_user_prompt_with_feedback(
+        diff,
+        pr_meta,
+        truncated,
+        previous_review,
+        new_commits,
+        None,
+        lang,
+    )
+}
+
+/// [`build_user_prompt`] with the author-feedback section.
+///
+/// `feedback` is the already-rendered section from
+/// [`author_feedback_section`]; `None` for a first review or when the author
+/// raised no objections.
+pub fn build_user_prompt_with_feedback(
+    diff: &str,
+    pr_meta: &Value,
+    truncated: bool,
+    previous_review: Option<&str>,
+    new_commits: Option<&str>,
+    feedback: Option<&str>,
+    lang: Lang,
+) -> String {
     let title = pr_meta.get("title").and_then(|t| t.as_str()).unwrap_or("");
     let body: String = pr_meta
         .get("body")
@@ -682,10 +707,14 @@ are still present, marking them carried over):\n{p}\n",
             )
         })
         .unwrap_or_default();
+    // The feedback section carries its own binding instruction, so it rides
+    // in as rendered — but ordered after the previous review, because its
+    // claims are about that review's findings.
+    let feedback_section = feedback.map(|f| format!("\n{f}\n")).unwrap_or_default();
     t!(
         lang,
-        "PR title: {title}\nPR description: {body}\n{prev_section}{commits_section}\nBelow is the PR's unified diff (look only at the added code):\n{diff}{note}\n\nReview the change above and answer with the JSON schema given.",
-        "PR 标题: {title}\nPR 描述: {body}\n{prev_section}{commits_section}\n以下是 PR 的 unified diff(只关注新增的代码):\n{diff}{note}\n\n请审查上述改动并按指定 JSON schema 输出。"
+        "PR title: {title}\nPR description: {body}\n{prev_section}{commits_section}{feedback_section}\nBelow is the PR's unified diff (look only at the added code):\n{diff}{note}\n\nReview the change above and answer with the JSON schema given.",
+        "PR 标题: {title}\nPR 描述: {body}\n{prev_section}{commits_section}{feedback_section}\n以下是 PR 的 unified diff(只关注新增的代码):\n{diff}{note}\n\n请审查上述改动并按指定 JSON schema 输出。"
     )
 }
 
@@ -887,13 +916,18 @@ async fn run_builtin_inner(
     // incremental context
     let (previous_review, new_commits) =
         fetch_incremental_context(gh, repo, pr_number, cfg.max_diff_chars).await;
+    // What the author already rejected about the previous round. Learning is
+    // per-PR context, not a model change: the same pushback that was written
+    // into a thread (AstrBot #5's PEP 758 rebuttal) stops being re-reported.
+    let feedback = author_feedback_section(gh, cfg, repo, pr_number, lang).await;
 
-    let user_prompt = build_user_prompt(
+    let user_prompt = build_user_prompt_with_feedback(
         &diff,
         &meta,
         truncated,
         previous_review.as_deref(),
         new_commits.as_deref(),
+        feedback.as_deref(),
         lang,
     );
 
@@ -990,6 +1024,219 @@ pub async fn fetch_incremental_context(
         }
     };
     (last_body, new_commits)
+}
+
+// ---------------------------------------------------------------------------
+// Author feedback — what the PR's author already rejected
+// ---------------------------------------------------------------------------
+
+/// One piece of author pushback against a previous finding.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AuthorPushback {
+    /// Who replied (or reacted).
+    pub author: String,
+    /// Their reply text, verbatim. Empty when the signal is a reaction only.
+    pub reply: String,
+    /// 👎 count on the bot's own inline comment — a dissent the author didn't
+    /// write out. 0 when there was none.
+    pub downvotes: usize,
+    /// Path and line the finding was anchored to, so the model can relate the
+    /// pushback to a place in the current diff.
+    pub path: String,
+    pub line: i64,
+}
+
+/// Collect the author's disagreement with the previous round's findings.
+///
+/// The material is what GitHub already stores about the last review: this
+/// bot's inline comments, replies threaded under them, and 👎 reactions on
+/// them. The PR author is `pr_author`; the learner's contract is that the
+/// feedback describes *that person's* position, so replies from other users
+/// (teammates chiming in, drive-bys) are attributed separately — the prompt
+/// shows who said what rather than laundering everyone's view into "the
+/// author's".
+///
+/// `app_slug` is the normalized bot login: our inline comments are authored
+/// as `slug[bot]`, and the review body they belong to may have degraded to a
+/// plain comment, so identity goes by author rather than by review id.
+pub async fn fetch_author_pushback(
+    gh: &Client,
+    repo: &str,
+    pr_number: i64,
+    app_slug: &str,
+) -> Vec<AuthorPushback> {
+    let comments = match gh.list_review_comments(repo, pr_number).await {
+        Ok(c) => c,
+        Err(e) => {
+            // Learning is additive; a failed read must not fail the review.
+            tracing::warn!("author feedback: review comments of {repo}#{pr_number}: {e}");
+            return Vec::new();
+        }
+    };
+
+    // Our own inline comments, in id order, so thread replies can be grouped.
+    let slug = format!("{}[bot]", normalize_bot(app_slug));
+    let ours: Vec<&Value> = comments
+        .iter()
+        .filter(|c| {
+            c.pointer("/user/login")
+                .and_then(|l| l.as_str())
+                .map(|l| l.eq_ignore_ascii_case(&slug))
+                .unwrap_or(false)
+        })
+        .collect();
+    if ours.is_empty() {
+        return Vec::new();
+    }
+
+    let mut pushback = Vec::new();
+    for own in ours {
+        let own_id = own.get("id").and_then(|i| i.as_i64()).unwrap_or(0);
+        let path = own
+            .get("path")
+            .and_then(|p| p.as_str())
+            .unwrap_or("")
+            .to_string();
+        let line = own.get("line").and_then(|l| l.as_i64()).unwrap_or(0);
+        let downvotes = own
+            .pointer("/reactions/-1")
+            .and_then(|n| n.as_i64())
+            .unwrap_or(0)
+            .max(0) as usize;
+
+        // Replies threaded under this comment, oldest first, with author.
+        let mut replies: Vec<(String, String)> = Vec::new();
+        for c in &comments {
+            let in_reply = c.get("in_reply_to_id").and_then(|i| i.as_i64());
+            if in_reply != Some(own_id) {
+                continue;
+            }
+            let who = c
+                .pointer("/user/login")
+                .and_then(|l| l.as_str())
+                .unwrap_or("");
+            let body = c.get("body").and_then(|b| b.as_str()).unwrap_or("");
+            if who.is_empty() || body.trim().is_empty() {
+                continue;
+            }
+            replies.push((who.to_string(), body.to_string()));
+        }
+
+        if replies.is_empty() && downvotes == 0 {
+            continue;
+        }
+        // The reply text is the disagreement itself; the 👎 is its shape when
+        // nobody wrote anything. Only the last written reply per (thread,
+        // author) pair is kept — the argument tends to be a back-and-forth,
+        // and the latest word is the author's current position.
+        let mut by_author: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        for (who, body) in replies {
+            by_author.insert(who, body);
+        }
+        if !by_author.is_empty() || downvotes > 0 {
+            // Keep one entry per commenting user; the 👎 rides on the first.
+            let mut first = true;
+            for (who, reply) in by_author.iter() {
+                pushback.push(AuthorPushback {
+                    author: who.clone(),
+                    reply: reply.clone(),
+                    downvotes: if first { downvotes } else { 0 },
+                    path: path.clone(),
+                    line,
+                });
+                first = false;
+            }
+            if by_author.is_empty() {
+                pushback.push(AuthorPushback {
+                    author: "(reaction only)".to_string(),
+                    reply: String::new(),
+                    downvotes,
+                    path,
+                    line,
+                });
+            }
+        }
+    }
+    pushback
+}
+
+/// Strip the `[bot]` suffix the way [`crate::github::normalize_login`] does.
+///
+/// A local helper rather than a re-export because the learner reads it as
+/// "login to compare against `slug[bot]`", and keeping the suffix-append
+/// explicit here is what makes that contract visible.
+fn normalize_bot(slug: &str) -> String {
+    let lower = slug.trim().to_lowercase();
+    lower.strip_suffix("[bot]").unwrap_or(&lower).to_string()
+}
+
+/// Render the collected pushback as the prompt section the model audits.
+///
+/// Empty input is `None`, so a first review carries no dead section. The
+/// instruction is the contract that makes the section matter: a rejected
+/// finding is not repeated unless there is verifiable new evidence, and any
+/// rebuttal the model disagrees with must be argued, not ignored.
+pub fn render_author_feedback(items: &[AuthorPushback], lang: Lang) -> Option<String> {
+    if items.is_empty() {
+        return None;
+    }
+    let mut lines = vec![match lang {
+        Lang::En => "## Author feedback on the previous review (be bound by it)".to_string(),
+        Lang::Zh => "## 作者对上一轮审查的反馈(必须遵守)".to_string(),
+    }];
+    lines.push(String::new());
+    lines.push(match lang {
+        Lang::En => "The PR's author and others replied to findings of the previous round \
+under the inline comments. Their disagreement is input you must weigh: do NOT repeat a \
+finding of the same claim at the same place unless the current diff contains verifiable \
+new evidence (a spec citation, an actual error, a runtime failure) that answers the \
+rebuttal. If you believe the author is wrong, say so in `summary` with the argument — \
+never by silently re-reporting the same finding."
+            .to_string(),
+        Lang::Zh => "作者及其他人曾在内联评论下对上一轮的发现作出回应。这些不同意见是你必须 \
+权衡的输入:除非当前 diff 中存在可验证的新证据(规范引用、实际报错、运行失败)足以回应 \
+反驳,否则**不要**在同一位置重复同一断言的 finding。若你认为作者是错的,请在 `summary` \
+中给出论证 —— 而不是默默重报同一条发现。"
+            .to_string(),
+    });
+    lines.push(String::new());
+    for item in items {
+        let mut entry = format!("- `{}`:{} — ", item.path, item.line);
+        let downvotes = item.downvotes;
+        if downvotes > 0 {
+            entry.push_str(&format!("👎 ×{downvotes}"));
+            if !item.reply.is_empty() {
+                entry.push_str("; ");
+            }
+        }
+        if !item.reply.is_empty() {
+            entry.push_str(&format!("@{}: \"{}\"", item.author, item.reply));
+        } else if downvotes == 0 {
+            continue;
+        }
+        lines.push(entry);
+    }
+    Some(lines.join("\n"))
+}
+
+/// The feedback section for a prompt: fetched, budgeted, `None` when empty.
+///
+/// Split from [`fetch_author_pushback`] so callers that already have the
+/// items (tests, future engines) can share the wording.
+pub async fn author_feedback_section(
+    gh: &Client,
+    cfg: &Config,
+    repo: &str,
+    pr_number: i64,
+    lang: Lang,
+) -> Option<String> {
+    let items = fetch_author_pushback(gh, repo, pr_number, &gh.app_slug).await;
+    let section = render_author_feedback(&items, lang)?;
+    // Budget it like every other context section: a thread that turned into a
+    // shouting match must not eat the diff's prompt share. Half of what the
+    // previous review gets, which has proven enough for disagreement prose.
+    Some(truncate(&section, cfg.max_diff_chars / 4).0)
 }
 
 #[cfg(test)]
@@ -1295,6 +1542,87 @@ diff --git a/gone.rs b/gone.rs
             !en.chars().any(|c| ('\u{4E00}'..='\u{9FFF}').contains(&c)),
             "{en}"
         );
+    }
+
+    // ---- author feedback --------------------------------------------------
+
+    /// The AstrBot #5 shape: the author rebuts a critical finding in the
+    /// thread ("It's the python 3.14 syntax") and thumbs-downs the comment.
+    /// The section must carry the rebuttal and bind the model to it.
+    #[test]
+    fn author_feedback_is_rendered_with_the_rebuttal_and_the_downvote() {
+        let items = vec![
+            AuthorPushback {
+                author: "BegoniaHe".into(),
+                reply: "It's the python 3.14 syntax. Exceptions can be used without \
+parentheses."
+                    .into(),
+                downvotes: 1,
+                path: "astrbot/core/tools/web_search_tools.py".into(),
+                line: 1432,
+            },
+            AuthorPushback {
+                author: "(reaction only)".into(),
+                reply: String::new(),
+                downvotes: 2,
+                path: "src/other.rs".into(),
+                line: 10,
+            },
+        ];
+        let en = render_author_feedback(&items, Lang::En).expect("some");
+        assert!(en.contains("Author feedback"), "{en}");
+        assert!(en.contains("BegoniaHe"), "{en}");
+        assert!(en.contains("python 3.14"), "{en}");
+        assert!(
+            en.contains("`astrbot/core/tools/web_search_tools.py`:1432"),
+            "{en}"
+        );
+        assert!(en.contains("👎 ×1"), "{en}");
+        assert!(en.contains("👎 ×2"), "{en}");
+        assert!(en.contains("do NOT repeat"), "{en}");
+
+        // The Chinese one is Chinese; the English one carries no CJK.
+        let zh = render_author_feedback(&items, Lang::Zh).expect("some");
+        assert!(zh.contains("作者对上一轮审查的反馈"), "{zh}");
+        assert!(
+            !en.chars().any(|c| ('\u{4E00}'..='\u{9FFF}').contains(&c)),
+            "{en}"
+        );
+    }
+
+    #[test]
+    fn no_feedback_means_no_section() {
+        assert_eq!(render_author_feedback(&[], Lang::En), None);
+    }
+
+    #[test]
+    fn feedback_section_lands_in_the_prompt_after_the_previous_review() {
+        let meta = serde_json::json!({"title": "T", "body": "B"});
+        let p = build_user_prompt_with_feedback(
+            "d",
+            &meta,
+            false,
+            Some("prev review body"),
+            None,
+            Some("## Author feedback\n\n- `f.rs`:1 — @bob: \"not a bug\""),
+            Lang::En,
+        );
+        assert!(p.contains("Author feedback"), "{p}");
+        assert!(p.contains("not a bug"), "{p}");
+        // The feedback comes after the review it comments on.
+        let review_at = p.find("prev review body").unwrap();
+        let feedback_at = p.find("Author feedback").unwrap();
+        assert!(review_at < feedback_at, "{p}");
+    }
+
+    /// Identity for finding our own inline comments. The bot authors them as
+    /// `slug[bot]`, so the fetcher must build that suffix itself — a bare
+    /// slug never matched, and an unfound thread is an unlearned rebuttal.
+    #[test]
+    fn normalize_bot_strips_the_suffix() {
+        assert_eq!(normalize_bot("xero-team-bot"), "xero-team-bot");
+        assert_eq!(normalize_bot("xero-team-bot[bot]"), "xero-team-bot");
+        assert_eq!(normalize_bot(" Xero-Team-Bot "), "xero-team-bot");
     }
 
     /// Both briefs must describe the same schema, or one language silently
