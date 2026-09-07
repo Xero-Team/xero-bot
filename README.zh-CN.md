@@ -2,7 +2,7 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-Xero-Team 的组织级 GitHub App 机器人。Rust 实现,单二进制,双部署模式(Vercel serverless / Docker 自托管)。
+Xero-Team 的组织级 GitHub App 机器人。Rust 实现,单二进制,自托管部署(Docker / VPS)。
 
 功能:
 - **bors/triagebot 风格评论命令** — `r?`、`?r cc`、label 管理、assign/claim、`r+` 代审批等
@@ -18,6 +18,15 @@ Xero-Team 的组织级 GitHub App 机器人。Rust 实现,单二进制,双部署
 大部分命令在 issue 上同样可用 —— GitHub 的标签、指派、评论对 issue 与 PR 是同一套 API。
 只有 `review`、`codeql`、`r+`、`r-` 这四条需要 PR,在 issue 上使用会明确回复说明而非静默失败。
 在 issue 上 `r? @用户` 只是指派,因为 issue 没有 reviewer。
+
+### 免 @ 会话
+
+同一用户在同一 PR/issue 上**带 @ 执行过一次命令**(如 `@xero-review help`)后,会话即已开启:
+之后的评论可以用下述免 @ 形式直接下指令。只有**明确的指令**才会被解析 —— 评论必须以动词
+**开头**,散文永远不会被当成命令。可免 @ 的动词是无歧义的那几个:`review`、`codeql`、`ready`、
+`author`、`blocked`、`ping`、`help`,以及裸 `r+` / `r-`。带参数的动词(`claim`、`label`、
+`cc`、`assign`)和组合形式仍需带 @;裸 `r? @user` 与 `?r` 本来就无需 @。没有会话的用户发免 @
+指令会收到一行说明,而不是石沉大海。
 
 | 命令 | 说明 |
 |---|---|
@@ -40,8 +49,13 @@ Xero-Team 的组织级 GitHub App 机器人。Rust 实现,单二进制,双部署
 
 自动行为(无需命令):
 - PR push/reopen 后检测冲突 → 打 `needs-rebase` + 提醒评论;冲突解决 → 摘标签
-- 周期 sweep(Vercel Cron 每日 / 自托管默认 6h)兜底检测
+- 周期 sweep(内置循环,默认 6h)兜底检测
 - 给 PR 打 `codeql` 标签(若配置了 `CODEQL_LABEL`)→ 自动生成 CodeQL 报告
+
+**`?r` 会通知审阅者。** 标签本身不会通知任何人,所以在 PR 上 `?r`/`ready` 还会主动 ping 审阅者:
+优先 re-request 当前 Reviewers 列表中的人(无论是 `r?` 加的还是手动在 GitHub UI 上加的);
+列表为空时,退而 ping 最近一次 CHANGES_REQUESTED/APPROVED 审查的提交者;两者都没有时,
+回复会提示用 `?r @用户` 指定,而不是凭空猜测。
 
 ### 审批
 
@@ -70,78 +84,30 @@ bot 用中文还是英文回复(AI 审查的正文同样如此)由 PR 自身的 
 
 `REVIEW_ENGINE` 选择:
 
-| 引擎 | 机制 | 增量能力 | 平台 |
-|---|---|---|---|
-| `agent`(默认) | tool-calling 循环,工具=GitHub API(列目录/读文件/搜代码),先探索项目再审查 | 注入本 PR 上一轮 bot 审查 + 其后的新提交列表 | Vercel + 自托管 |
-| `builtin` | 单次 HTTP 调用(OpenAI chat/responses/Anthropic 三种格式) | 同上(上下文注入) | Vercel + 自托管 |
-| `pi` | 子进程 `pi -p --session-dir`,只读工具集 | **会话延续**:per-repo 会话文件记住项目理解 | 仅自托管(Docker 已预装) |
-| `codex` | 子进程 `codex exec --sandbox read-only -o` | 同上(可 `codex exec resume`) | 仅自托管(Docker 已预装) |
-| `auto` | 依次探测:pi → codex → agent → builtin | - | - |
+| 引擎 | 机制 | 增量能力 |
+|---|---|---|
+| `agent`(默认) | tool-calling 循环,工具=GitHub API(列目录/读文件/搜代码),先探索项目再审查 | 注入本 PR 上一轮 bot 审查 + 其后的新提交列表 |
+| `builtin` | 单次 HTTP 调用(OpenAI chat/responses/Anthropic 三种格式) | 同上(上下文注入) |
+| `pi` | 子进程 `pi -p --session-dir`,只读工具集 | **会话延续**:per-repo 会话文件记住项目理解 |
+| `codex` | 子进程 `codex exec --sandbox read-only -o` | 同上(可 `codex exec resume`) |
+| `auto` | 依次探测:pi → codex → agent → builtin | - |
 
 agent 超时/失败自动回退 builtin。所有引擎共用同一发布管线:风险分级表 + 新增行内联评论 + 发布降级链(带内联 → 去内联 → 普通评论)。
 
+### Finding ID、证据与二次证伪(复检)
+
+每条发布的 finding 都带稳定 ID(`XRV-…`)、类型标注,且 description 必须引用其针对的代码。
+ID 使 finding 可以跨轮对账:再次审查同一 PR 时,prompt 要求模型逐条核对上一轮的 findings,
+并在总结中逐条给出结论 —— **已修复 / 仍存在 / 被判误报** —— 而不是每次都输出一份全新的清单。
+
+设置 `REVIEW_VERIFY=true` 后,critical/high/medium 级别的每条发现还会经过一次**盲态二次证伪**:
+独立的第二次 AI 调用,只拿到 diff 和该条断言(看不到第一轮结论),任务是设法**推翻**它。
+复核通过的发现标注 `[已复核]`;被驳回的发现降一级并标注 `[复核未确认]`,而不是删除 ——
+两次审查的分歧本身就是信息。复检每条显著发现多花一次模型调用,默认关闭。
+
 ## 部署
 
-两种模式跑的是同一套代码,区别只在运维方式:
-
-| | Vercel | Docker |
-|---|---|---|
-| 运维 | 零运维 | 自管服务器 |
-| 单次调用时长 | 300 s(Hobby)/ 800 s(Pro) | 无限制 |
-| `pi` / `codex` 引擎 | 不可用 | `pi` 预装,`codex` 需手动 |
-| 定时 sweep | Vercel Cron(每日,托管) | 内置 sweep 循环(默认 6h) |
-| Webhook 路径 | `/api/webhook` | `/webhook` |
-| 私钥 | `PRIVATE_KEY_B64` | `PRIVATE_KEY_PATH` 或 `PRIVATE_KEY_B64` |
-
-### 0. 创建 GitHub App(两种模式都需要)
-
-GitHub → Settings → Developer settings → GitHub Apps → **New GitHub App**:
-
-| 项 | 值 |
-|---|---|
-| Webhook URL | `https://<host>/api/webhook`(Vercel)或 `https://<host>/webhook`(自托管) |
-| Webhook secret | 任意随机字符串 — 必须与 `WEBHOOK_SECRET` 一致 |
-| 订阅事件 | **Issue comment** + **Pull request** |
-| 权限 | Contents: R · Pull requests: RW · Issues: RW · **Code scanning alerts: R** |
-
-然后:**生成私钥**(会下载 `.pem` 文件),记下数字 **App ID** 与 bot 的 @-名(填 `BOT_NAME`),并把 App 安装到目标组织/仓库。
-
-### 1. Vercel(推荐,零运维)
-
-1. **部署项目** — 把本仓库推到 GitHub 后在 Vercel 导入(Add New… → Project),Vercel Rust runtime 会自动构建 `api/*.rs` 各入口,`vercel.json` 已配好函数超时与 cron 计划。CLI 方式亦可:
-   ```bash
-   npm i -g vercel && vercel link && vercel --prod
-   ```
-2. **配置环境变量** — Project → Settings → Environment Variables,或 `vercel env add <KEY> production`:
-
-   | 变量 | 说明 |
-   |---|---|
-   | `APP_ID` | 数字 App ID |
-   | `PRIVATE_KEY_B64` | `.pem` 文件的 base64 — serverless 没有文件系统,`PRIVATE_KEY_PATH` 在 Vercel 上**不可用** |
-   | `WEBHOOK_SECRET` | 与 App 设置中一致 |
-   | `BOT_NAME` | 如 `xero-review` |
-   | `AI_BASE_URL` / `AI_API_KEY` / `AI_MODEL` / `API_FORMAT` | LLM 服务配置;见 [.env.example](.env.example) |
-   | `REVIEW_ENGINE` | `auto`(默认)— Vercel 上自动落到 `agent`/`builtin` |
-   | `CRON_SECRET` | 任意随机字符串;Vercel Cron 会自动以 Bearer 头携带 |
-
-   私钥转 base64(只取值,不要换行):
-   ```bash
-   base64 -w0 app.pem        # Linux / Git Bash
-   base64 -i app.pem         # macOS(默认单行输出)
-   ```
-   **增改环境变量后必须重新部署**(`vercel --prod` 或 Deployments → Redeploy)— 已运行的函数不会热加载新变量。
-
-3. **Cron** — `vercel.json` 已声明每日任务(`0 3 * * *`,Hobby 计划的最小粒度)打到 `/api/cron`。只要配置了 `CRON_SECRET`,Vercel 会自动附上 `Authorization: Bearer $CRON_SECRET`,无需额外鉴权设置。
-4. **验证**:
-   ```bash
-   curl https://<your-app>.vercel.app/api/health
-   # {"status":"ok","configured":true,...}
-   ```
-   并到 App 设置页的 *Recent Deliveries* 检查 webhook ping 是否绿勾。
-
-**Vercel 限制(已核实):** 函数最长 300 s(Hobby)/ 800 s(Pro)(`vercel.json` 当前设 300,Pro 上若审查被截断可调高)。`pi`/`codex` 子进程引擎在 Vercel 不可用 — `REVIEW_ENGINE=auto` 会回退到 `agent`。冷启动会给闲置后的首个请求增加几秒延迟。
-
-### 2. Docker 自托管(功能全量)
+自托管(Docker 或 VPS):
 
 1. **准备配置**:
    ```bash
@@ -153,7 +119,7 @@ GitHub → Settings → Developer settings → GitHub Apps → **New GitHub App*
      base64 -w0 xero-review-bot.private-key.pem   # Linux / Git Bash
      base64 -i xero-review-bot.private-key.pem    # macOS
      ```
-     Docker 和 Vercel 通用,无需挂载文件。(备选:挂载文件 — 在 compose 的 `volumes` 加一行
+     Docker 和裸机通用,无需挂载文件。(备选:挂载文件 — 在 compose 的 `volumes` 加一行
      `- ./xero-review-bot.pem:/keys/bot.pem:ro`,并设 `PRIVATE_KEY_PATH=/keys/bot.pem`。)
    - **`WEBHOOK_SECRET` 必须与 App 设置里存的完全一致** — 不一致的话 GitHub 每次推送都会被 401 拒绝。
 2. **子进程引擎要有自己的 AI key。** 容器已预装 `pi` 和 `codex`,它们用 `OPENAI_API_KEY` 认证(与 bot 的 `AI_API_KEY` 是两回事)。直接写进 `.env` 即可 — compose 的 `env_file` 会把整个文件注入容器。不填也不会坏 — `REVIEW_ENGINE=auto` 会回退到 `agent` 引擎,bot 照常工作。
@@ -163,6 +129,19 @@ GitHub → Settings → Developer settings → GitHub Apps → **New GitHub App*
    docker compose logs -f     # 观察启动;配置校验失败会立刻退出
    ```
 4. **Webhook URL**:`https://<your-host>/webhook` — 必须能被公网访问(GitHub 要向它推送事件;家用服务器需反代或内网穿透)。
+
+### 0. 创建 GitHub App
+
+GitHub → Settings → Developer settings → GitHub Apps → **New GitHub App**:
+
+| 项 | 值 |
+|---|---|
+| Webhook URL | `https://<host>/webhook` |
+| Webhook secret | 任意随机字符串 — 必须与 `WEBHOOK_SECRET` 一致 |
+| 订阅事件 | **Issue comment** + **Pull request** |
+| 权限 | Contents: R · Pull requests: RW · Issues: RW · **Code scanning alerts: R** |
+
+然后:**生成私钥**(会下载 `.pem` 文件),记下数字 **App ID** 与 bot 的 @-名(填 `BOT_NAME`),并把 App 安装到目标组织/仓库。
 
 容器内的既有能力:
 - `/data` 具名卷(`xero-data`)缓存仓库 checkout 与 `pi` 会话 — 这是 bot 的**增量记忆**,删掉就丢审查上下文,不要轻易清理。布局:
@@ -197,8 +176,8 @@ curl http://localhost:8080/health        # {"status":"ok",...}
 ## 配置
 
 全部环境变量见 [.env.example](.env.example)。要点:
-- `PRIVATE_KEY_PATH`(自托管)或 `PRIVATE_KEY_B64`(Vercel)二选一
-- 真实环境变量永远优先于 `.env` 值(Vercel 控制台配置因此生效)
+- `PRIVATE_KEY_PATH` 或 `PRIVATE_KEY_B64` 二选一
+- 真实环境变量永远优先于 `.env` 值
 - 标签名可配(`LABEL_*`),默认 `needs-rebase` / `waiting-on-review` / `waiting-on-author` / `blocked`
 - `CODEQL_LABEL` 非空时,打该标签自动触发 CodeQL 报告;默认空=仅命令触发
 - CodeQL 报告要求仓库已启用 code scanning(CodeQL default setup 或 codeql.yml workflow);私有仓库需 GitHub Advanced Security
@@ -206,7 +185,7 @@ curl http://localhost:8080/health        # {"status":"ok",...}
 ## 本地开发
 
 ```bash
-cargo test                    # 149 单元 + 65 集成(wiremock mock GitHub API)
+cargo test                    # 单元 + 集成测试(wiremock mock GitHub API)
 cargo run                     # 自托管模式跑在 :8080
 cargo run --example send_webhook -- issue-comment "@xero-review ping"
 cargo run --example send_webhook -- issue-comment "r? @octocat"
@@ -221,20 +200,17 @@ cargo run --example send_webhook -- pr-synchronize
 src/
 ├── config.rs          env 配置(.env 加载,真实环境变量优先)
 ├── webhook.rs         HMAC-SHA256 验签 + 事件分类
-├── commands.rs        命令解析器(多命令/代码块忽略/r? 任意位置/?短命令)
-├── handlers.rs        命令执行(权限校验、回复渲染)
+├── commands.rs        命令解析器(多命令/代码块忽略/r? 任意位置/?短命令/免 @ 会话)
+├── handlers.rs        命令执行(权限校验、回复渲染、?r 审阅者通知)
 ├── github.rs          octocrab 封装(唯一 GitHub API 出口)
 ├── review.rs          builtin 引擎 + 共享发布管线(diff 解析/verdict 解析/渲染/降级链)
+├── verify.rs          finding 二次证伪(盲态二审 + 稳定 finding ID)
 ├── agent.rs           原生 review agent(tool-calling 循环,工具=GitHub API)
-├── engines_subproc.rs pi/codex 子进程引擎 + git checkout 缓存(仅自托管)
+├── engines_subproc.rs pi/codex 子进程引擎 + git checkout 缓存
 ├── codeql.rs          Code Scanning 告警 → PR 变更文件映射 → 报告
 ├── rebase.rs          mergeable 检测 + needs-rebase 标签 + sweep
-├── dispatch.rs        事件 → 后台工作 路由(两种入口共用)
+├── dispatch.rs        事件 → 后台工作 路由(含免 @ 会话检查)
 └── main.rs            自托管 axum 服务器
-
-api/                   Vercel 入口(webhook/cron/health,AppState::wait_until 后台执行)
 ```
 
 状态持久化:全部存 GitHub(标签 = 工作流状态,PR review = 上一轮审查记忆)——bot 本身无数据库、无外部存储。
-
-构建说明:`vercel_runtime` vendor 在 `vendor/vercel_runtime`,带一处 unix-only 编译问题的一行修复(见 `Cargo.toml` 的 `[patch.crates-io]`)— Docker 构建与 Vercel 构建都依赖 `vendor/` 目录存在。
