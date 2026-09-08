@@ -166,6 +166,25 @@ fn queued_issues_mock() -> Mock {
         ])))
 }
 
+/// The testing-label list the driver reconciles the batch against. `members`
+/// is the PR numbers currently wearing `merge queue: testing`.
+fn testing_label_mock(members: &[i64]) -> Mock {
+    let items: Vec<serde_json::Value> = members
+        .iter()
+        .map(|n| {
+            json!({
+                "number": n,
+                "pull_request": {"url": "x"},
+                "state": "open"
+            })
+        })
+        .collect();
+    Mock::given(method("GET"))
+        .and(path(format!("/repos/{REPO}/issues")))
+        .and(query_param("labels", "merge queue: testing"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(items))
+}
+
 fn pr_mock(number: i64, head_sha: &str, state: &str, mergeable: Option<bool>) -> Mock {
     Mock::given(method("GET"))
         .and(path(format!("/repos/{REPO}/pulls/{number}")))
@@ -188,9 +207,11 @@ fn pr_mock(number: i64, head_sha: &str, state: &str, mergeable: Option<bool>) ->
 async fn batch_of_two_is_staged_in_order() {
     let server = MockServer::start().await;
 
-    // Reading the queue and the PRs.
+    // Reading the queue and the PRs. No member is labeled testing yet —
+    // that's what this tick is about to create.
     repo_info_mock("main").mount(&server).await;
     queued_issues_mock().mount(&server).await;
+    testing_label_mock(&[]).mount(&server).await;
     pr_mock(10, "head10", "open", Some(true))
         .mount(&server)
         .await;
@@ -240,8 +261,10 @@ async fn green_chain_advances_main() {
     let cfg = queue_cfg();
     let gh = client_for(&server);
 
-    // Mid-batch state: staging holds a two-member chain.
+    // Mid-batch state: staging holds a two-member chain, both members
+    // labeled testing (the label is what the driver reconciles against).
     repo_info_mock("main").mount(&server).await;
+    testing_label_mock(&[10, 11]).mount(&server).await;
     branch_ref("staging", Some("s0me-merge-sha"))
         .mount(&server)
         .await;
@@ -324,6 +347,7 @@ async fn red_ci_drops_the_tail_and_resets() {
 
     // Reads that reach the driver before CI.
     repo_info_mock("main").mount(&server).await;
+    testing_label_mock(&[10]).mount(&server).await;
     branch_ref("staging", Some("merge10")).mount(&server).await;
     commits_mock(
         "staging",
@@ -381,6 +405,7 @@ async fn conflict_drops_one_member_and_keeps_the_batch() {
 
     queued_issues_mock().mount(&server).await;
     repo_info_mock("main").mount(&server).await;
+    testing_label_mock(&[]).mount(&server).await;
     pr_mock(10, "head10", "open", Some(true))
         .mount(&server)
         .await;
@@ -441,6 +466,7 @@ async fn restart_mid_batch_resumes_without_re_merging() {
     let gh = client_for(&server);
 
     repo_info_mock("main").mount(&server).await;
+    testing_label_mock(&[10, 11]).mount(&server).await;
     branch_ref("staging", Some("m2")).mount(&server).await;
     commits_mock(
         "staging",
@@ -487,6 +513,138 @@ async fn restart_mid_batch_resumes_without_re_merging() {
 }
 
 // ---------------------------------------------------------------------------
+// 4b. GitHub dropped our marker: the staging merge commit's message is not
+// ours. The batch is identified by its labels and must keep testing.
+// ---------------------------------------------------------------------------
+
+/// The regression this exists to pin: `POST /merges` ignored our
+/// `commit_message` on a fast-forward-able fold and worded the commit
+/// itself (`Merge <head> into <base>`). The markerless chain read as "no
+/// batch", the driver walked into the idle-cleanup branch, and *deleted the
+/// staging branch under test* — the CI that was about to run on it never
+/// ran, and the labeled members sat silent until they timed out. Now the
+/// members come from the testing label, the tip comes from the staging ref,
+/// and nothing is deleted while a batch is under test.
+#[tokio::test]
+async fn markerless_merge_commit_keeps_the_batch_testing() {
+    let server = MockServer::start().await;
+
+    let cfg = queue_cfg();
+    let gh = client_for(&server);
+
+    repo_info_mock("main").mount(&server).await;
+    testing_label_mock(&[3]).mount(&server).await;
+    branch_ref("staging", Some("e05ee18")).mount(&server).await;
+    // The staging history as GitHub actually wrote it: no marker anywhere.
+    commits_mock(
+        "staging",
+        json!([
+            merge_commit(
+                "e05ee18",
+                "Merge 9233ac4beab3da1d84850dc54109c310a6e24404 into 4cc8ec11918de8ec436f7cc660196db6ece2ab63"
+            ),
+            merge_commit("4cc8ec1", "rename: the merge queue drops the bors name")
+        ]),
+    )
+    .mount(&server)
+    .await;
+    pr_mock(3, "9233ac4", "open", Some(true))
+        .mount(&server)
+        .await;
+    for m in ci_mocks("e05ee18", "") {
+        m.mount(&server).await;
+    }
+
+    // Nothing may mutate — in particular, the staging branch must survive.
+    Mock::given(method("DELETE"))
+        .and(path_regex(format!(r"/repos/{REPO}/git/refs/.*").as_str()))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(0)
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path_regex(format!(r"/repos/{REPO}/git/refs/.*").as_str()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .expect(0)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!("/repos/{REPO}/merges")))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({"sha": "x"})))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let outcome = xero_bot::merge_queue::pump_one(&gh, &cfg, REPO).await;
+    assert_eq!(
+        outcome,
+        xero_bot::merge_queue::PumpOutcome::Testing,
+        "{outcome}"
+    );
+}
+
+/// The other half of the same bug: with NO batch under test and no queued
+/// PRs, a staging that does *not* point at main is reset to main rather than
+/// deleted — deletion is reserved for a staging that already points at main
+/// (a pure leftover), and neither happens when a batch exists.
+#[tokio::test]
+async fn idle_cleanup_resets_or_keeps_not_blindly_deletes() {
+    let server = MockServer::start().await;
+
+    let cfg = queue_cfg();
+    let gh = client_for(&server);
+
+    repo_info_mock("main").mount(&server).await;
+    // No testing members, no queued members.
+    testing_label_mock(&[]).mount(&server).await;
+    Mock::given(method("GET"))
+        .and(path(format!("/repos/{REPO}/issues")))
+        .and(query_param("labels", "merge queue: queued"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .mount(&server)
+        .await;
+    // staging exists but is not at main's tip — unreadable history (e.g. a
+    // markerless batch whose labels were stripped). It must NOT be deleted.
+    branch_ref("staging", Some("e05ee18")).mount(&server).await;
+    branch_ref("main", Some("ma1n")).mount(&server).await;
+    // The chain read happens before the label reconciliation can short-circuit.
+    commits_mock(
+        "staging",
+        json!([
+            merge_commit(
+                "e05ee18",
+                "Merge 9233ac4beab3da1d84850dc54109c310a6e24404 into 4cc8ec11918de8ec436f7cc660196db6ece2ab63"
+            ),
+            merge_commit("4cc8ec1", "rename: the merge queue drops the bors name")
+        ]),
+    )
+    .mount(&server)
+    .await;
+    Mock::given(method("DELETE"))
+        .and(path_regex(format!(r"/repos/{REPO}/git/refs/.*").as_str()))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(0)
+        .mount(&server)
+        .await;
+    // Instead it is reset to main, which is exactly where the next batch
+    // would move it anyway.
+    Mock::given(method("PATCH"))
+        .and(path(format!("/repos/{REPO}/git/refs/heads/staging")))
+        .and(body_string_contains("ma1n"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let outcome = xero_bot::merge_queue::pump_one(&gh, &cfg, REPO).await;
+    assert_eq!(
+        outcome,
+        xero_bot::merge_queue::PumpOutcome::Idle,
+        "{outcome}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // 5. Advance blocked by protection (405): batch stays alive, no member dropped
 // ---------------------------------------------------------------------------
 
@@ -498,6 +656,7 @@ async fn advance_pr_405_keeps_the_batch() {
     let gh = client_for(&server);
 
     repo_info_mock("main").mount(&server).await;
+    testing_label_mock(&[10, 11]).mount(&server).await;
     branch_ref("staging", Some("m2")).mount(&server).await;
     commits_mock(
         "staging",

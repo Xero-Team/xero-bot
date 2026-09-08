@@ -652,23 +652,85 @@ pub async fn pump_one(gh: &Client, cfg: &Config, repo: &str) -> PumpOutcome {
     };
     let staging = cfg.merge_queue_staging_branch.clone();
 
-    // The chain is the truth about what's testing. The staging ref may be
-    // absent (no batch ever, or cleaned up after one).
+    // The staging ref may be absent (no batch ever, or cleaned up after one).
     let staging_ref = gh.get_branch_ref(repo, &staging).await;
-    let chain = match &staging_ref {
-        Ok(_) => {
-            let commits = match gh.list_commits(repo, &staging, 50).await {
-                Ok(c) => c,
-                Err(e) => return PumpOutcome::Error(format!("staging commits: {e}")),
-            };
-            parse_chain(&commits)
-        }
-        Err(GhError::Api { status: 404, .. }) => Vec::new(),
+    let staging_head = match &staging_ref {
+        Ok(r) => r
+            .pointer("/object/sha")
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .to_string(),
+        Err(GhError::Api { status: 404, .. }) => String::new(),
         Err(e) => return PumpOutcome::Error(format!("staging ref: {e}")),
     };
 
+    // The batch's members are the PRs wearing the testing label — the label is
+    // the state (the codebase convention), and it survives what the commit
+    // chain cannot: GitHub is free to word a merge commit itself (observed on
+    // a fast-forward-able fold: `Merge <head> into <base>`, our
+    // `commit_message` dropped on the floor), so a marker-based parse of the
+    // staging history can come back empty while a batch is very much under
+    // test. The chain read below is advisory — it supplies order and merge
+    // shas when present, and is rebuilt from labels when not.
+    let labeled_members: Vec<i64> = match gh
+        .list_prs_with_label(repo, &cfg.label_merge_queue_testing)
+        .await
+    {
+        Ok(prs) => prs
+            .iter()
+            .filter_map(|p| p.get("number").and_then(|n| n.as_i64()))
+            .collect(),
+        Err(e) => return PumpOutcome::Error(format!("testing list: {e}")),
+    };
+
+    let marked_chain = if staging_head.is_empty() {
+        Vec::new()
+    } else {
+        let commits = match gh.list_commits(repo, &staging, 50).await {
+            Ok(c) => c,
+            Err(e) => return PumpOutcome::Error(format!("staging commits: {e}")),
+        };
+        parse_chain(&commits)
+    };
+
+    // Reconcile: the chain the driver works with. Marker entries win for
+    // order/merge-shas (they are what staging actually points at); testing
+    // members the chain doesn't know about are appended in ascending number
+    // order with the staging tip as their nominal merge commit — the CI read
+    // uses the tip either way, and a reset needs a real sha, which the marked
+    // entries or main provide.
+    let mut chain = marked_chain.clone();
+    for n in &labeled_members {
+        if !chain.iter().any(|e| e.pr == *n) {
+            chain.push(ChainEntry {
+                pr: *n,
+                head_sha: String::new(),
+                merge_commit_sha: staging_head.clone(),
+            });
+        }
+    }
+    // Members the chain knows but the labels don't: a previous tick's label
+    // removal was interrupted, or someone stripped a label by hand. Trust the
+    // labels (they are the state) — a PR that left the batch without its
+    // label is out; rebuild around it so staging stops containing it.
+    let stripped: Vec<ChainEntry> = marked_chain
+        .iter()
+        .filter(|e| !labeled_members.contains(&e.pr))
+        .cloned()
+        .collect();
+    if !stripped.is_empty() && !marked_chain.is_empty() {
+        // Rebuild from the first stripped entry onward: their merge commits
+        // must come off staging, and any still-labeled members after them
+        // must be re-merged (their commits die with the reset).
+        let idx = marked_chain
+            .iter()
+            .position(|e| e.pr == stripped[0].pr)
+            .unwrap_or(0);
+        return rebuild_from(gh, cfg, repo, &marked_chain, idx, "label removed mid-batch").await;
+    }
+
     if chain.is_empty() {
-        return start_batch(gh, cfg, repo, &staging, &default_branch).await;
+        return start_batch(gh, cfg, repo, &staging, &default_branch, &staging_head).await;
     }
 
     // Health check: every member must still be open at the sha we merged.
@@ -678,7 +740,14 @@ pub async fn pump_one(gh: &Client, cfg: &Config, repo: &str) -> PumpOutcome {
 
     // CI on the staging tip. Failed and Pending-with-timeout both end the
     // batch (differently); green advances it.
-    let tip = chain[chain.len() - 1].merge_commit_sha.clone();
+    let tip = staging_head.clone();
+    if tip.is_empty() {
+        // Labeled members but no staging branch: the branch was deleted under
+        // us (the exact bug this reconciliation exists to prevent). Rebuild
+        // the batch from scratch — start_batch force-resets/creates staging
+        // from main and re-folds every member.
+        return start_batch(gh, cfg, repo, &staging, &default_branch, "").await;
+    }
     let ci = crate::review::ci_state_for(gh, repo, &tip).await;
     match &ci {
         crate::review::CiState::Green(_) => {
@@ -701,12 +770,17 @@ pub async fn pump_one(gh: &Client, cfg: &Config, repo: &str) -> PumpOutcome {
 }
 
 /// Start a new batch from the queued PRs, or idle if there are none.
+///
+/// `staging_head` is the staging ref the caller already read (`""` when the
+/// branch is absent); re-reading it here would double the request for no
+/// information.
 async fn start_batch(
     gh: &Client,
     cfg: &Config,
     repo: &str,
     staging: &str,
     default_branch: &str,
+    staging_head: &str,
 ) -> PumpOutcome {
     let queued = match gh
         .list_prs_with_label(repo, &cfg.label_merge_queue_queued)
@@ -722,12 +796,35 @@ async fn start_batch(
     numbers.sort_unstable();
     numbers.truncate(cfg.merge_queue_max_batch);
     if numbers.is_empty() {
-        // Nothing to do. Clean the staging ref up if it's still lying
-        // around — a leftover empty staging would grow into the next batch's
-        // base instead of starting from main's tip.
-        if gh.get_branch_ref(repo, staging).await.is_ok() && cfg.merge_queue_cleanup_staging {
-            if let Err(e) = gh.delete_branch_ref(repo, staging).await {
-                tracing::warn!("merge queue: delete unused {staging} on {repo}: {e}");
+        // Nothing to do. The only staging that is safe to clean up is one
+        // that already points at main's tip — a *pure leftover*. A staging
+        // holding anything else belongs to a batch we may not be able to
+        // read (GitHub has been observed wording merge commits itself,
+        // dropping our marker), and deleting it killed a batch under test
+        // once already: the CI that was about to run on it never ran, and
+        // the members sat labeled and silent until they timed out.
+        if !staging_head.is_empty() && cfg.merge_queue_cleanup_staging {
+            let main_sha = gh
+                .get_branch_ref(repo, default_branch)
+                .await
+                .ok()
+                .and_then(|r| {
+                    r.pointer("/object/sha")
+                        .and_then(|s| s.as_str())
+                        .map(String::from)
+                })
+                .unwrap_or_default();
+            if !main_sha.is_empty() && staging_head == main_sha {
+                if let Err(e) = gh.delete_branch_ref(repo, staging).await {
+                    tracing::warn!("merge queue: delete unused {staging} on {repo}: {e}");
+                }
+            } else if !main_sha.is_empty() {
+                // Reset the leftover to main instead of deleting it: the
+                // next batch needs staging at main's tip anyway, and a
+                // reset is the same write the batch start would do.
+                if let Err(e) = gh.update_branch_ref(repo, staging, &main_sha, true).await {
+                    return PumpOutcome::Error(format!("staging reset: {e}"));
+                }
             }
         }
         return PumpOutcome::Idle;
@@ -749,24 +846,14 @@ async fn start_batch(
     if main_sha.is_empty() {
         return PumpOutcome::Error("main ref has no sha".into());
     }
-    match gh.get_branch_ref(repo, staging).await {
-        Ok(old) => {
-            let old_sha = old
-                .pointer("/object/sha")
-                .and_then(|s| s.as_str())
-                .unwrap_or("");
-            if old_sha != main_sha {
-                if let Err(e) = gh.update_branch_ref(repo, staging, &main_sha, true).await {
-                    return PumpOutcome::Error(format!("staging reset: {e}"));
-                }
-            }
+    if staging_head.is_empty() {
+        if let Err(e) = gh.create_branch_ref(repo, staging, &main_sha).await {
+            return PumpOutcome::Error(format!("staging create: {e}"));
         }
-        Err(GhError::Api { status: 404, .. }) => {
-            if let Err(e) = gh.create_branch_ref(repo, staging, &main_sha).await {
-                return PumpOutcome::Error(format!("staging create: {e}"));
-            }
+    } else if staging_head != main_sha {
+        if let Err(e) = gh.update_branch_ref(repo, staging, &main_sha, true).await {
+            return PumpOutcome::Error(format!("staging reset: {e}"));
         }
-        Err(e) => return PumpOutcome::Error(format!("staging ref: {e}")),
     }
 
     // Fold each head in, in order. A conflict drops that PR (with a clear

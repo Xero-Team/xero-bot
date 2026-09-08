@@ -6,7 +6,10 @@ name: CI
 # repositories in a temp dir and skip themselves if `git` is missing.
 on:
   push:
-    branches: [main]
+    # `staging` is the merge queue's test branch: batches are folded onto it
+    # and only advance to main once CI passes *on staging*. Leaving it out
+    # means a batch never gets a verdict and times out.
+    branches: [main, staging]
   pull_request:
   workflow_dispatch:
 
