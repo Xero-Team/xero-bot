@@ -594,6 +594,13 @@ pub async fn pump_all(cfg: &Config) -> String {
     let mut repos = 0usize;
     let mut errors = 0usize;
     let mut skipped = 0usize;
+    // A quiet tick is the normal case — the queue walks every installation
+    // every 30s, and on most of them there is nothing to do. Logging the
+    // summary at info every tick buried the tick that actually did something
+    // (33 repos × 30s ≈ one `pump done` line every 100s, forever). Quiet
+    // ticks log at debug; any tick with an action or a failure logs at info
+    // and carries the per-repo lines above it.
+    let mut active = false;
 
     for inst in &installations {
         let Some(inst_id) = inst.get("id").and_then(|i| i.as_i64()) else {
@@ -601,12 +608,14 @@ pub async fn pump_all(cfg: &Config) -> String {
         };
         let Ok(gh) = crate::github::Client::installation_resolved(cfg, inst_id).await else {
             errors += 1;
+            active = true;
             continue;
         };
         let repos_list = match crate::github::Client::installation_repositories_via(&gh).await {
             Ok(r) => r,
             Err(_) => {
                 errors += 1;
+                active = true;
                 continue;
             }
         };
@@ -625,9 +634,13 @@ pub async fn pump_all(cfg: &Config) -> String {
                         start_backoff(&repo);
                     }
                     errors += 1;
+                    active = true;
                     tracing::warn!("merge queue pump {repo}: {e}");
                 }
-                other => tracing::info!("merge queue pump {repo}: {other}"),
+                other => {
+                    active = true;
+                    tracing::info!("merge queue pump {repo}: {other}");
+                }
             }
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
@@ -635,7 +648,11 @@ pub async fn pump_all(cfg: &Config) -> String {
 
     let summary =
         format!("merge queue pump done: {repos} repos, {errors} errors, {skipped} backed off");
-    tracing::info!("{summary}");
+    if active {
+        tracing::info!("{summary}");
+    } else {
+        tracing::debug!("{summary}");
+    }
     summary
 }
 
