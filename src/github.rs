@@ -56,7 +56,9 @@ const UNRESERVED_PATH: &percent_encoding::AsciiSet = &UNRESERVED.remove(b'/');
 
 /// Percent-encode one path segment. `/` is encoded too, so a label named
 /// `needs/rebase` addresses one segment instead of splitting into two.
-fn enc_seg(s: &str) -> String {
+/// `pub(crate)` for the bors driver, whose branch-name routes are built
+/// outside the method bodies that normally do their own encoding.
+pub(crate) fn enc_seg(s: &str) -> String {
     percent_encoding::utf8_percent_encode(s, UNRESERVED).to_string()
 }
 
@@ -128,6 +130,20 @@ impl std::fmt::Display for ReviewPostMode {
     }
 }
 
+/// What `POST /repos/{repo}/merges` actually did.
+///
+/// The endpoint answers 204 "nothing to merge" when `base` already
+/// contains `head`. That is not an error — it is the recovery signal for a
+/// driver whose previous attempt succeeded but died before recording it —
+/// so it gets its own variant instead of masquerading as a fresh sha.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MergeOutcome {
+    /// 201 with the new merge commit's sha.
+    Created(String),
+    /// 204 — base already contains head; nothing was written.
+    AlreadyMerged,
+}
+
 /// Normalize a GitHub login for comparison.
 ///
 /// A GitHub App authors comments and reviews as `name[bot]`, so any equality
@@ -185,7 +201,9 @@ pub async fn resolve_app_slug(cfg: &Config) -> String {
     resolved
 }
 
-fn chrono_now_secs() -> i64 {
+/// Wall-clock seconds since the epoch (0 if the clock is behind — JWT would
+/// be rejected anyway). Shared with the bors driver's timeout clock.
+pub fn chrono_now_secs() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -309,7 +327,8 @@ impl Client {
     }
 
     /// GET every page of a paginated route. See [`paginate`].
-    async fn get_all(&self, route: &str) -> Result<Vec<Value>, GhError> {
+    /// `pub(crate)`: the bors driver builds a few list routes directly.
+    pub(crate) async fn get_all(&self, route: &str) -> Result<Vec<Value>, GhError> {
         paginate(&self.crab, route).await
     }
 
@@ -927,6 +946,206 @@ impl Client {
         self.get_all(&format!(
             "/repos/{repo}/commits/{sha}/statuses?per_page=100"
         ))
+        .await
+    }
+
+    // -------------------------------------------------------------------
+    // Git data (branches, commits) and merges — the bors merge queue's writes
+    // -------------------------------------------------------------------
+
+    /// Repo metadata; the merge queue reads `default_branch` from it (the
+    /// queue targets a renamed default correctly, without hardcoding "main").
+    pub async fn repo_info(&self, repo: &str) -> Result<Value, GhError> {
+        self.get(&format!("/repos/{repo}")).await
+    }
+
+    /// Merge `head` into `base` (`POST /repos/{repo}/merges`), producing a
+    /// merge commit whose message is `message`.
+    ///
+    /// This is the primitive the bors driver uses to fold a PR head into the
+    /// staging branch — the pulls merge endpoint cannot do it, because it only
+    /// merges a PR into *its own* base.
+    ///
+    /// Status mapping, each deliberately distinct:
+    /// - 201 → [`MergeOutcome::Created`]
+    /// - 204 → [`MergeOutcome::AlreadyMerged`]
+    /// - 409 → conflict, propagated (the caller dequeues the PR rather than
+    ///   resetting the branch — the conflict may be with another member)
+    /// - anything else → propagated
+    ///
+    /// A 200 whose body says `merged: false` is documented behavior of this
+    /// endpoint in odd states; since no sha was produced, it is reported as a
+    /// conflict-equivalent 409 so callers take the same no-reset path.
+    pub async fn merge_branches(
+        &self,
+        repo: &str,
+        base: &str,
+        head: &str,
+        message: &str,
+    ) -> Result<MergeOutcome, GhError> {
+        let route = format!("/repos/{repo}/merges");
+        let body = json!({"base": base, "head": head, "commit_message": message});
+        // Raw request rather than `crab.post`: that helper deserializes the
+        // body into one type, and this endpoint legitimately returns both a
+        // 201 with JSON and a 204 with none — the split *is* the information
+        // (see [`MergeOutcome`]).
+        let uri: http::Uri = route
+            .parse()
+            .map_err(|_| GhError::BadShape(format!("bad route: {route}")))?;
+        let req = http::Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("Content-Type", "application/json")
+            .body(body.to_string().into_bytes())
+            .map_err(|e| GhError::BadShape(e.to_string()))?;
+        let resp = self.crab.execute(req).await.map_err(classify_octo_error)?;
+        let status = resp.status().as_u16();
+        if status == 204 {
+            return Ok(MergeOutcome::AlreadyMerged);
+        }
+        let value: Value = serde_json::from_slice(
+            &http_body_util::BodyExt::collect(resp.into_body())
+                .await
+                .map_err(|e| GhError::BadShape(e.to_string()))?
+                .to_bytes(),
+        )
+        .map_err(|e| GhError::BadShape(e.to_string()))?;
+        if (200..300).contains(&status) {
+            match value.get("sha").and_then(|s| s.as_str()) {
+                Some(sha) => Ok(MergeOutcome::Created(sha.to_string())),
+                None => Err(GhError::BadShape(format!(
+                    "merges {base}<-{head}: 201 without a sha"
+                ))),
+            }
+        } else {
+            let message = value
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("")
+                .to_string();
+            // `merged: false` with 200: treat like a conflict — no commit was
+            // produced, so the member is dropped, not the branch reset.
+            let status = if status == 200 { 409 } else { status };
+            Err(GhError::Api { status, message })
+        }
+    }
+
+    /// A branch ref, or its 404 (the caller distinguishes "absent" from
+    /// "unreadable").
+    pub async fn get_branch_ref(&self, repo: &str, branch: &str) -> Result<Value, GhError> {
+        self.get(&format!("/repos/{repo}/git/ref/heads/{}", enc_seg(branch)))
+            .await
+    }
+
+    /// Create a branch ref pointing at `sha`.
+    pub async fn create_branch_ref(
+        &self,
+        repo: &str,
+        name: &str,
+        sha: &str,
+    ) -> Result<(), GhError> {
+        self.post(
+            &format!("/repos/{repo}/git/refs"),
+            Some(json!({"ref": format!("refs/heads/{name}"), "sha": sha})),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Move a branch ref to `sha`. `force` allows moving backwards (the
+    /// staging resets); without it GitHub refuses non-fast-forward updates.
+    pub async fn update_branch_ref(
+        &self,
+        repo: &str,
+        branch: &str,
+        sha: &str,
+        force: bool,
+    ) -> Result<(), GhError> {
+        self.patch(
+            &format!("/repos/{repo}/git/refs/heads/{}", enc_seg(branch)),
+            Some(json!({"sha": sha, "force": force})),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Delete a branch ref.
+    pub async fn delete_branch_ref(&self, repo: &str, branch: &str) -> Result<(), GhError> {
+        self.delete(&format!("/repos/{repo}/git/refs/heads/{}", enc_seg(branch)))
+            .await
+    }
+
+    /// Recent commits on a branch, newest first.
+    pub async fn list_commits(
+        &self,
+        repo: &str,
+        sha: &str,
+        per_page: u32,
+    ) -> Result<Vec<Value>, GhError> {
+        self.get_all(&format!(
+            "/repos/{repo}/commits?sha={}&per_page={per_page}",
+            enc_seg(sha)
+        ))
+        .await
+    }
+
+    /// Open issues/PRs carrying one label. Only actual PRs are returned —
+    /// the issues search also serves plain issues, which the queue must
+    /// never treat as merge candidates.
+    pub async fn list_prs_with_label(
+        &self,
+        repo: &str,
+        label: &str,
+    ) -> Result<Vec<Value>, GhError> {
+        let all = self
+            .get_all(&format!(
+                "/repos/{repo}/issues?labels={}&state=open&per_page=100",
+                enc_seg(label)
+            ))
+            .await?;
+        Ok(all
+            .into_iter()
+            .filter(|v| v.get("pull_request").is_some())
+            .collect())
+    }
+
+    /// Create a pull request, returning its number.
+    pub async fn create_pr(
+        &self,
+        repo: &str,
+        head: &str,
+        base: &str,
+        title: &str,
+        body: &str,
+    ) -> Result<Value, GhError> {
+        self.post(
+            &format!("/repos/{repo}/pulls"),
+            Some(json!({"head": head, "base": base, "title": title, "body": body})),
+        )
+        .await
+    }
+
+    /// Merge a pull request (`PUT /repos/{repo}/pulls/{n}/merge`).
+    ///
+    /// A 405 ("Pull Request is not mergeable") must reach the caller intact:
+    /// it is the branch-protection refusal, and the merge queue's response to
+    /// it — keep the batch, explain, retry — depends on the status.
+    pub async fn merge_pr(
+        &self,
+        repo: &str,
+        number: i64,
+        merge_method: &str,
+        title: &str,
+        message: &str,
+    ) -> Result<Value, GhError> {
+        self.put(
+            &format!("/repos/{repo}/pulls/{number}/merge"),
+            Some(json!({
+                "merge_method": merge_method,
+                "commit_title": title,
+                "commit_message": message,
+            })),
+        )
         .await
     }
 
