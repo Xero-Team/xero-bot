@@ -101,6 +101,26 @@ pub enum WebhookEvent {
         label: String,
         installation_id: i64,
     },
+    /// pull_request_review submitted — a human's approval (or
+    /// changes-requested) drives the merge queue. The review's state travels
+    /// raw (`APPROVED` / `CHANGES_REQUESTED` / `COMMENTED`); filtering by
+    /// state happens at routing so dismissed/commented payloads stay cheap.
+    ///
+    /// `via_app_id` is `review.performed_via_github_app.id` — GitHub omits
+    /// the object entirely for human reviews, and our own r+ reviews carry
+    /// it. That asymmetry is the front-line guard against the bot reacting
+    /// to its own relayed approvals (an infinite loop otherwise: r+ fires a
+    /// review, the review fires the route, the route fires r+ …).
+    PrReview {
+        repo: String,
+        pr_number: i64,
+        action: String,
+        state: String,
+        reviewer: String,
+        reviewer_is_bot: bool,
+        via_app_id: Option<i64>,
+        installation_id: i64,
+    },
     Ignored(String),
 }
 
@@ -162,7 +182,7 @@ pub fn classify(event_header: &str, payload: &Value) -> WebhookEvent {
                     _ => WebhookEvent::Ignored("bad labeled payload".into()),
                 };
             }
-            if !matches!(action, "synchronize" | "reopened" | "opened") {
+            if !matches!(action, "synchronize" | "reopened" | "opened" | "closed") {
                 return WebhookEvent::Ignored(format!("action {action} not handled"));
             }
             match (
@@ -177,6 +197,36 @@ pub fn classify(event_header: &str, payload: &Value) -> WebhookEvent {
                     installation_id,
                 },
                 _ => WebhookEvent::Ignored("bad pull_request payload".into()),
+            }
+        }
+        "pull_request_review" => {
+            let action = jstr_or(payload, &["action"], "");
+            if action != "submitted" {
+                return WebhookEvent::Ignored(format!("action {action} not handled"));
+            }
+            let Some(installation_id) = ji64(payload, &["installation", "id"]) else {
+                return WebhookEvent::Ignored("no installation".into());
+            };
+            let Some(pr_number) = ji64(payload, &["pull_request", "number"]) else {
+                return WebhookEvent::Ignored("no PR number".into());
+            };
+            let Some(repo) = jstr(payload, &["repository", "full_name"]) else {
+                return WebhookEvent::Ignored("no repo".into());
+            };
+            let state = jstr_or(payload, &["review", "state"], "");
+            let reviewer = jstr_or(payload, &["review", "user", "login"], "");
+            WebhookEvent::PrReview {
+                repo: repo.to_string(),
+                pr_number,
+                action: action.to_string(),
+                state: state.to_string(),
+                reviewer: reviewer.to_string(),
+                reviewer_is_bot: jstr(payload, &["review", "user", "type"]) == Some("Bot"),
+                // Unlike issue comments, a review payload omits
+                // `performed_via_github_app` for human authors; its presence
+                // means the review was authored through an App — usually ours.
+                via_app_id: ji64(payload, &["review", "performed_via_github_app", "id"]),
+                installation_id,
             }
         }
         other => WebhookEvent::Ignored(other.to_string()),
@@ -347,6 +397,100 @@ mod tests {
         match classify("pull_request", &payload) {
             WebhookEvent::PrLabeled { label, .. } => assert_eq!(label, "codeql"),
             other => panic!("expected PrLabeled, got {other:?}"),
+        }
+    }
+
+    /// A human's web-UI approval: no `performed_via_github_app` at all, which
+    /// is precisely how the queue tells "someone approved" from "we relayed
+    /// an approval".
+    #[test]
+    fn test_classify_pr_review_approved() {
+        let payload = json!({
+            "action": "submitted",
+            "installation": {"id": 42},
+            "repository": {"full_name": "octocat/hello"},
+            "pull_request": {"number": 7},
+            "review": {"state": "APPROVED", "user": {"login": "alice", "type": "User"}}
+        });
+        match classify("pull_request_review", &payload) {
+            WebhookEvent::PrReview {
+                repo,
+                pr_number,
+                state,
+                reviewer,
+                reviewer_is_bot,
+                via_app_id,
+                ..
+            } => {
+                assert_eq!(repo, "octocat/hello");
+                assert_eq!(pr_number, 7);
+                assert_eq!(state, "APPROVED");
+                assert_eq!(reviewer, "alice");
+                assert!(!reviewer_is_bot);
+                assert_eq!(via_app_id, None);
+            }
+            other => panic!("expected PrReview, got {other:?}"),
+        }
+    }
+
+    /// Our own r+ posts an APPROVE review *as the App*; the payload must
+    /// expose that so routing can refuse to enqueue on it.
+    #[test]
+    fn test_classify_pr_review_from_app() {
+        let payload = json!({
+            "action": "submitted",
+            "installation": {"id": 42},
+            "repository": {"full_name": "octocat/hello"},
+            "pull_request": {"number": 7},
+            "review": {
+                "state": "APPROVED",
+                "user": {"login": "xero-review[bot]", "type": "Bot"},
+                "performed_via_github_app": {"id": 4768775}
+            }
+        });
+        match classify("pull_request_review", &payload) {
+            WebhookEvent::PrReview {
+                reviewer,
+                reviewer_is_bot,
+                via_app_id,
+                ..
+            } => {
+                assert_eq!(reviewer, "xero-review[bot]");
+                assert!(reviewer_is_bot);
+                assert_eq!(via_app_id, Some(4768775));
+            }
+            other => panic!("expected PrReview, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_classify_pr_review_dismissed_is_not_submitted() {
+        let payload = json!({
+            "action": "dismissed",
+            "installation": {"id": 42},
+            "repository": {"full_name": "octocat/hello"},
+            "pull_request": {"number": 7},
+            "review": {"state": "DISMISSED", "user": {"login": "alice"}}
+        });
+        assert!(matches!(
+            classify("pull_request_review", &payload),
+            WebhookEvent::Ignored(_)
+        ));
+    }
+
+    /// `closed` is an *action* of the already-subscribed pull_request event,
+    /// so no new subscription is needed — the queue just has to see it.
+    #[test]
+    fn test_classify_pull_request_closed() {
+        let payload = json!({
+            "action": "closed",
+            "installation": {"id": 42},
+            "repository": {"full_name": "octocat/hello"},
+            "pull_request": {"number": 7}
+        });
+        match classify("pull_request", &payload) {
+            WebhookEvent::PullRequest { action, .. } => assert_eq!(action, "closed"),
+            other => panic!("expected PullRequest, got {other:?}"),
         }
     }
 }

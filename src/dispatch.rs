@@ -116,12 +116,29 @@ pub fn route_event(cfg: &Config, event_header: &str, payload: &Value) -> Routing
             pr_number,
             action,
             installation_id,
-        } => Routing::Act(Work::RebaseCheck {
-            repo,
-            pr_number,
-            action,
-            installation_id,
-        }),
+        } => {
+            // `closed` exists only for the merge queue (dequeue on close);
+            // without it the action is noise and stays ignored — byte-for-byte
+            // the pre-bors behavior.
+            if action == "closed" {
+                if cfg.bors_enabled {
+                    return Routing::Act(Work::BorsPrClosed {
+                        repo,
+                        pr_number,
+                        installation_id,
+                    });
+                }
+                return Routing::Respond(
+                    serde_json::json!({"ignored": "closed: merge queue disabled"}),
+                );
+            }
+            Routing::Act(Work::RebaseCheck {
+                repo,
+                pr_number,
+                action,
+                installation_id,
+            })
+        }
         WebhookEvent::PrLabeled {
             repo,
             pr_number,
@@ -137,6 +154,56 @@ pub fn route_event(cfg: &Config, event_header: &str, payload: &Value) -> Routing
             } else {
                 Routing::Respond(serde_json::json!({"ignored": "label not configured"}))
             }
+        }
+        WebhookEvent::PrReview {
+            repo,
+            pr_number,
+            action,
+            state,
+            reviewer,
+            reviewer_is_bot,
+            via_app_id,
+            installation_id,
+        } => {
+            // The r+ relay posts its APPROVE *as this App*, and GitHub then
+            // delivers the very event we're handling. Enqueueing on our own
+            // review would be an infinite loop — r+ fires a review, the
+            // review fires this route, the route fires r+. Two independent
+            // checks, same pattern as the self-comment guards above: the App
+            // id, which is name-independent, and the login, which needs the
+            // `[bot]` suffix stripped.
+            if let (Some(via), Ok(own)) = (via_app_id, cfg.app_id.parse::<i64>()) {
+                if via == own {
+                    return Routing::Respond(serde_json::json!({"ignored": "self review"}));
+                }
+            }
+            if reviewer_is_bot && !reviewer.is_empty() {
+                let own = normalize_login(&cfg.bot_name);
+                let configured = normalize_login(&cfg.app_slug);
+                let them = normalize_login(&reviewer);
+                if them == own || (!configured.is_empty() && them == configured) {
+                    return Routing::Respond(serde_json::json!({"ignored": "self review"}));
+                }
+            }
+            if action != "submitted" {
+                return Routing::Respond(serde_json::json!({"ignored": "not submitted"}));
+            }
+            // COMMENTED reviews say nothing about merge-worthiness; DISMISSED
+            // is an action, not a submitted state. Only the two verdicts that
+            // gate a merge are worth a work item.
+            if !matches!(state.as_str(), "APPROVED" | "CHANGES_REQUESTED") {
+                return Routing::Respond(serde_json::json!({"ignored": "state not a verdict"}));
+            }
+            if !cfg.bors_enabled {
+                return Routing::Respond(serde_json::json!({"ignored": "merge queue disabled"}));
+            }
+            Routing::Act(Work::PrReview {
+                repo,
+                pr_number,
+                state,
+                reviewer,
+                installation_id,
+            })
         }
     }
 }
@@ -183,6 +250,24 @@ pub enum Work {
         installation_id: i64,
     },
     Codeql {
+        repo: String,
+        pr_number: i64,
+        installation_id: i64,
+    },
+    /// A human's review verdict arrived; drive the queue (approve → enqueue,
+    /// changes-requested → dequeue). Only APPROVED/CHANGES_REQUESTED pass
+    /// routing, so the state is one of those two by construction.
+    PrReview {
+        repo: String,
+        pr_number: i64,
+        state: String,
+        reviewer: String,
+        installation_id: i64,
+    },
+    /// A PR (or anything shaped like one) was closed; if it was queued or in
+    /// the batch, take it out. `merged` is decided at execution — the queue
+    /// only needs to know the PR is gone.
+    BorsPrClosed {
         repo: String,
         pr_number: i64,
         installation_id: i64,
@@ -347,6 +432,32 @@ commands like yours work without the mention."
             tracing::info!("codeql report {repo}#{pr_number}: {status}");
             Ok(())
         }
+        Work::PrReview {
+            repo,
+            pr_number,
+            state,
+            reviewer,
+            installation_id,
+        } => {
+            let gh = Client::installation_resolved(cfg, installation_id)
+                .await
+                .map_err(|e| format!("installation client: {e}"))?;
+            let status =
+                crate::bors::handle_review(&gh, cfg, &repo, pr_number, &state, &reviewer).await;
+            tracing::info!("bors review {repo}#{pr_number} ({state} by {reviewer}): {status}");
+            Ok(())
+        }
+        Work::BorsPrClosed {
+            repo,
+            pr_number,
+            installation_id,
+        } => {
+            let gh = Client::installation(cfg, installation_id, "")
+                .map_err(|e| format!("installation client: {e}"))?;
+            let status = crate::bors::handle_pr_closed(&gh, cfg, &repo, pr_number).await;
+            tracing::info!("bors closed {repo}#{pr_number}: {status}");
+            Ok(())
+        }
     }
 }
 
@@ -390,6 +501,143 @@ mod tests {
             Routing::Respond(v) => v.get("ignored").and_then(|s| s.as_str()).map(String::from),
             Routing::Act(_) => None,
         }
+    }
+
+    /// A human's `pull_request_review` payload; `review` is merged in.
+    fn review_payload(review: serde_json::Value) -> serde_json::Value {
+        json!({
+            "action": "submitted",
+            "installation": {"id": 42},
+            "repository": {"full_name": "Xero-Team/xero-bot"},
+            "pull_request": {"number": 7},
+            "review": review
+        })
+    }
+
+    fn bors_cfg() -> Config {
+        let mut c = cfg();
+        c.bors_enabled = true;
+        c
+    }
+
+    /// A human APPROVED is the queue's second trigger (the first is r+).
+    #[test]
+    fn human_approval_routes_to_bors_when_enabled() {
+        let p = review_payload(json!({"state": "APPROVED", "user": {"login": "alice"}}));
+        match route_event(&bors_cfg(), "pull_request_review", &p) {
+            Routing::Act(Work::PrReview {
+                state, reviewer, ..
+            }) => {
+                assert_eq!(state, "APPROVED");
+                assert_eq!(reviewer, "alice");
+            }
+            other => panic!("expected Act(PrReview), got {other:?}"),
+        }
+    }
+
+    /// CHANGES_REQUESTED dequeues a member; the state travels raw.
+    #[test]
+    fn changes_requested_routes_to_bors_when_enabled() {
+        let p = review_payload(json!({"state": "CHANGES_REQUESTED", "user": {"login": "bob"}}));
+        let r = route_event(&bors_cfg(), "pull_request_review", &p);
+        assert!(matches!(r, Routing::Act(Work::PrReview { .. })), "{r:?}");
+    }
+
+    /// COMMENTED reviews don't gate a merge — nothing to act on.
+    #[test]
+    fn commented_review_is_ignored() {
+        let p = review_payload(json!({"state": "COMMENTED", "user": {"login": "alice"}}));
+        assert_eq!(
+            ignored_reason(&route_event(&bors_cfg(), "pull_request_review", &p)).as_deref(),
+            Some("state not a verdict")
+        );
+    }
+
+    /// The r+ relay posts its APPROVE as the App; GitHub delivers that as this
+    /// very event. Without the guard the route would enqueue on it, and r+
+    /// would fire again — an infinite loop of reviews. The App-id check runs
+    /// even when the reviewer login isn't ours (e.g. a misconfigured BOT_NAME).
+    #[test]
+    fn self_review_ignored_via_app_id() {
+        let p = review_payload(json!({
+            "state": "APPROVED",
+            "user": {"login": "whatever[bot]", "type": "Bot"},
+            "performed_via_github_app": {"id": 4768775}
+        }));
+        let r = route_event(&bors_cfg(), "pull_request_review", &p);
+        assert_eq!(ignored_reason(&r).as_deref(), Some("self review"));
+    }
+
+    /// The login check covers the case the App id can't: a review posted
+    /// through the API on behalf of the App's identity.
+    #[test]
+    fn self_review_ignored_via_bot_login() {
+        let p = review_payload(json!({
+            "state": "APPROVED",
+            "user": {"login": "xero-team-bot[bot]", "type": "Bot"}
+        }));
+        let r = route_event(&bors_cfg(), "pull_request_review", &p);
+        assert_eq!(ignored_reason(&r).as_deref(), Some("self review"));
+    }
+
+    /// A similarly-named human must not be swallowed by the guard.
+    #[test]
+    fn similar_reviewer_not_treated_as_self() {
+        let p = review_payload(json!({
+            "state": "APPROVED",
+            "user": {"login": "xero-team-bot-helper", "type": "User"}
+        }));
+        let r = route_event(&bors_cfg(), "pull_request_review", &p);
+        assert!(matches!(r, Routing::Act(_)), "{r:?}");
+    }
+
+    /// Without BORS_ENABLED the queue must be entirely inert: the old
+    /// deployments' behavior is byte-for-byte preserved.
+    #[test]
+    fn review_events_ignored_without_bors() {
+        for state in ["APPROVED", "CHANGES_REQUESTED"] {
+            let p = review_payload(json!({"state": state, "user": {"login": "alice"}}));
+            assert_eq!(
+                ignored_reason(&route_event(&cfg(), "pull_request_review", &p)).as_deref(),
+                Some("merge queue disabled")
+            );
+        }
+    }
+
+    /// `pull_request closed` feeds the queue's dequeue-on-close; without the
+    /// feature it stays ignored exactly as before.
+    #[test]
+    fn pr_closed_routes_only_with_bors() {
+        let payload = json!({
+            "action": "closed",
+            "installation": {"id": 42},
+            "repository": {"full_name": "Xero-Team/xero-bot"},
+            "pull_request": {"number": 7}
+        });
+        let r = route_event(&bors_cfg(), "pull_request", &payload);
+        assert!(
+            matches!(r, Routing::Act(Work::BorsPrClosed { .. })),
+            "{r:?}"
+        );
+        let r = route_event(&cfg(), "pull_request", &payload);
+        assert_eq!(
+            ignored_reason(&r).as_deref(),
+            Some("closed: merge queue disabled")
+        );
+    }
+
+    /// The rebase path keeps its actions: `closed` must not have broadened
+    /// what reaches it.
+    #[test]
+    fn synchronize_still_routes_to_rebase() {
+        let payload = json!({
+            "action": "synchronize",
+            "installation": {"id": 42},
+            "repository": {"full_name": "Xero-Team/xero-bot"},
+            "pull_request": {"number": 7}
+        });
+        let r = route_event(&bors_cfg(), "pull_request", &payload);
+        assert!(matches!(r, Routing::Act(Work::RebaseCheck { .. })), "{r:?}");
     }
 
     /// The help text lists every command as `@bot <verb>`, so reacting to our own
