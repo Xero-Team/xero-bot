@@ -90,6 +90,27 @@ async fn main() {
         });
     }
 
+    // merge queue driver loop. Sleep-first like the rebase sweep: a restart
+    // mid-batch recovers on the first tick, but booting shouldn't immediately
+    // race GitHub's webhooks with a burst of staging writes. One loop, never
+    // concurrent with itself — the staging ref and the label dance have no
+    // lock, and two writers would corrupt both.
+    if cfg.bors_enabled {
+        tracing::info!(
+            "merge queue enabled: staging branch {:?}, poll every {}s",
+            cfg.bors_staging_branch,
+            cfg.bors_poll_interval_secs
+        );
+        let bors_cfg = cfg.clone();
+        tokio::spawn(async move {
+            let interval = std::time::Duration::from_secs(bors_cfg.bors_poll_interval_secs.max(15));
+            loop {
+                tokio::time::sleep(interval).await;
+                let _ = xero_bot::bors::pump_all(&bors_cfg).await;
+            }
+        });
+    }
+
     let port = cfg.port;
     let bot_name = cfg.bot_name.clone();
     let state = AppState { cfg };
@@ -183,8 +204,16 @@ async fn cron_sweep(
         );
     }
     let summary = xero_bot::rebase::sweep(&state.cfg).await;
+    // The queue rides the same external trigger as the sweep, as a
+    // belt-and-braces complement to the built-in loop (and the only driver
+    // tick when the built-in loop is off).
+    let bors_summary = if state.cfg.bors_enabled {
+        xero_bot::bors::pump_all(&state.cfg).await
+    } else {
+        "bors disabled".to_string()
+    };
     (
         StatusCode::OK,
-        Json(json!({"ok": true, "summary": summary})),
+        Json(json!({"ok": true, "summary": summary, "bors": bors_summary})),
     )
 }
