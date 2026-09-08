@@ -309,6 +309,19 @@ mod tests {
             cmds("xero-review", "@xero-review release-assignment"),
             vec![Command::Unclaim]
         );
+        // take / untake are aliases of claim / unclaim — same commands, not
+        // new ones. Like claim itself they need the mention: the bare list
+        // deliberately excludes argumentless-but-prose-prone verbs.
+        assert_eq!(
+            cmds("xero-review", "@xero-review take"),
+            vec![Command::Claim]
+        );
+        assert_eq!(
+            cmds("xero-review", "@xero-review untake"),
+            vec![Command::Unclaim]
+        );
+        assert_eq!(bare_command_candidate("take"), None);
+        assert_eq!(bare_command_candidate("untake"), None);
     }
 
     #[test]

@@ -42,7 +42,7 @@ Xero-Team 的组织级 GitHub App 机器人。Rust 实现,单二进制,自托管
 | `@xero-review blocked` | 标记受阻(`blocked`) |
 | `@xero-review label +bug -wip` | 添加/移除标签 |
 | `@xero-review assign @user` | 指派给 @user |
-| `@xero-review claim` / `unclaim` | 认领/释放(指派给自己/移除自己) |
+| `@xero-review claim` / `unclaim`(别名 `take` / `untake`) | 认领/释放(指派给自己/移除自己) |
 | `@xero-review r+` | 代审批:bot 校验评论者有 write 权限、且不是本 PR 作者后,以其名义提交 APPROVE review |
 | `@xero-review r+ as @user` | 以 @user 名义代审批(即 bors 的 `r=`,用于转发在其他渠道给出的批准)。**未设 `R_PLUS_ALLOW_ON_BEHALF=true` 时一律拒绝** —— 见[审批](#审批) |
 | `@xero-review r-` | 撤回 bot 之前的 APPROVE(dismiss) |
