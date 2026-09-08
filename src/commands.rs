@@ -81,6 +81,8 @@ pub enum Command {
     Reject,
     /// codeql report
     Codeql,
+    /// merge queue status (repo-level; works on issues too)
+    Queue,
 }
 
 impl Command {
@@ -109,7 +111,9 @@ impl Command {
             | Command::Label { .. }
             | Command::Assign { .. }
             | Command::Claim
-            | Command::Unclaim => false,
+            | Command::Unclaim
+            // repo-level state; asking from an issue is meaningful
+            | Command::Queue => false,
         }
     }
 }
@@ -331,6 +335,33 @@ mod tests {
             cmds("xero-review", "@xero-review codeql"),
             vec![Command::Codeql]
         );
+    }
+
+    /// The queue status command: plain, chained, and case-insensitive.
+    #[test]
+    fn test_queue() {
+        assert_eq!(
+            cmds("xero-review", "@xero-review queue"),
+            vec![Command::Queue]
+        );
+        assert_eq!(
+            cmds("xero-review", "@Xero-Review QUEUE"),
+            vec![Command::Queue]
+        );
+        // chains like any nullary
+        assert_eq!(
+            cmds("xero-review", "@xero-review ping; queue"),
+            vec![Command::Ping, Command::Queue]
+        );
+    }
+
+    /// `queue` is deliberately absent from the bare (mention-free) verb list:
+    /// "queue" is ordinary prose in a way "review" rarely is, and a misfired
+    /// status command is worse than an un-executed one — same policy as
+    /// `claim`/`label`.
+    #[test]
+    fn queue_is_not_a_bare_verb() {
+        assert_eq!(bare_command_candidate("queue"), None);
     }
 
     #[test]
@@ -780,12 +811,13 @@ mod tests {
             },
             Command::Claim,
             Command::Unclaim,
+            Command::Queue,
         ];
         for c in &issue_ok {
             assert!(!c.requires_pr(), "{c:?} works on an issue");
         }
         // and every variant is accounted for above
-        assert_eq!(pr_only.len() - 1 + issue_ok.len(), 15);
+        assert_eq!(pr_only.len() - 1 + issue_ok.len(), 16);
     }
 
     /// The input that started all of this. The help table lists every command,
@@ -798,13 +830,17 @@ mod tests {
         for lang in [crate::lang::Lang::En, crate::lang::Lang::Zh] {
             // Both settings of the on-behalf gate: it rewrites a row of the
             // table, and a row is exactly where a live command would hide.
+            // Same for the queue note, which names the `queue` command.
             for on_behalf in [false, true] {
-                let help = crate::handlers::help_text("bot", lang, on_behalf);
-                let out = parse_commands("bot", &help);
-                assert!(
-                    out.commands.is_empty() && out.diagnostics.is_empty(),
-                    "{lang:?} help text (on_behalf={on_behalf}) must be inert, got {out:?}"
-                );
+                for bors in [false, true] {
+                    let help = crate::handlers::help_text("bot", bors, lang, on_behalf);
+                    let out = parse_commands("bot", &help);
+                    assert!(
+                        out.commands.is_empty() && out.diagnostics.is_empty(),
+                        "{lang:?} help text (on_behalf={on_behalf}, bors={bors}) must be inert, \
+got {out:?}"
+                    );
+                }
             }
         }
     }

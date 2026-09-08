@@ -26,10 +26,38 @@ pub struct CommentContext {
     pub lang: Lang,
 }
 
-/// `on_behalf` is `cfg.r_plus_allow_on_behalf`: the table promised
-/// `r+ as @user` unconditionally, and with the gate closed by default that is a
-/// command the help advertises and the bot then refuses.
-pub fn help_text(bot_name: &str, lang: Lang, on_behalf: bool) -> String {
+/// The trailing note under the command table. With the merge queue on, it
+/// documents r+'s second effect; without it, only the needs-rebase note —
+/// one function rather than per-row flags, so the two deployments' helps
+/// can't drift apart row by row.
+fn queue_note(bors_enabled: bool, lang: Lang) -> String {
+    match lang {
+        Lang::En => {
+            if bors_enabled {
+                "A successful `r+` (or a web Approve by a write+ reviewer) **queues the PR for \
+automatic merge** — batches are tested on the `staging` branch, then advanced to `main`. \
+`r-` withdraws from the queue; `queue` shows it. Conflicted PRs are labelled \
+`needs-rebase` automatically."
+                    .to_string()
+            } else {
+                "_Conflicted PRs are labelled `needs-rebase` automatically, with a reminder._"
+                    .to_string()
+            }
+        }
+        Lang::Zh => {
+            if bors_enabled {
+                "成功的 `r+`(或网页上 write+ 审阅者的 Approve)会**将 PR 加入自动合并队列** \
+—— 批次先在 `staging` 分支上测试,全绿后推进 `main`。`r-` 撤回出队;`queue` 查看队列。\
+冲突的 PR 会被自动打上 `needs-rebase` 标签。"
+                    .to_string()
+            } else {
+                "_冲突的 PR 会被自动打上 `needs-rebase` 标签并提醒。_".to_string()
+            }
+        }
+    }
+}
+
+pub fn help_text(bot_name: &str, bors_enabled: bool, lang: Lang, on_behalf: bool) -> String {
     match lang {
         Lang::En => format!(
             "### xero-bot commands\n\n\
@@ -49,13 +77,15 @@ pub fn help_text(bot_name: &str, lang: Lang, on_behalf: bool) -> String {
 | `@{bot_name} unclaim` | Release the assignment |\n\
 | `@{bot_name} r+` | Relay an approval (needs write; the bot APPROVEs in your name) |\n\
 | `@{bot_name} r+ as @user` | {on_behalf_help} |\n\
-| `@{bot_name} r-` | Withdraw the bot's approval |\n\n\
-_Conflicted PRs are labelled `needs-rebase` automatically, with a reminder._",
+| `@{bot_name} r-` | Withdraw the bot's approval |\n\
+| `@{bot_name} queue` | Show the merge queue (batch under test + waiting PRs) |\n\n\
+{queue_help}",
             on_behalf_help = if on_behalf {
                 "Relay an approval crediting @user (they need write access too)"
             } else {
                 "**Disabled in this deployment** — set `R_PLUS_ALLOW_ON_BEHALF=true` to enable"
-            }
+            },
+            queue_help = queue_note(bors_enabled, Lang::En)
         ),
         Lang::Zh => format!(
             "### xero-bot 命令参考\n\n\
@@ -75,13 +105,15 @@ _Conflicted PRs are labelled `needs-rebase` automatically, with a reminder._",
 | `@{bot_name} unclaim` | 释放指派 |\n\
 | `@{bot_name} r+` | 代审批(需 write 权限;bot 以你的名义提交 APPROVE) |\n\
 | `@{bot_name} r+ as @user` | {on_behalf_help} |\n\
-| `@{bot_name} r-` | 撤回 bot 的审批 |\n\n\
-_冲突的 PR 会被自动打上 `needs-rebase` 标签并提醒。_",
+| `@{bot_name} r-` | 撤回 bot 的审批 |\n\
+| `@{bot_name} queue` | 查看合并队列(在测批次 + 排队 PR) |\n\n\
+{queue_help}",
             on_behalf_help = if on_behalf {
                 "以 @user 名义代审批(该用户同样需要 write 权限)"
             } else {
                 "**本部署已禁用** —— 需设置 `R_PLUS_ALLOW_ON_BEHALF=true` 开启"
-            }
+            },
+            queue_help = queue_note(bors_enabled, Lang::Zh)
         ),
     }
 }
@@ -178,7 +210,12 @@ async fn handle_one(gh: &Client, cfg: &Config, ctx: &CommentContext, cmd: Comman
             gh.post_issue_comment(
                 &ctx.repo,
                 ctx.pr_number,
-                &help_text(&cfg.bot_name, lang, cfg.r_plus_allow_on_behalf),
+                &help_text(
+                    &cfg.bot_name,
+                    cfg.bors_enabled,
+                    lang,
+                    cfg.r_plus_allow_on_behalf,
+                ),
             )
             .await,
         ),
@@ -214,6 +251,14 @@ async fn handle_one(gh: &Client, cfg: &Config, ctx: &CommentContext, cmd: Comman
         }
         Command::Codeql => {
             crate::codeql::run_codeql_report(gh, cfg, &ctx.repo, ctx.pr_number, lang).await
+        }
+        Command::Queue => {
+            let status = crate::bors::render_queue_status(gh, cfg, &ctx.repo, lang).await;
+            labeled(
+                "queue status reply",
+                gh.post_issue_comment(&ctx.repo, ctx.pr_number, &status)
+                    .await,
+            )
         }
         Command::RequestReview { user } => request_review(gh, ctx, &user).await,
         Command::Cc { users } => {
@@ -944,6 +989,19 @@ or above to approve this PR (currently: {their_perm}).",
     {
         Ok(_) => {
             let _ = gh.post_issue_comment(&ctx.repo, ctx.pr_number, &body).await;
+            // An approval is one vote and one vote only — the merge queue is
+            // what turns it into a merge. Enqueuing after a successful relay
+            // keeps r+ meaningful with the queue on; with it off, this is a
+            // no-op. Failures are logged, not fatal: the approval itself went
+            // through, and the queue will pick the PR up on the next r+.
+            if cfg.bors_enabled && ctx.is_pr {
+                let outcome = crate::bors::enqueue(gh, cfg, &ctx.repo, ctx.pr_number).await;
+                tracing::info!(
+                    "bors enqueue after r+ on {}#{}: {outcome}",
+                    ctx.repo,
+                    ctx.pr_number
+                );
+            }
             "ok".into()
         }
         Err(e) => {
@@ -964,7 +1022,7 @@ or above to approve this PR (currently: {their_perm}).",
 }
 
 /// r-: withdraw — dismiss our own previous APPROVE reviews.
-async fn handle_reject(gh: &Client, _cfg: &Config, ctx: &CommentContext) -> String {
+async fn handle_reject(gh: &Client, cfg: &Config, ctx: &CommentContext) -> String {
     let lang = ctx.lang;
     let reviews = match gh.list_pr_reviews(&ctx.repo, ctx.pr_number).await {
         Ok(r) => r,
@@ -1086,6 +1144,22 @@ async fn handle_reject(gh: &Client, _cfg: &Config, ctx: &CommentContext) -> Stri
             },
         )
         .await;
+    // Withdrawing the approval withdraws the merge request. A partial
+    // dismissal leaves at least one APPROVE standing, so the queue keeps the
+    // PR — the caller can retry r-.
+    if cfg.bors_enabled && dismissed == found && ctx.is_pr {
+        let note = t!(
+            lang,
+            "➖ Removed from the merge queue (r- by @{who}).",
+            "➖ 已移出合并队列(r- by @{who})。"
+        );
+        let status = crate::bors::dequeue_pr(gh, cfg, &ctx.repo, ctx.pr_number, &note).await;
+        tracing::info!(
+            "bors dequeue after r- on {}#{}: {status}",
+            ctx.repo,
+            ctx.pr_number
+        );
+    }
     if dismissed == found {
         "ok".into()
     } else {

@@ -336,12 +336,12 @@ async fn relayed_approval_is_posted_when_everyone_qualifies() {
 #[test]
 fn help_text_tells_the_truth_about_the_switch() {
     for lang in [Lang::En, Lang::Zh] {
-        let off = xero_bot::handlers::help_text("xero-review", lang, false);
+        let off = xero_bot::handlers::help_text("xero-review", false, lang, false);
         assert!(
             off.contains("R_PLUS_ALLOW_ON_BEHALF"),
             "{lang:?} help must name the setting when the feature is off:\n{off}"
         );
-        let on = xero_bot::handlers::help_text("xero-review", lang, true);
+        let on = xero_bot::handlers::help_text("xero-review", false, lang, true);
         assert!(
             !on.contains("R_PLUS_ALLOW_ON_BEHALF"),
             "{lang:?} help must not tell users to enable what is already on:\n{on}"

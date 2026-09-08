@@ -50,6 +50,7 @@ fn nullary(word: &str) -> Option<Command> {
         "blocked" => Command::Blocked,
         "claim" => Command::Claim,
         "unclaim" | "release-assignment" | "release" => Command::Unclaim,
+        "queue" => Command::Queue,
         _ => return None,
     })
 }
@@ -73,6 +74,7 @@ pub const VERBS: &[&str] = &[
     "label",
     "relabel",
     "assign",
+    "queue",
 ];
 
 pub struct Parsed {

@@ -112,5 +112,6 @@ fn command_name(c: &Command) -> String {
         Command::Assign { user } => format!("assign @{user}"),
         Command::Cc { .. } => "cc".into(),
         Command::Label { .. } => "label".into(),
+        Command::Queue => "queue".into(),
     }
 }
