@@ -45,7 +45,7 @@ gets one line of explanation instead of silence.
 | `@xero-review blocked` | Mark as blocked (`blocked`) |
 | `@xero-review label +bug -wip` | Add/remove labels |
 | `@xero-review assign @user` | Assign to @user |
-| `@xero-review claim` / `unclaim` | Claim/release (assign to self / remove self) |
+| `@xero-review claim` / `unclaim` (aliases: `take` / `untake`) | Claim/release (assign to self / remove self) |
 | `@xero-review r+` | Approve on behalf: the bot checks the commenter has write access and did not author the PR, then submits an APPROVE review in their name |
 | `@xero-review r+ as @user` | Approve in @user's name (bors' `r=`, for relaying an approval given elsewhere). **Refused unless `R_PLUS_ALLOW_ON_BEHALF=true`** — see [Approvals](#approvals) |
 | `@xero-review r-` | Withdraw a previous bot APPROVE (dismiss) |
