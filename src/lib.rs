@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod bors;
 pub mod codeql;
 pub mod commands;
 pub mod config;
