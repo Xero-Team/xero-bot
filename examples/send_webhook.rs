@@ -9,6 +9,8 @@
 //!   cargo run --example send_webhook -- issue-comment "r? @octocat"
 //!   cargo run --example send_webhook -- issue-comment "@xero-review review"
 //!   cargo run --example send_webhook -- pr-synchronize
+//!   cargo run --example send_webhook -- pr-review-approved
+//!   cargo run --example send_webhook -- pr-closed
 
 use std::process::exit;
 
@@ -16,7 +18,8 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.len() < 2 {
         eprintln!(
-            "usage: send_webhook [port] <issue-comment|pr-synchronize|ping-event> [comment-body]"
+            "usage: send_webhook [port] <issue-comment|pr-synchronize|pr-review-approved|\
+pr-closed|ping-event> [comment-body]"
         );
         exit(2);
     }
@@ -59,9 +62,37 @@ fn main() {
                 "pull_request": {"number": 1}
             }),
         ),
+        // A human web-UI approval — the merge queue's second trigger. No
+        // `performed_via_github_app`, which is how the bot knows it isn't its
+        // own r+ relay.
+        "pr-review-approved" => (
+            "pull_request_review",
+            serde_json::json!({
+                "action": "submitted",
+                "installation": {"id": 1, "node_id": "MDIzOkludGVncmF0aW9u"},
+                "repository": {"full_name": "octocat/hello-world"},
+                "pull_request": {"number": 1},
+                "review": {
+                    "state": "APPROVED",
+                    "user": {"login": "octocat", "type": "User"}
+                }
+            }),
+        ),
+        "pr-closed" => (
+            "pull_request",
+            serde_json::json!({
+                "action": "closed",
+                "installation": {"id": 1, "node_id": "MDIzOkludGVncmF0aW9u"},
+                "repository": {"full_name": "octocat/hello-world"},
+                "pull_request": {"number": 1, "merged": false}
+            }),
+        ),
         "ping-event" => ("ping", serde_json::json!({"zen": "Design for failure."})),
         other => {
-            eprintln!("unknown event: {other} (use issue-comment | pr-synchronize | ping-event)");
+            eprintln!(
+                "unknown event: {other} (use issue-comment | pr-synchronize | \
+pr-review-approved | pr-closed | ping-event)"
+            );
             exit(2);
         }
     };

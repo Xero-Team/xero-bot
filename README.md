@@ -49,6 +49,7 @@ gets one line of explanation instead of silence.
 | `@xero-review r+` | Approve on behalf: the bot checks the commenter has write access and did not author the PR, then submits an APPROVE review in their name |
 | `@xero-review r+ as @user` | Approve in @user's name (bors' `r=`, for relaying an approval given elsewhere). **Refused unless `R_PLUS_ALLOW_ON_BEHALF=true`** — see [Approvals](#approvals) |
 | `@xero-review r-` | Withdraw a previous bot APPROVE (dismiss) |
+| `@xero-review queue` | Show the merge queue: batch under test + waiting PRs |
 
 Automatic behavior (no command needed):
 - After a PR push/reopen, checks for conflicts → adds `needs-rebase` + a reminder comment; once resolved → removes the label
@@ -79,6 +80,52 @@ requires one counts it, so `r+` is a privileged write and not a comment. Three r
 
 A refused `r+` costs no API call beyond the checks above, and the `help` table says which side
 of the switch the deployment is on.
+
+### Merge queue (bors-style)
+
+With `BORS_ENABLED=true`, an approval stops meaning "this looks good" and starts meaning
+**"merge it"** — the same semantics bors gave `r+`. The queue tests a *batch* of PRs
+together, so main only ever advances to combinations that have actually passed CI:
+
+1. A successful `r+` (or a web Approve by a write+ reviewer) adds the `bors: queued` label.
+   `r-`, a CHANGES_REQUESTED review, or closing the PR takes it out again.
+2. The driver (a poll loop, default every 30s) builds a batch — up to `BORS_MAX_BATCH` PRs,
+   ascending number order — by merging each PR's head into the `staging` branch as a merge
+   commit (`xero-bors: merge #n (head …)`). The batch is then labeled `bors: testing`.
+3. CI runs on the staging pushes. Green → main is advanced via a `staging`→`main` PR (which
+   inherits main's branch protection, so required checks are already satisfied by the tested
+   tree). Red → the newest member is removed as the likely culprit, staging resets, and the
+   remaining prefix re-tests automatically (tail-dropping is bisecting by construction).
+4. On success every member gets a 🎉 comment and the staging branch is deleted (recreated
+   next batch).
+
+`@xero-review queue` shows the batch under test with its CI state, plus the waiting list.
+
+**Prerequisites** (the queue fails open-ish: a batch that never gets a CI verdict times out
+after `BORS_CI_TIMEOUT_SECS` — default 2h — and returns its PRs to the queue with an
+explanation):
+
+- **CI must run on staging pushes.** A workflow with only `on: pull_request` never fires on
+  the `staging` branch — this is the single most common misconfiguration:
+  ```yaml
+  on:
+    push:
+      branches: [main, staging]
+  ```
+- **GitHub App settings**: add permission **Contents: read/write** (the queue creates,
+  resets and deletes the staging branch and creates the advance PR) and subscribe to the
+  **Pull request review** event (a web Approve must reach the bot). Everything else stays
+  as before.
+- **Branch protection**: leave `staging` unprotected — the bot force-updates it constantly.
+  Keep `main` protected as today; the advance PR satisfies required checks on its own
+  (its head is the tested tree). If main also requires human reviews, a write+ user
+  approving the advance PR approves the whole batch — the bot says so and retries.
+- **Only PRs targeting the repo's default branch** are accepted (`BORS_ADVANCE_METHOD=pr`
+  default; `ref` does a bare fast-forward and needs the App exempted from push
+  restrictions — advanced setups only).
+
+The queue keeps all state in GitHub — labels plus the staging merge-commit chain — so a
+restart mid-batch resumes exactly where it left off, with no database.
 
 ### Reply language
 
@@ -174,8 +221,8 @@ GitHub → Settings → Developer settings → GitHub Apps → **New GitHub App*
 |---|---|
 | Webhook URL | `https://<host>/webhook` |
 | Webhook secret | any random string — must match `WEBHOOK_SECRET` |
-| Subscribed events | **Issue comment** + **Pull request** |
-| Permissions | Contents: R · Pull requests: RW · Issues: RW · **Checks: R** · **Code scanning alerts: R** |
+| Subscribed events | **Issue comment** + **Pull request** (+ **Pull request review** for the merge queue) |
+| Permissions | Contents: R (RW for the merge queue) · Pull requests: RW · Issues: RW · **Checks: R** · **Code scanning alerts: R** |
 
 Then: **generate a private key** (downloads a `.pem` file), note the numeric **App ID** and the bot's @-name (for `BOT_NAME`), and install the App on the target org/repos.
 
@@ -226,6 +273,7 @@ cargo run                     # self-hosted mode on :8080
 cargo run --example send_webhook -- issue-comment "@xero-review ping"
 cargo run --example send_webhook -- issue-comment "r? @octocat"
 cargo run --example send_webhook -- pr-synchronize
+cargo run --example send_webhook -- pr-review-approved
 ```
 
 `send_webhook` signs the payload with `WEBHOOK_SECRET` (default `dev-secret`) and POSTs it to the local server, simulating the GitHub side.
@@ -245,8 +293,9 @@ src/
 ├── engines_subproc.rs pi/codex subprocess engines + git checkout cache
 ├── codeql.rs          code scanning alerts → PR changed-file mapping → report
 ├── rebase.rs          mergeable detection + needs-rebase label + sweep
+├── bors.rs            merge queue (staging batches, CI gate, main advance; state = labels + staging chain)
 ├── dispatch.rs        event → background work routing (incl. the mention-free session check)
 └── main.rs            self-hosted axum server
 ```
 
-State persistence: everything lives in GitHub (labels = workflow state, PR reviews = previous-round review memory) — the bot itself has no database and no external storage.
+State persistence: everything lives in GitHub (labels = workflow state, PR reviews = previous-round review memory, the staging merge-commit chain = merge queue) — the bot itself has no database and no external storage.

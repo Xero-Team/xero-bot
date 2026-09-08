@@ -46,6 +46,7 @@ Xero-Team 的组织级 GitHub App 机器人。Rust 实现,单二进制,自托管
 | `@xero-review r+` | 代审批:bot 校验评论者有 write 权限、且不是本 PR 作者后,以其名义提交 APPROVE review |
 | `@xero-review r+ as @user` | 以 @user 名义代审批(即 bors 的 `r=`,用于转发在其他渠道给出的批准)。**未设 `R_PLUS_ALLOW_ON_BEHALF=true` 时一律拒绝** —— 见[审批](#审批) |
 | `@xero-review r-` | 撤回 bot 之前的 APPROVE(dismiss) |
+| `@xero-review queue` | 查看合并队列(在测批次 + 排队 PR) |
 
 自动行为(无需命令):
 - PR push/reopen 后检测冲突 → 打 `needs-rebase` + 提醒评论;冲突解决 → 摘标签
@@ -71,6 +72,47 @@ Xero-Team 的组织级 GitHub App 机器人。Rust 实现,单二进制,自托管
   普通 `r+` 无论开关如何都不受影响。
 
 被拒绝的 `r+` 除上述校验外不会产生额外 API 调用;`help` 表会说明本部署处于开关的哪一侧。
+
+### 合并队列(bors 式)
+
+设置 `BORS_ENABLED=true` 后,批准不再只是"这个看起来不错",而是**"合并它"** —— 与 bors 给
+`r+` 的语义一致。队列把多个 PR 组成**批次**一起测试,保证 main 只会推进到真正通过 CI 的
+组合:
+
+1. `r+` 成功(或 write+ 审阅者在网页上 Approve)会给 PR 打 `bors: queued` 标签。
+   `r-`、CHANGES_REQUESTED 审查、或关闭 PR 都会把它移出队列。
+2. 驱动循环(轮询,默认每 30s)组批 —— 最多 `BORS_MAX_BATCH` 个、按 PR 号升序 —— 把每个
+   PR 的 head 以 merge commit(`xero-bors: merge #n (head …)`)逐个并入 `staging` 分支,
+   批次成员改打 `bors: testing` 标签。
+3. CI 在 staging 的 push 上运行。全绿 → 通过一个 `staging`→`main` 的 PR 推进 main
+   (该 PR 继承 main 的分支保护,required checks 因 head 就是已测试树而天然满足)。
+   红灯 → 把最新的成员当作疑似元凶移出队列,staging 重置,剩余前缀自动重测
+   (尾部丢弃天然就是二分)。
+4. 成功后每个成员收到 🎉 评论,staging 分支被删除(下一批次开始时重建)。
+
+`@xero-review queue` 可查看在测批次及其 CI 状态、以及排队名单。
+
+**前提条件**(不满足时队列会等:CI 迟迟没有结论的批次在 `BORS_CI_TIMEOUT_SECS` —— 默认
+2 小时 —— 后超时,把 PR 退回队列并附解释评论):
+
+- **CI 必须对 staging 分支的 push 生效。** 只写了 `on: pull_request` 的 workflow 在
+  `staging` 分支上永远不跑 —— 这是最常见的配置错误:
+  ```yaml
+  on:
+    push:
+      branches: [main, staging]
+  ```
+- **GitHub App 设置**:权限增加 **Contents: 读写**(队列要创建/重置/删除 staging 分支、
+  创建推进 PR),订阅事件增加 **Pull request review**(网页 Approve 要能到达 bot)。
+  其余不变。
+- **分支保护**:`staging` 不要加任何保护 —— bot 会反复 force-update 它。`main` 保持现有
+  保护;推进 PR 自己就能满足 required checks(head 就是已测试树)。如果 main 还要求人工
+  批准,write+ 用户批准推进 PR 即等于批准整批 —— bot 会说明并重试。
+- **仅接受目标为仓库默认分支的 PR**(`BORS_ADVANCE_METHOD=pr` 为默认;`ref` 直接
+  fast-forward,需要给 App 配置绕过 main 推送限制 —— 仅进阶用法)。
+
+队列的所有状态都存在 GitHub —— 标签 + staging merge commit 链 —— 所以批次中途重启会
+从原处继续,无数据库。
 
 ### 回复语言
 
@@ -156,8 +198,8 @@ GitHub → Settings → Developer settings → GitHub Apps → **New GitHub App*
 |---|---|
 | Webhook URL | `https://<host>/webhook` |
 | Webhook secret | 任意随机字符串 — 必须与 `WEBHOOK_SECRET` 一致 |
-| 订阅事件 | **Issue comment** + **Pull request** |
-| 权限 | Contents: R · Pull requests: RW · Issues: RW · **Checks: R** · **Code scanning alerts: R** |
+| 订阅事件 | **Issue comment** + **Pull request**(启用合并队列再加 **Pull request review**) |
+| 权限 | Contents: R(合并队列需 RW)· Pull requests: RW · Issues: RW · **Checks: R** · **Code scanning alerts: R** |
 
 然后:**生成私钥**(会下载 `.pem` 文件),记下数字 **App ID** 与 bot 的 @-名(填 `BOT_NAME`),并把 App 安装到目标组织/仓库。
 
@@ -208,6 +250,7 @@ cargo run                     # 自托管模式跑在 :8080
 cargo run --example send_webhook -- issue-comment "@xero-review ping"
 cargo run --example send_webhook -- issue-comment "r? @octocat"
 cargo run --example send_webhook -- pr-synchronize
+cargo run --example send_webhook -- pr-review-approved
 ```
 
 `send_webhook` 用 `WEBHOOK_SECRET`(默认 `dev-secret`)对 payload 签名后 POST 到本地服务器,模拟 GitHub 侧。
@@ -227,8 +270,9 @@ src/
 ├── engines_subproc.rs pi/codex 子进程引擎 + git checkout 缓存
 ├── codeql.rs          Code Scanning 告警 → PR 变更文件映射 → 报告
 ├── rebase.rs          mergeable 检测 + needs-rebase 标签 + sweep
+├── bors.rs            合并队列(staging 批次 + CI 门禁 + 推进 main;状态 = 标签 + staging 提交链)
 ├── dispatch.rs        事件 → 后台工作 路由(含免 @ 会话检查)
 └── main.rs            自托管 axum 服务器
 ```
 
-状态持久化:全部存 GitHub(标签 = 工作流状态,PR review = 上一轮审查记忆)——bot 本身无数据库、无外部存储。
+状态持久化:全部存 GitHub(标签 = 工作流状态,PR review = 上一轮审查记忆,staging merge commit 链 = 合并队列)——bot 本身无数据库、无外部存储。
