@@ -5,7 +5,7 @@
 Org-wide GitHub App bot for the Xero-Team. Written in Rust — a single self-hosted binary (Docker / VPS).
 
 Features:
-- **bors/triagebot-style comment commands** — `r?`, `?r cc`, label management, assign/claim, `r+` approval on behalf, and more
+- **triagebot-style comment commands** — `r?`, `?r cc`, label management, assign/claim, `r+` approval on behalf, and more
 - **Incremental AI code review** — learns the project first and builds on the previous review round, instead of looking at the diff in isolation
 - **Rebase reminders** — when a PR conflicts with its target branch, adds the `needs-rebase` label and a reminder; clears it once resolved
 - **CodeQL quality reports** — reads the repo's existing code scanning alerts and maps them to files changed in the PR
@@ -81,17 +81,17 @@ requires one counts it, so `r+` is a privileged write and not a comment. Three r
 A refused `r+` costs no API call beyond the checks above, and the `help` table says which side
 of the switch the deployment is on.
 
-### Merge queue (bors-style)
+### Merge queue
 
-With `BORS_ENABLED=true`, an approval stops meaning "this looks good" and starts meaning
-**"merge it"** — the same semantics bors gave `r+`. The queue tests a *batch* of PRs
+With `MERGE_QUEUE_ENABLED=true`, an approval stops meaning "this looks good" and starts meaning
+**"merge it"** — the semantics an automerge queue gives `r+`. The queue tests a *batch* of PRs
 together, so main only ever advances to combinations that have actually passed CI:
 
-1. A successful `r+` (or a web Approve by a write+ reviewer) adds the `bors: queued` label.
+1. A successful `r+` (or a web Approve by a write+ reviewer) adds the `merge queue: queued` label.
    `r-`, a CHANGES_REQUESTED review, or closing the PR takes it out again.
-2. The driver (a poll loop, default every 30s) builds a batch — up to `BORS_MAX_BATCH` PRs,
+2. The driver (a poll loop, default every 30s) builds a batch — up to `MERGE_QUEUE_MAX_BATCH` PRs,
    ascending number order — by merging each PR's head into the `staging` branch as a merge
-   commit (`xero-bors: merge #n (head …)`). The batch is then labeled `bors: testing`.
+   commit (`xero-bot: merge #n (head …)`). The batch is then labeled `merge queue: testing`.
 3. CI runs on the staging pushes. Green → main is advanced via a `staging`→`main` PR (which
    inherits main's branch protection, so required checks are already satisfied by the tested
    tree). Red → the newest member is removed as the likely culprit, staging resets, and the
@@ -102,7 +102,7 @@ together, so main only ever advances to combinations that have actually passed C
 `@xero-review queue` shows the batch under test with its CI state, plus the waiting list.
 
 **Prerequisites** (the queue fails open-ish: a batch that never gets a CI verdict times out
-after `BORS_CI_TIMEOUT_SECS` — default 2h — and returns its PRs to the queue with an
+after `MERGE_QUEUE_CI_TIMEOUT_SECS` — default 2h — and returns its PRs to the queue with an
 explanation):
 
 - **CI must run on staging pushes.** A workflow with only `on: pull_request` never fires on
@@ -120,7 +120,7 @@ explanation):
   Keep `main` protected as today; the advance PR satisfies required checks on its own
   (its head is the tested tree). If main also requires human reviews, a write+ user
   approving the advance PR approves the whole batch — the bot says so and retries.
-- **Only PRs targeting the repo's default branch** are accepted (`BORS_ADVANCE_METHOD=pr`
+- **Only PRs targeting the repo's default branch** are accepted (`MERGE_QUEUE_ADVANCE_METHOD=pr`
   default; `ref` does a bare fast-forward and needs the App exempted from push
   restrictions — advanced setups only).
 
@@ -293,7 +293,7 @@ src/
 ├── engines_subproc.rs pi/codex subprocess engines + git checkout cache
 ├── codeql.rs          code scanning alerts → PR changed-file mapping → report
 ├── rebase.rs          mergeable detection + needs-rebase label + sweep
-├── bors.rs            merge queue (staging batches, CI gate, main advance; state = labels + staging chain)
+├── merge_queue.rs     merge queue (staging batches, CI gate, main advance; state = labels + staging chain)
 ├── dispatch.rs        event → background work routing (incl. the mention-free session check)
 └── main.rs            self-hosted axum server
 ```

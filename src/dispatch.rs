@@ -119,10 +119,10 @@ pub fn route_event(cfg: &Config, event_header: &str, payload: &Value) -> Routing
         } => {
             // `closed` exists only for the merge queue (dequeue on close);
             // without it the action is noise and stays ignored — byte-for-byte
-            // the pre-bors behavior.
+            // the pre-merge-queue behavior.
             if action == "closed" {
-                if cfg.bors_enabled {
-                    return Routing::Act(Work::BorsPrClosed {
+                if cfg.merge_queue_enabled {
+                    return Routing::Act(Work::QueuePrClosed {
                         repo,
                         pr_number,
                         installation_id,
@@ -194,7 +194,7 @@ pub fn route_event(cfg: &Config, event_header: &str, payload: &Value) -> Routing
             if !matches!(state.as_str(), "APPROVED" | "CHANGES_REQUESTED") {
                 return Routing::Respond(serde_json::json!({"ignored": "state not a verdict"}));
             }
-            if !cfg.bors_enabled {
+            if !cfg.merge_queue_enabled {
                 return Routing::Respond(serde_json::json!({"ignored": "merge queue disabled"}));
             }
             Routing::Act(Work::PrReview {
@@ -267,7 +267,7 @@ pub enum Work {
     /// A PR (or anything shaped like one) was closed; if it was queued or in
     /// the batch, take it out. `merged` is decided at execution — the queue
     /// only needs to know the PR is gone.
-    BorsPrClosed {
+    QueuePrClosed {
         repo: String,
         pr_number: i64,
         installation_id: i64,
@@ -443,19 +443,22 @@ commands like yours work without the mention."
                 .await
                 .map_err(|e| format!("installation client: {e}"))?;
             let status =
-                crate::bors::handle_review(&gh, cfg, &repo, pr_number, &state, &reviewer).await;
-            tracing::info!("bors review {repo}#{pr_number} ({state} by {reviewer}): {status}");
+                crate::merge_queue::handle_review(&gh, cfg, &repo, pr_number, &state, &reviewer)
+                    .await;
+            tracing::info!(
+                "merge queue review {repo}#{pr_number} ({state} by {reviewer}): {status}"
+            );
             Ok(())
         }
-        Work::BorsPrClosed {
+        Work::QueuePrClosed {
             repo,
             pr_number,
             installation_id,
         } => {
             let gh = Client::installation(cfg, installation_id, "")
                 .map_err(|e| format!("installation client: {e}"))?;
-            let status = crate::bors::handle_pr_closed(&gh, cfg, &repo, pr_number).await;
-            tracing::info!("bors closed {repo}#{pr_number}: {status}");
+            let status = crate::merge_queue::handle_pr_closed(&gh, cfg, &repo, pr_number).await;
+            tracing::info!("merge queue closed {repo}#{pr_number}: {status}");
             Ok(())
         }
     }
@@ -514,17 +517,17 @@ mod tests {
         })
     }
 
-    fn bors_cfg() -> Config {
+    fn queue_cfg() -> Config {
         let mut c = cfg();
-        c.bors_enabled = true;
+        c.merge_queue_enabled = true;
         c
     }
 
     /// A human APPROVED is the queue's second trigger (the first is r+).
     #[test]
-    fn human_approval_routes_to_bors_when_enabled() {
+    fn human_approval_routes_to_queue_when_enabled() {
         let p = review_payload(json!({"state": "APPROVED", "user": {"login": "alice"}}));
-        match route_event(&bors_cfg(), "pull_request_review", &p) {
+        match route_event(&queue_cfg(), "pull_request_review", &p) {
             Routing::Act(Work::PrReview {
                 state, reviewer, ..
             }) => {
@@ -537,9 +540,9 @@ mod tests {
 
     /// CHANGES_REQUESTED dequeues a member; the state travels raw.
     #[test]
-    fn changes_requested_routes_to_bors_when_enabled() {
+    fn changes_requested_routes_to_queue_when_enabled() {
         let p = review_payload(json!({"state": "CHANGES_REQUESTED", "user": {"login": "bob"}}));
-        let r = route_event(&bors_cfg(), "pull_request_review", &p);
+        let r = route_event(&queue_cfg(), "pull_request_review", &p);
         assert!(matches!(r, Routing::Act(Work::PrReview { .. })), "{r:?}");
     }
 
@@ -548,7 +551,7 @@ mod tests {
     fn commented_review_is_ignored() {
         let p = review_payload(json!({"state": "COMMENTED", "user": {"login": "alice"}}));
         assert_eq!(
-            ignored_reason(&route_event(&bors_cfg(), "pull_request_review", &p)).as_deref(),
+            ignored_reason(&route_event(&queue_cfg(), "pull_request_review", &p)).as_deref(),
             Some("state not a verdict")
         );
     }
@@ -564,7 +567,7 @@ mod tests {
             "user": {"login": "whatever[bot]", "type": "Bot"},
             "performed_via_github_app": {"id": 4768775}
         }));
-        let r = route_event(&bors_cfg(), "pull_request_review", &p);
+        let r = route_event(&queue_cfg(), "pull_request_review", &p);
         assert_eq!(ignored_reason(&r).as_deref(), Some("self review"));
     }
 
@@ -576,7 +579,7 @@ mod tests {
             "state": "APPROVED",
             "user": {"login": "xero-team-bot[bot]", "type": "Bot"}
         }));
-        let r = route_event(&bors_cfg(), "pull_request_review", &p);
+        let r = route_event(&queue_cfg(), "pull_request_review", &p);
         assert_eq!(ignored_reason(&r).as_deref(), Some("self review"));
     }
 
@@ -587,14 +590,14 @@ mod tests {
             "state": "APPROVED",
             "user": {"login": "xero-team-bot-helper", "type": "User"}
         }));
-        let r = route_event(&bors_cfg(), "pull_request_review", &p);
+        let r = route_event(&queue_cfg(), "pull_request_review", &p);
         assert!(matches!(r, Routing::Act(_)), "{r:?}");
     }
 
-    /// Without BORS_ENABLED the queue must be entirely inert: the old
+    /// Without MERGE_QUEUE_ENABLED the queue must be entirely inert: the old
     /// deployments' behavior is byte-for-byte preserved.
     #[test]
-    fn review_events_ignored_without_bors() {
+    fn review_events_ignored_without_queue() {
         for state in ["APPROVED", "CHANGES_REQUESTED"] {
             let p = review_payload(json!({"state": state, "user": {"login": "alice"}}));
             assert_eq!(
@@ -607,16 +610,16 @@ mod tests {
     /// `pull_request closed` feeds the queue's dequeue-on-close; without the
     /// feature it stays ignored exactly as before.
     #[test]
-    fn pr_closed_routes_only_with_bors() {
+    fn pr_closed_routes_only_with_queue() {
         let payload = json!({
             "action": "closed",
             "installation": {"id": 42},
             "repository": {"full_name": "Xero-Team/xero-bot"},
             "pull_request": {"number": 7}
         });
-        let r = route_event(&bors_cfg(), "pull_request", &payload);
+        let r = route_event(&queue_cfg(), "pull_request", &payload);
         assert!(
-            matches!(r, Routing::Act(Work::BorsPrClosed { .. })),
+            matches!(r, Routing::Act(Work::QueuePrClosed { .. })),
             "{r:?}"
         );
         let r = route_event(&cfg(), "pull_request", &payload);
@@ -636,7 +639,7 @@ mod tests {
             "repository": {"full_name": "Xero-Team/xero-bot"},
             "pull_request": {"number": 7}
         });
-        let r = route_event(&bors_cfg(), "pull_request", &payload);
+        let r = route_event(&queue_cfg(), "pull_request", &payload);
         assert!(matches!(r, Routing::Act(Work::RebaseCheck { .. })), "{r:?}");
     }
 

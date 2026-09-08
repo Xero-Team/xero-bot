@@ -832,12 +832,12 @@ mod tests {
             // table, and a row is exactly where a live command would hide.
             // Same for the queue note, which names the `queue` command.
             for on_behalf in [false, true] {
-                for bors in [false, true] {
-                    let help = crate::handlers::help_text("bot", bors, lang, on_behalf);
+                for queue_on in [false, true] {
+                    let help = crate::handlers::help_text("bot", queue_on, lang, on_behalf);
                     let out = parse_commands("bot", &help);
                     assert!(
                         out.commands.is_empty() && out.diagnostics.is_empty(),
-                        "{lang:?} help text (on_behalf={on_behalf}, bors={bors}) must be inert, \
+                        "{lang:?} help text (on_behalf={on_behalf}, queue={queue_on}) must be inert, \
 got {out:?}"
                     );
                 }

@@ -56,7 +56,7 @@ const UNRESERVED_PATH: &percent_encoding::AsciiSet = &UNRESERVED.remove(b'/');
 
 /// Percent-encode one path segment. `/` is encoded too, so a label named
 /// `needs/rebase` addresses one segment instead of splitting into two.
-/// `pub(crate)` for the bors driver, whose branch-name routes are built
+/// `pub(crate)` for the merge-queue driver, whose branch-name routes are built
 /// outside the method bodies that normally do their own encoding.
 pub(crate) fn enc_seg(s: &str) -> String {
     percent_encoding::utf8_percent_encode(s, UNRESERVED).to_string()
@@ -202,7 +202,7 @@ pub async fn resolve_app_slug(cfg: &Config) -> String {
 }
 
 /// Wall-clock seconds since the epoch (0 if the clock is behind — JWT would
-/// be rejected anyway). Shared with the bors driver's timeout clock.
+/// be rejected anyway). Shared with the merge-queue driver's timeout clock.
 pub fn chrono_now_secs() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -327,7 +327,7 @@ impl Client {
     }
 
     /// GET every page of a paginated route. See [`paginate`].
-    /// `pub(crate)`: the bors driver builds a few list routes directly.
+    /// `pub(crate)`: the merge-queue driver builds a few list routes directly.
     pub(crate) async fn get_all(&self, route: &str) -> Result<Vec<Value>, GhError> {
         paginate(&self.crab, route).await
     }
@@ -950,7 +950,7 @@ impl Client {
     }
 
     // -------------------------------------------------------------------
-    // Git data (branches, commits) and merges — the bors merge queue's writes
+    // Git data (branches, commits) and merges — the merge queue's writes
     // -------------------------------------------------------------------
 
     /// Repo metadata; the merge queue reads `default_branch` from it (the
@@ -962,7 +962,7 @@ impl Client {
     /// Merge `head` into `base` (`POST /repos/{repo}/merges`), producing a
     /// merge commit whose message is `message`.
     ///
-    /// This is the primitive the bors driver uses to fold a PR head into the
+    /// This is the primitive the merge-queue driver uses to fold a PR head into the
     /// staging branch — the pulls merge endpoint cannot do it, because it only
     /// merges a PR into *its own* base.
     ///

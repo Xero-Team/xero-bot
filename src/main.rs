@@ -95,18 +95,20 @@ async fn main() {
     // race GitHub's webhooks with a burst of staging writes. One loop, never
     // concurrent with itself — the staging ref and the label dance have no
     // lock, and two writers would corrupt both.
-    if cfg.bors_enabled {
+    if cfg.merge_queue_enabled {
         tracing::info!(
             "merge queue enabled: staging branch {:?}, poll every {}s",
-            cfg.bors_staging_branch,
-            cfg.bors_poll_interval_secs
+            cfg.merge_queue_staging_branch,
+            cfg.merge_queue_poll_interval_secs
         );
-        let bors_cfg = cfg.clone();
+        let merge_queue_cfg = cfg.clone();
         tokio::spawn(async move {
-            let interval = std::time::Duration::from_secs(bors_cfg.bors_poll_interval_secs.max(15));
+            let interval = std::time::Duration::from_secs(
+                merge_queue_cfg.merge_queue_poll_interval_secs.max(15),
+            );
             loop {
                 tokio::time::sleep(interval).await;
-                let _ = xero_bot::bors::pump_all(&bors_cfg).await;
+                let _ = xero_bot::merge_queue::pump_all(&merge_queue_cfg).await;
             }
         });
     }
@@ -207,13 +209,13 @@ async fn cron_sweep(
     // The queue rides the same external trigger as the sweep, as a
     // belt-and-braces complement to the built-in loop (and the only driver
     // tick when the built-in loop is off).
-    let bors_summary = if state.cfg.bors_enabled {
-        xero_bot::bors::pump_all(&state.cfg).await
+    let merge_queue_summary = if state.cfg.merge_queue_enabled {
+        xero_bot::merge_queue::pump_all(&state.cfg).await
     } else {
-        "bors disabled".to_string()
+        "merge queue disabled".to_string()
     };
     (
         StatusCode::OK,
-        Json(json!({"ok": true, "summary": summary, "bors": bors_summary})),
+        Json(json!({"ok": true, "summary": summary, "merge_queue": merge_queue_summary})),
     )
 }

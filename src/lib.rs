@@ -1,5 +1,4 @@
 pub mod agent;
-pub mod bors;
 pub mod codeql;
 pub mod commands;
 pub mod config;
@@ -8,6 +7,7 @@ pub mod engines_subproc;
 pub mod github;
 pub mod handlers;
 pub mod lang;
+pub mod merge_queue;
 pub mod rebase;
 pub mod redact;
 pub mod review;

@@ -1,4 +1,4 @@
-//! Bors-style merge queue: approved PRs are merged into a staging branch one
+//! Merge queue: approved PRs are merged into a staging branch one
 //! batch at a time, CI runs on the staging pushes, and a green batch advances
 //! main. A red batch drops its tail member (the newest) and re-tests the
 //! rest — tail-dropping is bisecting by construction.
@@ -7,9 +7,9 @@
 //!
 //! | State | Carrier |
 //! |---|---|
-//! | queued | `bors: queued` label |
-//! | batch member | `bors: testing` label |
-//! | batch contents & order | the staging branch's merge-commit chain, each message `xero-bors: merge #n (head <sha>)` |
+//! | queued | `merge queue: queued` label |
+//! | batch member | `merge queue: testing` label |
+//! | batch contents & order | the staging branch's merge-commit chain, each message `xero-bot: merge #n (head <sha>)` |
 //! | main advance | the open staging→main PR carrying [`ADVANCE_MARKER`] in its body |
 //!
 //! Every step is idempotent and re-derivable from those carriers, so a
@@ -34,15 +34,15 @@ use crate::t;
 /// without it is the batch's base (usually main's tip at batch start).
 ///
 /// The head sha is recorded here because the PR list alone cannot answer
-/// "was this member's head changed mid-batch?" — the standard bors
+/// "was this member's head changed mid-batch?" — the standard merge queue
 /// failure mode of an author force-pushing while their PR is under test.
-pub const MARKER_PREFIX: &str = "xero-bors: merge #";
+pub const MARKER_PREFIX: &str = "xero-bot: merge #";
 
 /// Hidden marker in the body of the PR that advances main (staging→main).
 /// Recognizing our own advance PR by content, not by author, is the same
 /// trick as [`crate::github::REVIEW_MARKER`] — a degraded or renamed bot
 /// login must not orphan the batch.
-pub const ADVANCE_MARKER: &str = "<!-- xero-bors-advance -->";
+pub const ADVANCE_MARKER: &str = "<!-- xero-bot-merge-queue-advance -->";
 
 /// One staging merge commit: which PR, at which head sha.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,7 +74,7 @@ pub fn parse_chain(commits: &[Value]) -> Vec<ChainEntry> {
             break;
         };
         if let Some(rest) = message.strip_prefix(MARKER_PREFIX) {
-            // "xero-bors: merge #123 (head abc1234…)" — the parenthetical is
+            // "xero-bot: merge #123 (head abc1234…)" — the parenthetical is
             // what enqueue wrote; tolerate its absence for commits written by
             // older versions or by hand.
             let pr = rest
@@ -275,7 +275,7 @@ pub async fn handle_pr_closed(gh: &Client, cfg: &Config, repo: &str, pr_number: 
 /// is v1's shape limit — merging a PR aimed at another branch into `staging`
 /// would fold the wrong diff into main.
 pub async fn enqueue(gh: &Client, cfg: &Config, repo: &str, pr_number: i64) -> EnqueueOutcome {
-    if !cfg.bors_enabled {
+    if !cfg.merge_queue_enabled {
         return EnqueueOutcome::Refused("merge queue disabled".into());
     }
     let pr = match gh.get_pr(repo, pr_number).await {
@@ -320,10 +320,10 @@ pub async fn enqueue(gh: &Client, cfg: &Config, repo: &str, pr_number: i64) -> E
         Ok(l) => l,
         Err(e) => return EnqueueOutcome::Refused(format!("cannot read labels: {e}")),
     };
-    if labels.iter().any(|l| l == &cfg.label_bors_testing) {
+    if labels.iter().any(|l| l == &cfg.label_merge_queue_testing) {
         return EnqueueOutcome::Already;
     }
-    if labels.iter().any(|l| l == &cfg.label_bors_queued) {
+    if labels.iter().any(|l| l == &cfg.label_merge_queue_queued) {
         return EnqueueOutcome::Already;
     }
 
@@ -345,7 +345,7 @@ pub async fn enqueue(gh: &Client, cfg: &Config, repo: &str, pr_number: i64) -> E
         .add_labels(
             repo,
             pr_number,
-            std::slice::from_ref(&cfg.label_bors_queued),
+            std::slice::from_ref(&cfg.label_merge_queue_queued),
         )
         .await
     {
@@ -354,8 +354,8 @@ pub async fn enqueue(gh: &Client, cfg: &Config, repo: &str, pr_number: i64) -> E
     // Queue position is not computed here — the driver sorts by number, and a
     // position that races the labels is a claim we can't back. The ack says
     // what is true without a second read: it is queued.
-    let queued_label = cfg.label_bors_queued.as_str();
-    let staging_name = cfg.bors_staging_branch.as_str();
+    let queued_label = cfg.label_merge_queue_queued.as_str();
+    let staging_name = cfg.merge_queue_staging_branch.as_str();
     let bot = cfg.bot_name.as_str();
     let body = t!(
         lang,
@@ -381,7 +381,10 @@ pub async fn dequeue_pr(
     note: &str,
 ) -> String {
     let mut removed = false;
-    for label in [&cfg.label_bors_queued, &cfg.label_bors_testing] {
+    for label in [
+        &cfg.label_merge_queue_queued,
+        &cfg.label_merge_queue_testing,
+    ] {
         match gh.remove_label(repo, pr_number, label).await {
             Ok(_) => removed = true,
             // Removing a non-existent label is the normal "wasn't queued" case.
@@ -405,14 +408,14 @@ pub async fn dequeue_pr(
 /// Rendered even when both lists are empty — a `queue` command that answers
 /// silence looks broken.
 pub async fn render_queue_status(gh: &Client, cfg: &Config, repo: &str, lang: Lang) -> String {
-    if !cfg.bors_enabled {
+    if !cfg.merge_queue_enabled {
         return t!(
             lang,
-            "ℹ️ The merge queue is disabled (set `BORS_ENABLED=true`).",
-            "ℹ️ 合并队列未启用(需设置 `BORS_ENABLED=true`)。"
+            "ℹ️ The merge queue is disabled (set `MERGE_QUEUE_ENABLED=true`).",
+            "ℹ️ 合并队列未启用(需设置 `MERGE_QUEUE_ENABLED=true`)。"
         );
     }
-    let staging = &cfg.bors_staging_branch;
+    let staging = &cfg.merge_queue_staging_branch;
 
     // The chain: everything on staging since the first non-marker commit.
     let chain = match gh.list_commits(repo, staging, 50).await {
@@ -429,7 +432,10 @@ pub async fn render_queue_status(gh: &Client, cfg: &Config, repo: &str, lang: La
         Some(crate::review::ci_state_for(gh, repo, tip).await)
     };
 
-    let queued: Vec<String> = match gh.list_prs_with_label(repo, &cfg.label_bors_queued).await {
+    let queued: Vec<String> = match gh
+        .list_prs_with_label(repo, &cfg.label_merge_queue_queued)
+        .await
+    {
         Ok(prs) => prs
             .iter()
             .filter_map(|p| p.get("number").and_then(|n| n.as_i64()))
@@ -572,8 +578,8 @@ fn start_backoff(repo: &str) {
 /// Serial on purpose: two concurrent pumps would race the staging ref and
 /// the label dance. The 200ms per-repo pacing matches `rebase::sweep`.
 pub async fn pump_all(cfg: &Config) -> String {
-    if !cfg.bors_enabled {
-        return "bors disabled".into();
+    if !cfg.merge_queue_enabled {
+        return "merge queue disabled".into();
     }
     let app = match crate::github::Client::app_client(cfg) {
         Ok(c) => c,
@@ -619,15 +625,16 @@ pub async fn pump_all(cfg: &Config) -> String {
                         start_backoff(&repo);
                     }
                     errors += 1;
-                    tracing::warn!("bors pump {repo}: {e}");
+                    tracing::warn!("merge queue pump {repo}: {e}");
                 }
-                other => tracing::info!("bors pump {repo}: {other}"),
+                other => tracing::info!("merge queue pump {repo}: {other}"),
             }
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
     }
 
-    let summary = format!("bors pump done: {repos} repos, {errors} errors, {skipped} backed off");
+    let summary =
+        format!("merge queue pump done: {repos} repos, {errors} errors, {skipped} backed off");
     tracing::info!("{summary}");
     summary
 }
@@ -643,7 +650,7 @@ pub async fn pump_one(gh: &Client, cfg: &Config, repo: &str) -> PumpOutcome {
             .to_string(),
         Err(e) => return PumpOutcome::Error(format!("repo info: {e}")),
     };
-    let staging = cfg.bors_staging_branch.clone();
+    let staging = cfg.merge_queue_staging_branch.clone();
 
     // The chain is the truth about what's testing. The staging ref may be
     // absent (no batch ever, or cleaned up after one).
@@ -701,7 +708,10 @@ async fn start_batch(
     staging: &str,
     default_branch: &str,
 ) -> PumpOutcome {
-    let queued = match gh.list_prs_with_label(repo, &cfg.label_bors_queued).await {
+    let queued = match gh
+        .list_prs_with_label(repo, &cfg.label_merge_queue_queued)
+        .await
+    {
         Ok(p) => p,
         Err(e) => return PumpOutcome::Error(format!("queued list: {e}")),
     };
@@ -710,14 +720,14 @@ async fn start_batch(
         .filter_map(|p| p.get("number").and_then(|n| n.as_i64()))
         .collect();
     numbers.sort_unstable();
-    numbers.truncate(cfg.bors_max_batch);
+    numbers.truncate(cfg.merge_queue_max_batch);
     if numbers.is_empty() {
         // Nothing to do. Clean the staging ref up if it's still lying
         // around — a leftover empty staging would grow into the next batch's
         // base instead of starting from main's tip.
-        if gh.get_branch_ref(repo, staging).await.is_ok() && cfg.bors_cleanup_staging {
+        if gh.get_branch_ref(repo, staging).await.is_ok() && cfg.merge_queue_cleanup_staging {
             if let Err(e) = gh.delete_branch_ref(repo, staging).await {
-                tracing::warn!("bors: delete unused {staging} on {repo}: {e}");
+                tracing::warn!("merge queue: delete unused {staging} on {repo}: {e}");
             }
         }
         return PumpOutcome::Idle;
@@ -796,9 +806,15 @@ async fn start_batch(
     // Swap labels: members → testing. A member that conflicted keeps neither
     // label after dequeue_pr; a member that merged loses queued.
     for n in &merged {
-        let _ = gh.remove_label(repo, *n, &cfg.label_bors_queued).await;
         let _ = gh
-            .add_labels(repo, *n, std::slice::from_ref(&cfg.label_bors_testing))
+            .remove_label(repo, *n, &cfg.label_merge_queue_queued)
+            .await;
+        let _ = gh
+            .add_labels(
+                repo,
+                *n,
+                std::slice::from_ref(&cfg.label_merge_queue_testing),
+            )
             .await;
     }
     for (n, why) in &conflicts {
@@ -906,7 +922,7 @@ async fn rebuild_from(
     if reset_sha.is_empty() {
         return PumpOutcome::Error(format!("rebuild of #{}: no parent sha", entry.pr));
     }
-    let staging = cfg.bors_staging_branch.clone();
+    let staging = cfg.merge_queue_staging_branch.clone();
     if let Err(e) = gh.update_branch_ref(repo, &staging, &reset_sha, true).await {
         return PumpOutcome::Error(format!("staging reset for rebuild: {e}"));
     }
@@ -928,7 +944,7 @@ async fn rebuild_from(
             Ok(p) => p,
             Err(e) => {
                 let _ = dequeue_pr(gh, cfg, repo, later.pr, "").await;
-                tracing::warn!("bors rebuild: cannot re-read #{}: {e}", later.pr);
+                tracing::warn!("merge queue rebuild: cannot re-read #{}: {e}", later.pr);
                 continue;
             }
         };
@@ -938,7 +954,7 @@ async fn rebuild_from(
             Ok(_) => remerged.push(later.pr),
             Err(e) => {
                 let _ = dequeue_pr(gh, cfg, repo, later.pr, "").await;
-                tracing::warn!("bors rebuild: re-merge #{} failed: {e}", later.pr);
+                tracing::warn!("merge queue rebuild: re-merge #{} failed: {e}", later.pr);
             }
         }
     }
@@ -1009,8 +1025,8 @@ async fn timeout_batch(gh: &Client, cfg: &Config, repo: &str, chain: &[ChainEntr
     for entry in chain {
         let _ = dequeue_pr(gh, cfg, repo, entry.pr, "").await;
     }
-    let timeout_h = cfg.bors_ci_timeout_secs / 3600;
-    let staging_name = cfg.bors_staging_branch.as_str();
+    let timeout_h = cfg.merge_queue_ci_timeout_secs / 3600;
+    let staging_name = cfg.merge_queue_staging_branch.as_str();
     let list = members
         .iter()
         .map(|n| format!("#{n}"))
@@ -1057,7 +1073,7 @@ async fn batch_timed_out(gh: &Client, cfg: &Config, repo: &str, chain: &[ChainEn
         Some(then) => {
             let now = crate::github::chrono_now_secs();
             let elapsed = (now - then as i64).max(0) as u64;
-            elapsed >= cfg.bors_ci_timeout_secs
+            elapsed >= cfg.merge_queue_ci_timeout_secs
         }
         None => false,
     }
@@ -1092,7 +1108,7 @@ fn rfc3339_to_secs(s: &str) -> Option<u64> {
 }
 
 /// Advance main: create (or reuse) the staging→main PR and merge it, or
-/// fast-forward the ref directly under `BORS_ADVANCE_METHOD=ref`.
+/// fast-forward the ref directly under `MERGE_QUEUE_ADVANCE_METHOD=ref`.
 async fn advance_main(
     gh: &Client,
     cfg: &Config,
@@ -1105,7 +1121,7 @@ async fn advance_main(
     let staging_head = chain[chain.len() - 1].merge_commit_sha.clone();
     let members: Vec<i64> = chain.iter().map(|e| e.pr).collect();
 
-    match cfg.bors_advance_method.as_str() {
+    match cfg.merge_queue_advance_method.as_str() {
         "ref" => {
             // True fast-forward. `force: false` — a main that moved by hand
             // refuses the update (non-FF), which is the protection working.
@@ -1129,7 +1145,7 @@ async fn advance_main(
             if let Err(e) = close_stale_advance_prs(gh, repo, default_branch, staging).await {
                 return PumpOutcome::Error(format!("stale advance prs: {e}"));
             }
-            let title = format!("xero-bors: advance {default_branch} to {}", staging);
+            let title = format!("xero-bot: advance {default_branch} to {}", staging);
             let list = members
                 .iter()
                 .map(|n| format!("#{n}"))
@@ -1158,14 +1174,14 @@ xero-bot — approving it approves the batch._"
                 .get("number")
                 .and_then(|n| n.as_i64())
                 .unwrap_or_default();
-            let title = format!("xero-bors: advance {default_branch} ({list})");
+            let title = format!("xero-bot: advance {default_branch} ({list})");
             match gh
                 .merge_pr(
                     repo,
                     number,
-                    &cfg.bors_advance_merge_method,
+                    &cfg.merge_queue_advance_merge_method,
                     &title,
-                    &format!("Batch {list} tested green on `{staging}` (xero-bors)."),
+                    &format!("Batch {list} tested green on `{staging}` (xero-bot merge queue)."),
                 )
                 .await
             {
@@ -1268,13 +1284,13 @@ async fn complete_batch(
         );
         let _ = gh.post_issue_comment(repo, entry.pr, &body).await;
         let _ = gh
-            .remove_label(repo, entry.pr, &cfg.label_bors_testing)
+            .remove_label(repo, entry.pr, &cfg.label_merge_queue_testing)
             .await;
     }
-    if cfg.bors_cleanup_staging {
-        let staging = cfg.bors_staging_branch.as_str();
+    if cfg.merge_queue_cleanup_staging {
+        let staging = cfg.merge_queue_staging_branch.as_str();
         if let Err(e) = gh.delete_branch_ref(repo, staging).await {
-            tracing::warn!("bors: delete {staging} on {repo} after completion: {e}");
+            tracing::warn!("merge queue: delete {staging} on {repo} after completion: {e}");
         }
     }
     PumpOutcome::Advanced(chain.iter().map(|e| e.pr).collect(), merge_sha.to_string())
@@ -1304,8 +1320,8 @@ mod tests {
     #[test]
     fn parse_chain_reads_marker_messages() {
         let commits = [
-            commit("mm", "xero-bors: merge #456 (head def4567)"),
-            commit("ee", "xero-bors: merge #123 (head abc1234)"),
+            commit("mm", "xero-bot: merge #456 (head def4567)"),
+            commit("ee", "xero-bot: merge #123 (head abc1234)"),
             commit("bb", "Initial commit"),
         ];
         let chain = parse_chain(&commits);
@@ -1329,7 +1345,7 @@ mod tests {
     #[test]
     fn parse_chain_stops_at_base_and_tolerates_marker_without_head() {
         let commits = [
-            commit("mm", "xero-bors: merge #2"),
+            commit("mm", "xero-bot: merge #2"),
             commit("bb", "Merge pull request #1 from someone/feature"),
         ];
         let chain = parse_chain(&commits);
@@ -1342,15 +1358,15 @@ mod tests {
     fn parse_chain_rejects_marker_without_a_number() {
         // A torn or hand-edited marker can be matched to no PR; trusting the
         // prefix would let labels and chain disagree.
-        let commits = [commit("mm", "xero-bors: merge (nonsense)")];
+        let commits = [commit("mm", "xero-bot: merge (nonsense)")];
         assert!(parse_chain(&commits).is_empty());
     }
 
     #[test]
     fn parse_chain_does_not_match_a_superset_prefix() {
-        // Another consumer might one day write "xero-bors: merge attempt #3";
+        // Another consumer might one day write "xero-bot: merge attempt #3";
         // it must not parse as PR 3.
-        let commits = [commit("mm", "xero-bors: merge attempt #3")];
+        let commits = [commit("mm", "xero-bot: merge attempt #3")];
         assert!(parse_chain(&commits).is_empty());
     }
 

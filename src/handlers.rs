@@ -30,10 +30,10 @@ pub struct CommentContext {
 /// documents r+'s second effect; without it, only the needs-rebase note —
 /// one function rather than per-row flags, so the two deployments' helps
 /// can't drift apart row by row.
-fn queue_note(bors_enabled: bool, lang: Lang) -> String {
+fn queue_note(merge_queue_enabled: bool, lang: Lang) -> String {
     match lang {
         Lang::En => {
-            if bors_enabled {
+            if merge_queue_enabled {
                 "A successful `r+` (or a web Approve by a write+ reviewer) **queues the PR for \
 automatic merge** — batches are tested on the `staging` branch, then advanced to `main`. \
 `r-` withdraws from the queue; `queue` shows it. Conflicted PRs are labelled \
@@ -45,7 +45,7 @@ automatic merge** — batches are tested on the `staging` branch, then advanced 
             }
         }
         Lang::Zh => {
-            if bors_enabled {
+            if merge_queue_enabled {
                 "成功的 `r+`(或网页上 write+ 审阅者的 Approve)会**将 PR 加入自动合并队列** \
 —— 批次先在 `staging` 分支上测试,全绿后推进 `main`。`r-` 撤回出队;`queue` 查看队列。\
 冲突的 PR 会被自动打上 `needs-rebase` 标签。"
@@ -57,7 +57,7 @@ automatic merge** — batches are tested on the `staging` branch, then advanced 
     }
 }
 
-pub fn help_text(bot_name: &str, bors_enabled: bool, lang: Lang, on_behalf: bool) -> String {
+pub fn help_text(bot_name: &str, merge_queue_enabled: bool, lang: Lang, on_behalf: bool) -> String {
     match lang {
         Lang::En => format!(
             "### xero-bot commands\n\n\
@@ -85,7 +85,7 @@ pub fn help_text(bot_name: &str, bors_enabled: bool, lang: Lang, on_behalf: bool
             } else {
                 "**Disabled in this deployment** — set `R_PLUS_ALLOW_ON_BEHALF=true` to enable"
             },
-            queue_help = queue_note(bors_enabled, Lang::En)
+            queue_help = queue_note(merge_queue_enabled, Lang::En)
         ),
         Lang::Zh => format!(
             "### xero-bot 命令参考\n\n\
@@ -113,7 +113,7 @@ pub fn help_text(bot_name: &str, bors_enabled: bool, lang: Lang, on_behalf: bool
             } else {
                 "**本部署已禁用** —— 需设置 `R_PLUS_ALLOW_ON_BEHALF=true` 开启"
             },
-            queue_help = queue_note(bors_enabled, Lang::Zh)
+            queue_help = queue_note(merge_queue_enabled, Lang::Zh)
         ),
     }
 }
@@ -212,7 +212,7 @@ async fn handle_one(gh: &Client, cfg: &Config, ctx: &CommentContext, cmd: Comman
                 ctx.pr_number,
                 &help_text(
                     &cfg.bot_name,
-                    cfg.bors_enabled,
+                    cfg.merge_queue_enabled,
                     lang,
                     cfg.r_plus_allow_on_behalf,
                 ),
@@ -253,7 +253,7 @@ async fn handle_one(gh: &Client, cfg: &Config, ctx: &CommentContext, cmd: Comman
             crate::codeql::run_codeql_report(gh, cfg, &ctx.repo, ctx.pr_number, lang).await
         }
         Command::Queue => {
-            let status = crate::bors::render_queue_status(gh, cfg, &ctx.repo, lang).await;
+            let status = crate::merge_queue::render_queue_status(gh, cfg, &ctx.repo, lang).await;
             labeled(
                 "queue status reply",
                 gh.post_issue_comment(&ctx.repo, ctx.pr_number, &status)
@@ -796,7 +796,7 @@ to pick one and they'll be notified.",
     }
 }
 
-/// r+: permission-gated approval relay (bors-style).
+/// r+: permission-gated approval relay (merge-queue style).
 ///
 /// The gates run cheapest-first, and that order is part of the guarantee: a
 /// request that is refused on configuration or on who asked never reaches the
@@ -994,10 +994,10 @@ or above to approve this PR (currently: {their_perm}).",
             // keeps r+ meaningful with the queue on; with it off, this is a
             // no-op. Failures are logged, not fatal: the approval itself went
             // through, and the queue will pick the PR up on the next r+.
-            if cfg.bors_enabled && ctx.is_pr {
-                let outcome = crate::bors::enqueue(gh, cfg, &ctx.repo, ctx.pr_number).await;
+            if cfg.merge_queue_enabled && ctx.is_pr {
+                let outcome = crate::merge_queue::enqueue(gh, cfg, &ctx.repo, ctx.pr_number).await;
                 tracing::info!(
-                    "bors enqueue after r+ on {}#{}: {outcome}",
+                    "merge queue enqueue after r+ on {}#{}: {outcome}",
                     ctx.repo,
                     ctx.pr_number
                 );
@@ -1147,15 +1147,15 @@ async fn handle_reject(gh: &Client, cfg: &Config, ctx: &CommentContext) -> Strin
     // Withdrawing the approval withdraws the merge request. A partial
     // dismissal leaves at least one APPROVE standing, so the queue keeps the
     // PR — the caller can retry r-.
-    if cfg.bors_enabled && dismissed == found && ctx.is_pr {
+    if cfg.merge_queue_enabled && dismissed == found && ctx.is_pr {
         let note = t!(
             lang,
             "➖ Removed from the merge queue (r- by @{who}).",
             "➖ 已移出合并队列(r- by @{who})。"
         );
-        let status = crate::bors::dequeue_pr(gh, cfg, &ctx.repo, ctx.pr_number, &note).await;
+        let status = crate::merge_queue::dequeue_pr(gh, cfg, &ctx.repo, ctx.pr_number, &note).await;
         tracing::info!(
-            "bors dequeue after r- on {}#{}: {status}",
+            "merge queue dequeue after r- on {}#{}: {status}",
             ctx.repo,
             ctx.pr_number
         );

@@ -1,4 +1,4 @@
-//! Bors merge queue end-to-end tests against a mocked GitHub API.
+//! Merge queue end-to-end tests against a mocked GitHub API.
 //!
 //! These exercise the driver (`pump_one` / `pump_all`'s per-repo unit) and
 //! the queue commands (`render_queue_status`, `enqueue`) the way production
@@ -16,25 +16,25 @@ use xero_bot::github::Client;
 
 const REPO: &str = "octocat/hello";
 
-/// Bors-enabled config pointed at nothing (octocrab is redirected per-test).
-fn bors_cfg() -> Config {
+/// Merge-queue config pointed at nothing (octocrab is redirected per-test).
+fn queue_cfg() -> Config {
     let mut c = Config::from_env();
     c.app_id = "12345".into();
     c.webhook_secret = "whsec".into();
     c.bot_name = "xero-review".into();
     c.app_slug = "xero-review".into();
     c.rebase_sweep_enabled = false;
-    c.bors_enabled = true;
-    c.bors_staging_branch = "staging".into();
-    c.bors_max_batch = 8;
-    c.bors_ci_timeout_secs = 7_200;
-    c.bors_poll_interval_secs = 30;
-    c.bors_advance_method = "pr".into();
-    c.bors_advance_merge_method = "merge".into();
-    c.bors_cleanup_staging = true;
-    c.bors_advance_strict = false;
-    c.label_bors_queued = "bors: queued".into();
-    c.label_bors_testing = "bors: testing".into();
+    c.merge_queue_enabled = true;
+    c.merge_queue_staging_branch = "staging".into();
+    c.merge_queue_max_batch = 8;
+    c.merge_queue_ci_timeout_secs = 7_200;
+    c.merge_queue_poll_interval_secs = 30;
+    c.merge_queue_advance_method = "pr".into();
+    c.merge_queue_advance_merge_method = "merge".into();
+    c.merge_queue_cleanup_staging = true;
+    c.merge_queue_advance_strict = false;
+    c.label_merge_queue_queued = "merge queue: queued".into();
+    c.label_merge_queue_testing = "merge queue: testing".into();
     c
 }
 
@@ -93,7 +93,7 @@ fn single_commit_mock(sha: &str, parents: &[&str]) -> Mock {
         .and(query_param("sha", sha))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!([{
             "sha": sha,
-            "commit": {"message": "xero-bors: merge #10 (head head10)"},
+            "commit": {"message": "xero-bot: merge #10 (head head10)"},
             "parents": parents.iter().map(|p| json!({"sha": p})).collect::<Vec<_>>()
         }])))
 }
@@ -103,7 +103,7 @@ fn merge_commit(sha: &str, message: &str) -> serde_json::Value {
 }
 
 fn marker_commit(sha: &str, pr: i64, head: &str) -> serde_json::Value {
-    merge_commit(sha, &format!("xero-bors: merge #{pr} (head {head})"))
+    merge_commit(sha, &format!("xero-bot: merge #{pr} (head {head})"))
 }
 
 /// CI reads: check-runs + statuses for one sha.
@@ -151,7 +151,7 @@ async fn allow_labels(server: &MockServer) {
 fn queued_issues_mock() -> Mock {
     Mock::given(method("GET"))
         .and(path(format!("/repos/{REPO}/issues")))
-        .and(query_param("labels", "bors: queued"))
+        .and(query_param("labels", "merge queue: queued"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!([
             {
                 "number": 10,
@@ -223,11 +223,11 @@ async fn batch_of_two_is_staged_in_order() {
     allow_comments(&server).await;
 
     let gh = client_for(&server);
-    let cfg = bors_cfg();
-    let outcome = xero_bot::bors::pump_one(&gh, &cfg, REPO).await;
+    let cfg = queue_cfg();
+    let outcome = xero_bot::merge_queue::pump_one(&gh, &cfg, REPO).await;
     assert_eq!(
         outcome,
-        xero_bot::bors::PumpOutcome::Started(vec![10, 11]),
+        xero_bot::merge_queue::PumpOutcome::Started(vec![10, 11]),
         "{outcome}"
     );
 }
@@ -237,7 +237,7 @@ async fn batch_of_two_is_staged_in_order() {
 #[tokio::test]
 async fn green_chain_advances_main() {
     let server = MockServer::start().await;
-    let cfg = bors_cfg();
+    let cfg = queue_cfg();
     let gh = client_for(&server);
 
     // Mid-batch state: staging holds a two-member chain.
@@ -249,7 +249,7 @@ async fn green_chain_advances_main() {
         "staging",
         json!([
             marker_commit("s0me-merge-sha", 11, "head11"),
-            merge_commit("under11", "xero-bors: merge #10 (head head10)"),
+            merge_commit("under11", "xero-bot: merge #10 (head head10)"),
             merge_commit("ma1n", "Initial commit")
         ]),
     )
@@ -265,7 +265,7 @@ async fn green_chain_advances_main() {
     // The queue is empty (the members left it when the batch started).
     Mock::given(method("GET"))
         .and(path(format!("/repos/{REPO}/issues")))
-        .and(query_param("labels", "bors: queued"))
+        .and(query_param("labels", "merge queue: queued"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
         .mount(&server)
         .await;
@@ -302,10 +302,10 @@ async fn green_chain_advances_main() {
         .mount(&server)
         .await;
 
-    let outcome = xero_bot::bors::pump_one(&gh, &cfg, REPO).await;
+    let outcome = xero_bot::merge_queue::pump_one(&gh, &cfg, REPO).await;
     assert_eq!(
         outcome,
-        xero_bot::bors::PumpOutcome::Advanced(vec![10, 11], "advanced-sha".into()),
+        xero_bot::merge_queue::PumpOutcome::Advanced(vec![10, 11], "advanced-sha".into()),
         "{outcome}"
     );
 }
@@ -319,7 +319,7 @@ async fn red_ci_drops_the_tail_and_resets() {
     let server = MockServer::start().await;
 
     // A batch of one is already under test: #10 merged into staging.
-    let cfg = bors_cfg();
+    let cfg = queue_cfg();
     let gh = client_for(&server);
 
     // Reads that reach the driver before CI.
@@ -360,10 +360,10 @@ async fn red_ci_drops_the_tail_and_resets() {
     allow_labels(&server).await;
     allow_comments(&server).await;
 
-    let outcome = xero_bot::bors::pump_one(&gh, &cfg, REPO).await;
+    let outcome = xero_bot::merge_queue::pump_one(&gh, &cfg, REPO).await;
     assert_eq!(
         outcome,
-        xero_bot::bors::PumpOutcome::Dropped(10, "CI failed".into()),
+        xero_bot::merge_queue::PumpOutcome::Dropped(10, "CI failed".into()),
         "{outcome}"
     );
 
@@ -418,11 +418,11 @@ async fn conflict_drops_one_member_and_keeps_the_batch() {
     allow_comments(&server).await;
 
     let gh = client_for(&server);
-    let cfg = bors_cfg();
-    let outcome = xero_bot::bors::pump_one(&gh, &cfg, REPO).await;
+    let cfg = queue_cfg();
+    let outcome = xero_bot::merge_queue::pump_one(&gh, &cfg, REPO).await;
     assert_eq!(
         outcome,
-        xero_bot::bors::PumpOutcome::Started(vec![10]),
+        xero_bot::merge_queue::PumpOutcome::Started(vec![10]),
         "the conflicting member must not stall the batch: {outcome}"
     );
 }
@@ -437,7 +437,7 @@ async fn restart_mid_batch_resumes_without_re_merging() {
 
     // No queued PRs (both are in the batch), staging has one marker commit
     // of the two-member batch, CI on the tip is still pending.
-    let cfg = bors_cfg();
+    let cfg = queue_cfg();
     let gh = client_for(&server);
 
     repo_info_mock("main").mount(&server).await;
@@ -446,7 +446,7 @@ async fn restart_mid_batch_resumes_without_re_merging() {
         "staging",
         json!([
             marker_commit("m2", 11, "head11"),
-            merge_commit("m1", "xero-bors: merge #10 (head head10)"),
+            merge_commit("m1", "xero-bot: merge #10 (head head10)"),
             merge_commit("ma1n", "Initial commit")
         ]),
     )
@@ -478,8 +478,12 @@ async fn restart_mid_batch_resumes_without_re_merging() {
         .mount(&server)
         .await;
 
-    let outcome = xero_bot::bors::pump_one(&gh, &cfg, REPO).await;
-    assert_eq!(outcome, xero_bot::bors::PumpOutcome::Testing, "{outcome}");
+    let outcome = xero_bot::merge_queue::pump_one(&gh, &cfg, REPO).await;
+    assert_eq!(
+        outcome,
+        xero_bot::merge_queue::PumpOutcome::Testing,
+        "{outcome}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -490,7 +494,7 @@ async fn restart_mid_batch_resumes_without_re_merging() {
 async fn advance_pr_405_keeps_the_batch() {
     let server = MockServer::start().await;
 
-    let cfg = bors_cfg();
+    let cfg = queue_cfg();
     let gh = client_for(&server);
 
     repo_info_mock("main").mount(&server).await;
@@ -499,7 +503,7 @@ async fn advance_pr_405_keeps_the_batch() {
         "staging",
         json!([
             marker_commit("m2", 11, "head11"),
-            merge_commit("m1", "xero-bors: merge #10 (head head10)"),
+            merge_commit("m1", "xero-bot: merge #10 (head head10)"),
             merge_commit("ma1n", "Initial commit")
         ]),
     )
@@ -547,9 +551,9 @@ async fn advance_pr_405_keeps_the_batch() {
     allow_comments(&server).await;
     allow_labels(&server).await;
 
-    let outcome = xero_bot::bors::pump_one(&gh, &cfg, REPO).await;
+    let outcome = xero_bot::merge_queue::pump_one(&gh, &cfg, REPO).await;
     match outcome {
-        xero_bot::bors::PumpOutcome::AdvanceBlocked(_) => {}
+        xero_bot::merge_queue::PumpOutcome::AdvanceBlocked(_) => {}
         other => panic!("expected AdvanceBlocked, got {other:?}"),
     }
 }
@@ -567,7 +571,7 @@ fn self_review_never_reaches_the_queue() {
     cfg.bot_name = "xero-review".into();
     cfg.app_slug = "xero-review".into();
     cfg.webhook_secret = "whsec".into();
-    cfg.bors_enabled = true;
+    cfg.merge_queue_enabled = true;
 
     // The payload our own `post_approve_review` produces.
     let payload = json!({
@@ -645,7 +649,7 @@ async fn r_plus_success_enqueues_the_pr() {
     // distinguish "approved and queued" from a plain r+.
     Mock::given(method("POST"))
         .and(path(format!("/repos/{REPO}/issues/7/labels")))
-        .and(body_string_contains("bors: queued"))
+        .and(body_string_contains("merge queue: queued"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
         .expect(1)
         .mount(&server)
@@ -657,7 +661,7 @@ async fn r_plus_success_enqueues_the_pr() {
         .mount(&server)
         .await;
 
-    let cfg = bors_cfg();
+    let cfg = queue_cfg();
     let gh = client_for(&server);
     let ctx = xero_bot::handlers::CommentContext {
         repo: REPO.into(),

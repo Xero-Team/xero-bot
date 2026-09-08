@@ -5,7 +5,7 @@
 Xero-Team 的组织级 GitHub App 机器人。Rust 实现,单二进制,自托管部署(Docker / VPS)。
 
 功能:
-- **bors/triagebot 风格评论命令** — `r?`、`?r cc`、label 管理、assign/claim、`r+` 代审批等
+- **triagebot 风格评论命令** — `r?`、`?r cc`、label 管理、assign/claim、`r+` 代审批等
 - **增量 AI 代码审查** — 先了解项目、结合上一轮审查意见,而非孤立地看 diff
 - **rebase 提醒** — PR 与目标分支冲突时自动打 `needs-rebase` 标签并提醒,解决后自动清除
 - **CodeQL 质量报告** — 读取仓库存量 code scanning 告警,映射到 PR 变更文件
@@ -73,17 +73,17 @@ Xero-Team 的组织级 GitHub App 机器人。Rust 实现,单二进制,自托管
 
 被拒绝的 `r+` 除上述校验外不会产生额外 API 调用;`help` 表会说明本部署处于开关的哪一侧。
 
-### 合并队列(bors 式)
+### 合并队列
 
-设置 `BORS_ENABLED=true` 后,批准不再只是"这个看起来不错",而是**"合并它"** —— 与 bors 给
+设置 `MERGE_QUEUE_ENABLED=true` 后,批准不再只是"这个看起来不错",而是**"合并它"** —— 与自动合并队列给
 `r+` 的语义一致。队列把多个 PR 组成**批次**一起测试,保证 main 只会推进到真正通过 CI 的
 组合:
 
-1. `r+` 成功(或 write+ 审阅者在网页上 Approve)会给 PR 打 `bors: queued` 标签。
+1. `r+` 成功(或 write+ 审阅者在网页上 Approve)会给 PR 打 `merge queue: queued` 标签。
    `r-`、CHANGES_REQUESTED 审查、或关闭 PR 都会把它移出队列。
-2. 驱动循环(轮询,默认每 30s)组批 —— 最多 `BORS_MAX_BATCH` 个、按 PR 号升序 —— 把每个
-   PR 的 head 以 merge commit(`xero-bors: merge #n (head …)`)逐个并入 `staging` 分支,
-   批次成员改打 `bors: testing` 标签。
+2. 驱动循环(轮询,默认每 30s)组批 —— 最多 `MERGE_QUEUE_MAX_BATCH` 个、按 PR 号升序 —— 把每个
+   PR 的 head 以 merge commit(`xero-bot: merge #n (head …)`)逐个并入 `staging` 分支,
+   批次成员改打 `merge queue: testing` 标签。
 3. CI 在 staging 的 push 上运行。全绿 → 通过一个 `staging`→`main` 的 PR 推进 main
    (该 PR 继承 main 的分支保护,required checks 因 head 就是已测试树而天然满足)。
    红灯 → 把最新的成员当作疑似元凶移出队列,staging 重置,剩余前缀自动重测
@@ -92,7 +92,7 @@ Xero-Team 的组织级 GitHub App 机器人。Rust 实现,单二进制,自托管
 
 `@xero-review queue` 可查看在测批次及其 CI 状态、以及排队名单。
 
-**前提条件**(不满足时队列会等:CI 迟迟没有结论的批次在 `BORS_CI_TIMEOUT_SECS` —— 默认
+**前提条件**(不满足时队列会等:CI 迟迟没有结论的批次在 `MERGE_QUEUE_CI_TIMEOUT_SECS` —— 默认
 2 小时 —— 后超时,把 PR 退回队列并附解释评论):
 
 - **CI 必须对 staging 分支的 push 生效。** 只写了 `on: pull_request` 的 workflow 在
@@ -108,7 +108,7 @@ Xero-Team 的组织级 GitHub App 机器人。Rust 实现,单二进制,自托管
 - **分支保护**:`staging` 不要加任何保护 —— bot 会反复 force-update 它。`main` 保持现有
   保护;推进 PR 自己就能满足 required checks(head 就是已测试树)。如果 main 还要求人工
   批准,write+ 用户批准推进 PR 即等于批准整批 —— bot 会说明并重试。
-- **仅接受目标为仓库默认分支的 PR**(`BORS_ADVANCE_METHOD=pr` 为默认;`ref` 直接
+- **仅接受目标为仓库默认分支的 PR**(`MERGE_QUEUE_ADVANCE_METHOD=pr` 为默认;`ref` 直接
   fast-forward,需要给 App 配置绕过 main 推送限制 —— 仅进阶用法)。
 
 队列的所有状态都存在 GitHub —— 标签 + staging merge commit 链 —— 所以批次中途重启会
@@ -270,7 +270,7 @@ src/
 ├── engines_subproc.rs pi/codex 子进程引擎 + git checkout 缓存
 ├── codeql.rs          Code Scanning 告警 → PR 变更文件映射 → 报告
 ├── rebase.rs          mergeable 检测 + needs-rebase 标签 + sweep
-├── bors.rs            合并队列(staging 批次 + CI 门禁 + 推进 main;状态 = 标签 + staging 提交链)
+├── merge_queue.rs     合并队列(staging 批次 + CI 门禁 + 推进 main;状态 = 标签 + staging 提交链)
 ├── dispatch.rs        事件 → 后台工作 路由(含免 @ 会话检查)
 └── main.rs            自托管 axum 服务器
 ```

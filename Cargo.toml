@@ -2,7 +2,7 @@
 name = "xero-bot"
 version = "0.2.0"
 edition = "2021"
-description = "Xero-Team GitHub bot: bors/triagebot-style commands, incremental AI review, CodeQL reports"
+description = "Xero-Team GitHub bot: triagebot-style commands with a merge queue, incremental AI review, CodeQL reports"
 license = "MIT"
 
 [dependencies]
