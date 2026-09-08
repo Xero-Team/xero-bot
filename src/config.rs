@@ -74,11 +74,44 @@ pub struct Config {
     pub rebase_sweep_enabled: bool,
     pub rebase_sweep_interval_secs: u64,
 
+    // Bors merge queue
+    /// Master switch. Default **false**: the queue writes branches and merges
+    /// PRs — behavior no deployment should gain silently. Everything bors does
+    /// is gated on this, including the new webhook routes.
+    pub bors_enabled: bool,
+    /// The branch PR heads are merged into, one batch at a time.
+    pub bors_staging_branch: String,
+    /// Upper bound on one batch; the queue takes PRs in ascending number.
+    pub bors_max_batch: usize,
+    /// How long a batch may sit without reaching a CI verdict before every
+    /// member is dequeued with an explanation.
+    pub bors_ci_timeout_secs: u64,
+    /// Driver tick interval, floored at 15s (see `validate`).
+    pub bors_poll_interval_secs: u64,
+    /// How main is advanced once the batch is green: `"pr"` (a staging→main
+    /// PR, inherits branch protection) or `"ref"` (fast-forward ref update,
+    /// needs the App exempted from push restrictions).
+    pub bors_advance_method: String,
+    /// Merge method for the advance PR: `"merge"` or `"squash"` (`"rebase"`
+    /// would re-linearize the staging commits — not offered).
+    pub bors_advance_merge_method: String,
+    /// Delete the staging ref after a batch completes; recreated next batch.
+    pub bors_cleanup_staging: bool,
+    /// When the advance PR cannot merge because main moved by hand: keep the
+    /// batch and retry (false, default) or dequeue everything (true).
+    pub bors_advance_strict: bool,
+
     // Labels
     pub label_needs_rebase: String,
     pub label_waiting_review: String,
     pub label_waiting_author: String,
     pub label_blocked: String,
+    /// PR is waiting for a batch to start (`bors: queued`) / is a member of
+    /// the batch currently under test (`bors: testing`). Together with the
+    /// staging branch's merge-commit chain, these labels are the whole queue
+    /// state — the bot has no database.
+    pub label_bors_queued: String,
+    pub label_bors_testing: String,
     pub codeql_label: String,
 
     // Service
@@ -216,10 +249,22 @@ impl Config {
             rebase_sweep_enabled: bool_cfg("REBASE_SWEEP_ENABLED", true),
             rebase_sweep_interval_secs: int_cfg("REBASE_SWEEP_INTERVAL_SECS", 21_600),
 
+            bors_enabled: bool_cfg("BORS_ENABLED", false),
+            bors_staging_branch: cfg("BORS_STAGING_BRANCH", "staging"),
+            bors_max_batch: int_cfg("BORS_MAX_BATCH", 8) as usize,
+            bors_ci_timeout_secs: int_cfg("BORS_CI_TIMEOUT_SECS", 7_200),
+            bors_poll_interval_secs: int_cfg("BORS_POLL_INTERVAL_SECS", 30),
+            bors_advance_method: cfg("BORS_ADVANCE_METHOD", "pr"),
+            bors_advance_merge_method: cfg("BORS_ADVANCE_MERGE_METHOD", "merge"),
+            bors_cleanup_staging: bool_cfg("BORS_CLEANUP_STAGING", true),
+            bors_advance_strict: bool_cfg("BORS_ADVANCE_STRICT", false),
+
             label_needs_rebase: cfg("LABEL_NEEDS_REBASE", "needs-rebase"),
             label_waiting_review: cfg("LABEL_WAITING_REVIEW", "waiting-on-review"),
             label_waiting_author: cfg("LABEL_WAITING_AUTHOR", "waiting-on-author"),
             label_blocked: cfg("LABEL_BLOCKED", "blocked"),
+            label_bors_queued: cfg("LABEL_BORS_QUEUED", "bors: queued"),
+            label_bors_testing: cfg("LABEL_BORS_TESTING", "bors: testing"),
             codeql_label: cfg("CODEQL_LABEL", ""),
 
             port: int_cfg("PORT", 8080) as u16,
@@ -257,6 +302,30 @@ impl Config {
                     pem.len(),
                     head.trim()
                 ));
+            }
+        }
+
+        // Bors values are validated here rather than defaulted silently: a
+        // typo'd BORS_ADVANCE_METHOD would otherwise fall back to an implicit
+        // "pr" — merging with a method the operator never chose.
+        if self.bors_enabled {
+            if self.bors_staging_branch.is_empty() {
+                return Err("BORS_STAGING_BRANCH is empty".into());
+            }
+            if !matches!(self.bors_advance_method.as_str(), "pr" | "ref") {
+                return Err(format!(
+                    "BORS_ADVANCE_METHOD must be \"pr\" or \"ref\" (got {:?})",
+                    self.bors_advance_method
+                ));
+            }
+            if !matches!(self.bors_advance_merge_method.as_str(), "merge" | "squash") {
+                return Err(format!(
+                    "BORS_ADVANCE_MERGE_METHOD must be \"merge\" or \"squash\" (got {:?})",
+                    self.bors_advance_merge_method
+                ));
+            }
+            if self.bors_max_batch == 0 {
+                return Err("BORS_MAX_BATCH must be at least 1".into());
             }
         }
         Ok(())
