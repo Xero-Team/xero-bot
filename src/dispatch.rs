@@ -139,6 +139,21 @@ pub fn route_event(cfg: &Config, event_header: &str, payload: &Value) -> Routing
                 installation_id,
             })
         }
+        WebhookEvent::RepoPush {
+            repo,
+            ref_name,
+            installation_id,
+        } => {
+            // Whether the push touched the default branch is only knowable
+            // from the API, and routing stays synchronous — so the branch
+            // name travels and the check happens at execution, where the
+            // installation client already exists anyway.
+            Routing::Act(Work::BasePushed {
+                repo,
+                ref_name,
+                installation_id,
+            })
+        }
         WebhookEvent::PrLabeled {
             repo,
             pr_number,
@@ -247,6 +262,14 @@ pub enum Work {
         repo: String,
         pr_number: i64,
         action: String,
+        installation_id: i64,
+    },
+    /// A push landed somewhere in a repo; execution decides whether it was
+    /// the default branch. Base moves are the only way a PR goes conflicted
+    /// without an event on the PR itself.
+    BasePushed {
+        repo: String,
+        ref_name: String,
         installation_id: i64,
     },
     Codeql {
@@ -418,6 +441,17 @@ commands like yours work without the mention."
             let gh = Client::installation(cfg, installation_id, "")
                 .map_err(|e| format!("installation client: {e}"))?;
             crate::rebase::handle_push_event(&gh, cfg, &repo, pr_number, &action).await;
+            Ok(())
+        }
+        Work::BasePushed {
+            repo,
+            ref_name,
+            installation_id,
+        } => {
+            let gh = Client::installation_resolved(cfg, installation_id)
+                .await
+                .map_err(|e| format!("installation client: {e}"))?;
+            crate::rebase::handle_base_push(&gh, cfg, &repo, &ref_name).await;
             Ok(())
         }
         Work::Codeql {
@@ -641,6 +675,43 @@ mod tests {
         });
         let r = route_event(&queue_cfg(), "pull_request", &payload);
         assert!(matches!(r, Routing::Act(Work::RebaseCheck { .. })), "{r:?}");
+    }
+
+    /// A push to any ref becomes a BasePushed work item; whether the ref was
+    /// the default branch is an API question, answered at execution.
+    #[test]
+    fn push_routes_to_base_pushed() {
+        let payload = json!({
+            "installation": {"id": 42},
+            "repository": {"full_name": "Xero-Team/xero-bot"},
+            "ref": "refs/heads/main",
+        });
+        match route_event(&cfg(), "push", &payload) {
+            Routing::Act(Work::BasePushed {
+                repo,
+                ref_name,
+                installation_id,
+            }) => {
+                assert_eq!(repo, "Xero-Team/xero-bot");
+                assert_eq!(ref_name, "refs/heads/main");
+                assert_eq!(installation_id, 42);
+            }
+            other => panic!("expected Act(BasePushed), got {other:?}"),
+        }
+    }
+
+    /// A push payload without an installation (e.g. a deploy key push) is
+    /// refused at classification — there is no client to check anything with.
+    #[test]
+    fn push_without_installation_is_ignored() {
+        let payload = json!({
+            "repository": {"full_name": "Xero-Team/xero-bot"},
+            "ref": "refs/heads/main",
+        });
+        assert_eq!(
+            ignored_reason(&route_event(&cfg(), "push", &payload)).as_deref(),
+            Some("no installation")
+        );
     }
 
     /// The help text lists every command as `@bot <verb>`, so reacting to our own

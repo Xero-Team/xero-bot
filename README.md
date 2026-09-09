@@ -114,8 +114,9 @@ explanation):
   ```
 - **GitHub App settings**: add permission **Contents: read/write** (the queue creates,
   resets and deletes the staging branch and creates the advance PR) and subscribe to the
-  **Pull request review** event (a web Approve must reach the bot). Everything else stays
-  as before.
+  **Pull request review** event (a web Approve must reach the bot). Also subscribe to the
+  **Push** event if you can: it is what notices "someone else's PR merged and dirtied an
+  open PR" within seconds instead of at the next sweep. Everything else stays as before.
 - **Branch protection**: leave `staging` unprotected — the bot force-updates it constantly.
   Keep `main` protected as today; the advance PR satisfies required checks on its own
   (its head is the tested tree). If main also requires human reviews, a write+ user
@@ -221,7 +222,7 @@ GitHub → Settings → Developer settings → GitHub Apps → **New GitHub App*
 |---|---|
 | Webhook URL | `https://<host>/webhook` |
 | Webhook secret | any random string — must match `WEBHOOK_SECRET` |
-| Subscribed events | **Issue comment** + **Pull request** (+ **Pull request review** for the merge queue) |
+| Subscribed events | **Issue comment** + **Pull request** (+ **Pull request review** for the merge queue; **Push** recommended — seconds-level notice when the base moves) |
 | Permissions | Contents: R (RW for the merge queue) · Pull requests: RW · Issues: RW · **Checks: R** · **Code scanning alerts: R** |
 
 Then: **generate a private key** (downloads a `.pem` file), note the numeric **App ID** and the bot's @-name (for `BOT_NAME`), and install the App on the target org/repos.

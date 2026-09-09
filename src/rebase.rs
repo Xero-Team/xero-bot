@@ -198,6 +198,58 @@ pub async fn handle_push_event(
     tracing::info!("rebase check {repo}#{pr_number} ({action}): {status}");
 }
 
+/// Handle a push webhook: when the default branch moved, every open PR can
+/// have become conflicted without any event of its own. Re-check them all,
+/// after the same mergeability grace the synchronize path uses.
+///
+/// A push to any other ref is the normal case (feature branches) and is
+/// dropped after one read of the repo record. Webhook ordering is not a
+/// dependency: `mergeable` is recomputed from the current refs at read time,
+/// so an older event running late answers with current truth or `Unknown`,
+/// and the sweep covers the rest.
+pub async fn handle_base_push(gh: &Client, cfg: &Config, repo: &str, ref_name: &str) {
+    let pushed = ref_name.strip_prefix("refs/heads/").unwrap_or("");
+    if pushed.is_empty() {
+        // Tag pushes (`refs/tags/…`) and other refs can't dirty a PR's base.
+        return;
+    }
+    let default_branch = match gh.repo_info(repo).await {
+        Ok(r) => r
+            .get("default_branch")
+            .and_then(|b| b.as_str())
+            .unwrap_or("")
+            .to_string(),
+        Err(e) => {
+            tracing::warn!("base-push check {repo}: repo info: {e}");
+            return;
+        }
+    };
+    if pushed != default_branch {
+        return;
+    }
+    let Ok(prs) = gh.open_prs(repo).await else {
+        tracing::warn!("base-push check {repo}: cannot list open PRs");
+        return;
+    };
+    // GitHub needs a beat to recompute `mergeable` after the base moved.
+    tokio::time::sleep(std::time::Duration::from_secs(cfg.rebase_check_delay_secs)).await;
+    let mut n = 0usize;
+    for pr in &prs {
+        let Some(number) = pr.get("number").and_then(|num| num.as_i64()) else {
+            continue;
+        };
+        n += 1;
+        // One decision per PR; quieter than the sweep only because the
+        // trigger is precise, not because the outcome differs.
+        let status = check_pr(gh, cfg, repo, number).await;
+        if matches!(status, CheckOutcome::Flagged | CheckOutcome::Error(_)) {
+            tracing::info!("base-push check {repo}#{number} ({pushed} pushed): {status}");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    tracing::info!("base-push check {repo}: {n} PRs re-checked after push to {pushed}");
+}
+
 /// Sweep every installation's repositories for conflicted PRs.
 /// App-level client lists installations; each repo gets an installation client.
 pub async fn sweep(cfg: &Config) -> String {
