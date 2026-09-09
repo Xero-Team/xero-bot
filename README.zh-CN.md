@@ -104,7 +104,8 @@ Xero-Team 的组织级 GitHub App 机器人。Rust 实现,单二进制,自托管
   ```
 - **GitHub App 设置**:权限增加 **Contents: 读写**(队列要创建/重置/删除 staging 分支、
   创建推进 PR),订阅事件增加 **Pull request review**(网页 Approve 要能到达 bot)。
-  其余不变。
+  建议同时订阅 **Push** 事件:别人合 PR 使默认分支前进、把 open PR 弄脏时,bot 靠它
+  在几秒内发现并提醒,而不必等下一轮 sweep。其余不变。
 - **分支保护**:`staging` 不要加任何保护 —— bot 会反复 force-update 它。`main` 保持现有
   保护;推进 PR 自己就能满足 required checks(head 就是已测试树)。如果 main 还要求人工
   批准,write+ 用户批准推进 PR 即等于批准整批 —— bot 会说明并重试。
@@ -198,7 +199,7 @@ GitHub → Settings → Developer settings → GitHub Apps → **New GitHub App*
 |---|---|
 | Webhook URL | `https://<host>/webhook` |
 | Webhook secret | 任意随机字符串 — 必须与 `WEBHOOK_SECRET` 一致 |
-| 订阅事件 | **Issue comment** + **Pull request**(启用合并队列再加 **Pull request review**) |
+| 订阅事件 | **Issue comment** + **Pull request**(启用合并队列再加 **Pull request review**,建议再加 **Push** —— base 前进秒级提醒) |
 | 权限 | Contents: R(合并队列需 RW)· Pull requests: RW · Issues: RW · **Checks: R** · **Code scanning alerts: R** |
 
 然后:**生成私钥**(会下载 `.pem` 文件),记下数字 **App ID** 与 bot 的 @-名(填 `BOT_NAME`),并把 App 安装到目标组织/仓库。

@@ -82,7 +82,14 @@ async fn main() {
         tokio::spawn(async move {
             let interval =
                 std::time::Duration::from_secs(sweep_cfg.rebase_sweep_interval_secs.max(60));
-            // first run after one interval (fresh start; don't hammer on boot)
+            // Sweep right at boot: a deployment gap can hide base-branch moves
+            // (no webhook fires for "someone else's PR merged and dirtied an
+            // open PR"), and sleeping a full interval first turned that gap
+            // into hours of silent conflicts on every redeploy. The delay is
+            // only long enough for the installation clients to be ready; real
+            // base-move latency is covered by the push event, not this loop.
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            let _ = xero_bot::rebase::sweep(&sweep_cfg).await;
             loop {
                 tokio::time::sleep(interval).await;
                 let _ = xero_bot::rebase::sweep(&sweep_cfg).await;

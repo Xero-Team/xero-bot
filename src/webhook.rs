@@ -94,6 +94,15 @@ pub enum WebhookEvent {
         action: String,
         installation_id: i64,
     },
+    /// push to the default branch — base moved, open PRs may have become
+    /// conflicted even though they themselves were untouched. GitHub delivers
+    /// no pull_request webhook in that case, so this event is the only
+    /// sub-sweep-latency way to notice (and the sweep may be hours away).
+    RepoPush {
+        repo: String,
+        ref_name: String,
+        installation_id: i64,
+    },
     /// labeled event — codeql label trigger
     PrLabeled {
         repo: String,
@@ -197,6 +206,21 @@ pub fn classify(event_header: &str, payload: &Value) -> WebhookEvent {
                     installation_id,
                 },
                 _ => WebhookEvent::Ignored("bad pull_request payload".into()),
+            }
+        }
+        "push" => {
+            let Some(installation_id) = ji64(payload, &["installation", "id"]) else {
+                return WebhookEvent::Ignored("no installation".into());
+            };
+            let Some(repo) = jstr(payload, &["repository", "full_name"]) else {
+                return WebhookEvent::Ignored("no repo".into());
+            };
+            WebhookEvent::RepoPush {
+                repo: repo.to_string(),
+                // `ref` is a full ref ("refs/heads/main"); the branch check
+                // happens at dispatch, where the default branch is known.
+                ref_name: jstr_or(payload, &["ref"], "").to_string(),
+                installation_id,
             }
         }
         "pull_request_review" => {
