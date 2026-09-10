@@ -234,6 +234,8 @@ mod tests {
             merge_queue_ci_timeout_secs: 0,
             merge_queue_poll_interval_secs: 0,
             merge_queue_advance_method: String::new(),
+            idle_workflows_enabled: false,
+            idle_workflows_poll_interval_secs: 60,
             merge_queue_advance_merge_method: String::new(),
             merge_queue_cleanup_staging: false,
             merge_queue_advance_strict: false,
