@@ -12,6 +12,8 @@ use serde_json::{json, Value};
 
 use crate::config::Config;
 
+pub mod actions;
+
 pub struct Client {
     pub crab: Octocrab,
     /// bot login for filtering own reviews (e.g. "xero-review[bot]")

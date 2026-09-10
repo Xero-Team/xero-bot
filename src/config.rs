@@ -74,6 +74,10 @@ pub struct Config {
     pub rebase_sweep_enabled: bool,
     pub rebase_sweep_interval_secs: u64,
 
+    /// Discover opt-in .github/xero-bot.toml rules and persist scheduling state.
+    pub idle_workflows_enabled: bool,
+    pub idle_workflows_poll_interval_secs: u64,
+
     // Merge queue
     /// Master switch. Default **false**: the queue writes branches and merges
     /// PRs — behavior no deployment should gain silently. Everything the queue does
@@ -249,6 +253,9 @@ impl Config {
             rebase_sweep_enabled: bool_cfg("REBASE_SWEEP_ENABLED", true),
             rebase_sweep_interval_secs: int_cfg("REBASE_SWEEP_INTERVAL_SECS", 21_600),
 
+            idle_workflows_enabled: bool_cfg("IDLE_WORKFLOWS_ENABLED", false),
+            idle_workflows_poll_interval_secs: int_cfg("IDLE_WORKFLOWS_POLL_INTERVAL_SECS", 60),
+
             merge_queue_enabled: bool_cfg("MERGE_QUEUE_ENABLED", false),
             merge_queue_staging_branch: cfg("MERGE_QUEUE_STAGING_BRANCH", "staging"),
             merge_queue_max_batch: int_cfg("MERGE_QUEUE_MAX_BATCH", 8) as usize,
@@ -330,6 +337,9 @@ impl Config {
             if self.merge_queue_max_batch == 0 {
                 return Err("MERGE_QUEUE_MAX_BATCH must be at least 1".into());
             }
+        }
+        if self.idle_workflows_enabled && self.idle_workflows_poll_interval_secs < 15 {
+            return Err("IDLE_WORKFLOWS_POLL_INTERVAL_SECS must be at least 15".into());
         }
         Ok(())
     }

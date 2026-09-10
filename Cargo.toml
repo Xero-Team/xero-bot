@@ -29,6 +29,10 @@ thiserror = "2"
 http = "1"
 http-body-util = "0.1"
 bytes = "1"
+toml = "0.8"
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde_yaml = "0.9"
+chrono = "0.4"
 
 [dev-dependencies]
 wiremock = "0.6"
