@@ -123,6 +123,17 @@ bot 用中文还是英文回复(AI 审查的正文同样如此)由 PR 自身的 
 看不出来时(`bump deps`、`v2 -> v3`)退而参考触发评论,仍无法判断则回退英文。无需任何配置;
 只支持这两种语言 —— 以汉字书写的日文在这里与中文无法区分,会被当作中文回复。
 
+### 空闲 workflow 调度
+
+各仓库通过默认分支上的 `.github/xero-bot.toml` 显式启用,分别配置要等待结束的 CI
+和需要空闲触发、失败重试的 workflow。默认开发活动空闲 30 分钟后触发,失败间隔
+15 分钟重试,最多重试两次。普通评论和 review 不重置计时;相关 PR、合并队列 CI
+仍在排队或运行时继续等待。
+
+部署端设置 `IDLE_WORKFLOWS_ENABLED=true`,为 App 增加 **Actions: write**,并保留
+`XERO_DATA_DIR` 持久卷,用于保存 SQLite 调度状态。详见
+[配置与恢复说明](docs/idle-workflows-cn.md)和 [TOML 示例](examples/idle-workflows.toml)。
+
 ## AI 审查引擎
 
 `REVIEW_ENGINE` 选择:
@@ -276,4 +287,6 @@ src/
 └── main.rs            自托管 axum 服务器
 ```
 
-状态持久化:全部存 GitHub(标签 = 工作流状态,PR review = 上一轮审查记忆,staging merge commit 链 = 合并队列)——bot 本身无数据库、无外部存储。
+状态持久化:标签、PR 审查记忆和合并队列状态存于 GitHub。可选的空闲 workflow
+调度器额外在 `XERO_DATA_DIR` 下使用 SQLite 保存活动时间、触发记录和重试历史,
+无需外部数据库服务。

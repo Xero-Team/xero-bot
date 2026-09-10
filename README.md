@@ -139,6 +139,19 @@ triggering comment is consulted, and failing that the reply is English. There is
 configure, and no other languages are modelled — Japanese written in kanji is indistinguishable
 from Chinese here and will be answered in Chinese.
 
+### Idle workflow scheduling
+
+Opt repositories into idle-time Actions dispatch and failure recovery with
+`.github/xero-bot.toml` on their default branch. Configure the CI workflows to
+wait for separately from workflows to dispatch/retry. Defaults: 30 minutes of
+development inactivity, 15 minutes between attempts, and at most two retries.
+Comments and reviews do not reset the timer; PR and merge queue CI must finish.
+
+Set `IDLE_WORKFLOWS_ENABLED=true`, grant the App **Actions: write**, and retain
+`XERO_DATA_DIR` for local SQLite state. See the
+[configuration and recovery guide](docs/idle-workflows.md) and
+[TOML example](examples/idle-workflows.toml).
+
 ## AI review engine
 
 Selected via `REVIEW_ENGINE`:
@@ -299,4 +312,7 @@ src/
 └── main.rs            self-hosted axum server
 ```
 
-State persistence: everything lives in GitHub (labels = workflow state, PR reviews = previous-round review memory, the staging merge-commit chain = merge queue) — the bot itself has no database and no external storage.
+State persistence: labels, PR review history and merge queue state live in GitHub.
+The optional idle workflow scheduler also keeps activity timestamps, dispatch
+intent and retry history in SQLite under `XERO_DATA_DIR`; no external database
+service is required.

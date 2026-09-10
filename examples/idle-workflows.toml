@@ -1,0 +1,33 @@
+# Copy to .github/xero-bot.toml on your repository's DEFAULT branch.
+# Replace workflow filenames and the target branch before enabling.
+[idle_workflows]
+enabled = true
+idle_minutes = 30
+
+# CI to wait for. Omit monitors, or use workflows = [], to wait for all
+# Actions in this repository, including PR, push, staging and merge_group CI.
+[[idle_workflows.monitors]]
+workflows = ["ci.yml"]
+
+# Optional repositories sharing Actions capacity. The App must be installed
+# there too. This repository is always included in the monitoring scope.
+# [[idle_workflows.monitors]]
+# repository = "your-org/related-repository"
+# workflows = ["ci.yml"]
+
+# Workflows to dispatch during idle time and recover/retry automatically.
+# Add another [[idle_workflows.tasks]] for each workflow/branch pair.
+[[idle_workflows.tasks]]
+workflow = "publish-image.yml"
+branch = "main"
+retry_interval_minutes = 15
+max_retries = 2 # Two retries after the first attempt: three attempts total.
+
+# Only include schedule/push if they process run.head_sha with equivalent
+# inputs. A nightly job selecting yesterday's commit does not.
+run_events = ["workflow_dispatch"]
+
+# Inputs must exist in the workflow's workflow_dispatch definition.
+# [idle_workflows.tasks.inputs]
+# channel = "nightly"
+# publish = true

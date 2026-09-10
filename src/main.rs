@@ -9,6 +9,7 @@
 //! Background work runs on tokio::spawn (no time limit).
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
@@ -24,6 +25,7 @@ use xero_bot::webhook::verify_signature;
 #[derive(Clone)]
 struct AppState {
     cfg: Config,
+    idle_workflows: Option<Arc<xero_bot::idle_workflows::Scheduler>>,
 }
 
 #[tokio::main]
@@ -43,6 +45,23 @@ async fn main() {
         eprintln!("ERROR: {e}");
         std::process::exit(2);
     }
+
+    let idle_workflows = if cfg.idle_workflows_enabled {
+        match xero_bot::idle_workflows::Scheduler::open(
+            std::path::Path::new(&cfg.data_dir),
+            cfg.idle_workflows_poll_interval_secs,
+        ) {
+            Ok(scheduler) => Some(Arc::new(scheduler)),
+            Err(e) => {
+                eprintln!(
+                    "ERROR: cannot open idle workflow state (another instance may own it): {e}"
+                );
+                std::process::exit(2);
+            }
+        }
+    } else {
+        None
+    };
 
     // We bind 0.0.0.0, so an unauthenticated /cron is reachable from anywhere
     // the port is. The sweep walks every installation and can post reminder
@@ -120,9 +139,25 @@ async fn main() {
         });
     }
 
+    if let Some(scheduler) = idle_workflows.as_ref().map(Arc::clone) {
+        let scheduler_cfg = cfg.clone();
+        tokio::spawn(async move {
+            let interval =
+                std::time::Duration::from_secs(scheduler_cfg.idle_workflows_poll_interval_secs);
+            loop {
+                let summary = scheduler.pump_all(&scheduler_cfg).await;
+                tracing::debug!("{summary}");
+                tokio::time::sleep(interval).await;
+            }
+        });
+    }
+
     let port = cfg.port;
     let bot_name = cfg.bot_name.clone();
-    let state = AppState { cfg };
+    let state = AppState {
+        cfg,
+        idle_workflows,
+    };
 
     let app = Router::new()
         .route("/", get(health))
@@ -183,6 +218,19 @@ async fn webhook(
         Err(_) => return (StatusCode::BAD_REQUEST, Json(json!({"error": "bad json"}))),
     };
 
+    if let Some(scheduler) = &state.idle_workflows {
+        let delivery = headers
+            .get("x-github-delivery")
+            .and_then(|v| v.to_str().ok());
+        if let Err(error) = scheduler.observe_webhook(&event_header, &payload, delivery) {
+            tracing::error!("idle workflow activity could not be persisted: {error}");
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "activity persistence unavailable"})),
+            );
+        }
+    }
+
     match route_event(&state.cfg, &event_header, &payload) {
         Routing::Respond(body) => (StatusCode::OK, Json(body)),
         Routing::Act(work) => {
@@ -221,8 +269,14 @@ async fn cron_sweep(
     } else {
         "merge queue disabled".to_string()
     };
+    let idle_workflows_summary = match &state.idle_workflows {
+        Some(scheduler) => scheduler.pump_all(&state.cfg).await,
+        None => "idle workflows disabled".into(),
+    };
     (
         StatusCode::OK,
-        Json(json!({"ok": true, "summary": summary, "merge_queue": merge_queue_summary})),
+        Json(
+            json!({"ok": true, "summary": summary, "merge_queue": merge_queue_summary, "idle_workflows": idle_workflows_summary}),
+        ),
     )
 }
