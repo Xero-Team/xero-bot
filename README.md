@@ -11,6 +11,9 @@ Features:
 - **CodeQL quality reports** — reads the repo's existing code scanning alerts and maps them to files changed in the PR
 - **Bilingual replies** — answers in English or Chinese, chosen from the PR's own commit messages; no configuration
 
+Repository TOML loading, disabled-command vetoes and configuration failure handling are available independently of the idle scheduler. See the [configuration contract and current delivery scope](docs/repository-config.md); full mention-mode/session routing follows in #12–#14.
+
+
 ## Command reference
 
 Issued in comments (case-insensitive; one comment may contain several commands; content inside code blocks is ignored).

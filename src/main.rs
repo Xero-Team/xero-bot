@@ -218,6 +218,9 @@ async fn webhook(
         Err(_) => return (StatusCode::BAD_REQUEST, Json(json!({"error": "bad json"}))),
     };
 
+    xero_bot::config::cache::RepositoryConfigCache::shared()
+        .observe_webhook(&event_header, &payload);
+
     if let Some(scheduler) = &state.idle_workflows {
         let delivery = headers
             .get("x-github-delivery")

@@ -94,27 +94,7 @@ impl Command {
     /// than at the dispatch site keeps the list next to the enum it describes,
     /// so a new command has to answer the question to compile.
     pub fn requires_pr(&self) -> bool {
-        match self {
-            // reads the diff
-            Command::Review => true,
-            // maps code-scanning alerts onto the PR's changed files
-            Command::Codeql => true,
-            // submit / dismiss a pull request review
-            Command::Approve { .. } | Command::Reject => true,
-            Command::Ping
-            | Command::Help
-            | Command::RequestReview { .. }
-            | Command::Cc { .. }
-            | Command::Ready
-            | Command::Author
-            | Command::Blocked
-            | Command::Label { .. }
-            | Command::Assign { .. }
-            | Command::Claim
-            | Command::Unclaim
-            // repo-level state; asking from an issue is meaningful
-            | Command::Queue => false,
-        }
+        self.id().requires_pr()
     }
 }
 

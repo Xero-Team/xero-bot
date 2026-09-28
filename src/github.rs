@@ -13,6 +13,7 @@ use serde_json::{json, Value};
 use crate::config::Config;
 
 pub mod actions;
+pub mod repository_config;
 
 pub struct Client {
     pub crab: Octocrab,

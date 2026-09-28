@@ -3,13 +3,7 @@ use std::collections::{BTreeMap, HashSet};
 use serde::Deserialize;
 use serde_json::Value;
 
-pub const CONFIG_PATH: &str = ".github/xero-bot.toml";
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RepositoryConfig {
-    idle_workflows: Option<Rules>,
-}
+pub use crate::config::repository::CONFIG_PATH;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -92,10 +86,14 @@ pub fn repository_name(value: &str) -> Result<String, String> {
 }
 
 pub fn parse(text: &str, repository: &str) -> Result<Option<Rules>, String> {
-    let root: RepositoryConfig = toml::from_str(text)
-        // Do not log source snippets: workflow inputs can contain private data.
-        .map_err(|e: toml::de::Error| format!("{CONFIG_PATH}: {}", e.message()))?;
-    let Some(mut rules) = root.idle_workflows.filter(|r| r.enabled) else {
+    crate::config::repository::RepositoryConfig::parse(text, repository)
+        .map_err(|e| e.to_string())?
+        .idle
+        .map_err(|e| e.to_string())
+}
+
+pub(crate) fn validate(rules: Option<Rules>, repository: &str) -> Result<Option<Rules>, String> {
+    let Some(mut rules) = rules.filter(|r| r.enabled) else {
         return Ok(None);
     };
     if !(1..=43_200).contains(&rules.idle_minutes) {

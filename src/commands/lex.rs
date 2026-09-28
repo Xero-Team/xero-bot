@@ -29,6 +29,8 @@ pub enum Tok {
     ReviewReq,
     /// `r+`
     Approve,
+    /// `r= @user` — target is mandatory; never falls back to ordinary approval.
+    ApproveAs,
     /// `r-`
     Reject,
     /// `?r`
@@ -220,6 +222,7 @@ impl<'a> Lexer<'a> {
                 let tok = match sigil {
                     '?' => Some(Tok::ReviewReq),
                     '+' => Some(Tok::Approve),
+                    '=' => Some(Tok::ApproveAs),
                     '-' => Some(Tok::Reject),
                     _ => None,
                 };
