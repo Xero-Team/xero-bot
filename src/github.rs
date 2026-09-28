@@ -17,7 +17,7 @@ pub mod repository_config;
 
 pub struct Client {
     pub crab: Octocrab,
-    /// bot login for filtering own reviews (e.g. "xero-review[bot]")
+    /// bot login for filtering own reviews (e.g. `xero-review[bot]`)
     pub app_slug: String,
 }
 
@@ -81,7 +81,7 @@ fn enc_path(s: &str) -> String {
 /// `Page<Value>` deserializes both a bare JSON array and GitHub's wrapped
 /// shapes (`{"repositories": [...]}`, `{"installations": [...]}`), so one
 /// helper covers every paginated endpoint here. Errors go through
-/// [`classify_octo_error`], which the hand-rolled `crab.get` calls this
+/// `classify_octo_error`, which the hand-rolled `crab.get` calls this
 /// replaces did not — so their 403/404 arrived as `GhError::Http` and every
 /// `Api { status }` branch downstream quietly failed to match.
 ///
@@ -927,7 +927,7 @@ impl Client {
     /// A 403 is a normal answer here, not a malfunction: the App may not have
     /// been granted `Checks: read`, and every caller must treat the CI state
     /// as *unknown* rather than as "all green" when this fails. That asymmetry
-    /// is the whole point of the return type — see [`CiState`].
+    /// is the whole point of the return type — see [`crate::review::CiState`].
     pub async fn check_runs(&self, repo: &str, sha: &str) -> Result<Vec<Value>, GhError> {
         let v = self
             .get(&format!(

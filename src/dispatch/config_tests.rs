@@ -16,6 +16,7 @@ const REPO: &str = "example/project";
 #[derive(Default)]
 struct TestClock(AtomicU64);
 impl Clock for TestClock {
+    /// Expose the controlled clock used to test diagnostic suppression without wall-clock waits.
     fn now(&self) -> u64 {
         self.0.load(Ordering::SeqCst)
     }
@@ -28,6 +29,7 @@ struct Fixture {
     clock: Arc<TestClock>,
 }
 impl Fixture {
+    /// Build mock production ingress with idle disabled and no live GitHub credentials.
     async fn new(text: &str) -> Self {
         let server = MockServer::start().await;
         let gh = Client {
@@ -76,6 +78,7 @@ impl Fixture {
             clock,
         }
     }
+    /// Route a human comment carrying the fixture's target repository and installation identity.
     fn route(&self, text: &str, number: i64) -> Routing {
         route_event(
             &self.cfg,
@@ -87,6 +90,7 @@ impl Fixture {
             }),
         )
     }
+    /// Execute routed comment work through the production configuration gate using mocks.
     async fn comment(&self, text: &str, number: i64) {
         let Routing::Act(work) = self.route(text, number) else {
             panic!("did not route {text}");
@@ -95,6 +99,7 @@ impl Fixture {
             .await
             .unwrap();
     }
+    /// Reject session/permission reads and business writes, allowing only config reads and diagnoses.
     async fn assert_only_config_and_diagnostics(&self) -> usize {
         let requests = self.server.received_requests().await.unwrap();
         let mut posts = 0;
@@ -126,6 +131,7 @@ impl Fixture {
     }
 }
 
+/// Every supported disabled spelling and compound must stop before session lookup or action APIs.
 #[tokio::test]
 async fn disabled_all_aliases_and_compounds_never_query_sessions_or_call_actions() {
     let settings = CommandId::ALL
@@ -164,6 +170,8 @@ async fn disabled_all_aliases_and_compounds_never_query_sessions_or_call_actions
         "@bot take; review; cc @bob",
         "@bot r+ as @bob",
         "@bot r+ @bob",
+        "@bot r= @bob.",
+        "@bot r= @bob。",
     ] {
         f.comment(text, number).await;
         number += 1;
@@ -175,6 +183,7 @@ async fn disabled_all_aliases_and_compounds_never_query_sessions_or_call_actions
     assert!(!f.cfg.idle_workflows_enabled);
 }
 
+/// Existing history cannot bypass disabled or justify querying the session endpoint.
 #[tokio::test]
 async fn disabled_bare_command_cannot_use_even_an_existing_session() {
     let f = Fixture::new("[command_triggers]\nreview={mode='disabled'}").await;
@@ -191,6 +200,7 @@ async fn disabled_bare_command_cannot_use_even_an_existing_session() {
     assert_eq!(f.assert_only_config_and_diagnostics().await, 1);
 }
 
+/// A currently disabled historical command cannot qualify as a legacy session opener.
 #[tokio::test]
 async fn disabled_history_does_not_open_a_legacy_session_for_another_command() {
     let f = Fixture::new("[command_triggers]\nhelp={mode='disabled'}").await;
@@ -219,6 +229,7 @@ async fn disabled_history_does_not_open_a_legacy_session_for_another_command() {
         .unwrap());
 }
 
+/// Configuration failures permit bounded status replies while suppressing every bundled command.
 #[tokio::test]
 async fn fault_help_ping_and_mixed_commands_only_receive_status_and_obey_budget() {
     let f = Fixture::new("").await;
@@ -239,6 +250,7 @@ async fn fault_help_ping_and_mixed_commands_only_receive_status_and_obey_budget(
     assert_eq!(f.assert_only_config_and_diagnostics().await, 3);
 }
 
+/// A comment-domain error must block execution even when other configuration domains remain valid.
 #[tokio::test]
 async fn invalid_comment_domain_blocks_even_when_other_domains_are_valid() {
     let f =
@@ -247,6 +259,7 @@ async fn invalid_comment_domain_blocks_even_when_other_domains_are_valid() {
     assert_eq!(f.assert_only_config_and_diagnostics().await, 1);
 }
 
+/// Non-command content must stay silent and cause no configuration HTTP reads.
 #[tokio::test]
 async fn ordinary_chat_code_and_quotes_never_load_config() {
     let f = Fixture::new("").await;
@@ -263,6 +276,7 @@ async fn ordinary_chat_code_and_quotes_never_load_config() {
     assert!(f.server.received_requests().await.unwrap().is_empty());
 }
 
+/// The existing CodeQL label trigger must honor the same disabled veto without posting per-event replies.
 #[tokio::test]
 async fn disabled_codeql_label_event_cannot_bypass_configuration() {
     let f = Fixture::new("[command_triggers]\ncodeql={mode='disabled'}").await;
@@ -284,6 +298,7 @@ async fn disabled_codeql_label_event_cannot_bypass_configuration() {
     assert_eq!(f.assert_only_config_and_diagnostics().await, 0);
 }
 
+/// Help must expose unsupported automatic rules while valid comment commands remain usable.
 #[tokio::test]
 async fn unsupported_event_rules_are_reported_by_help_without_disabling_comments() {
     let f = Fixture::new(

@@ -16,10 +16,12 @@ use crate::github::{enc_seg, Client};
 
 pub const TTL_SECS: u64 = 60;
 pub trait Clock: Send + Sync {
+    /// Return monotonically increasing seconds for snapshot age and retry deadlines.
     fn now(&self) -> u64;
 }
 struct MonotonicClock(Instant);
 impl Clock for MonotonicClock {
+    /// Measure elapsed process time so wall-clock adjustments cannot revive old policy.
     fn now(&self) -> u64 {
         self.0.elapsed().as_secs()
     }
@@ -53,6 +55,7 @@ pub enum ConfigState {
     },
 }
 impl ConfigState {
+    /// Expose executable policy only for Ready; stale references never pass this accessor.
     pub fn snapshot(&self) -> Result<&Snapshot, &Problem> {
         match self {
             Self::Ready(s) => Ok(s),
@@ -102,11 +105,13 @@ pub struct RepositoryConfigCache {
     diagnostics: Mutex<HashMap<(RepositoryKey, i64, ReasonCode), u64>>,
 }
 impl Default for RepositoryConfigCache {
+    /// Create an isolated cache using a monotonic clock and no persisted snapshots.
     fn default() -> Self {
         Self::with_clock(Arc::new(MonotonicClock(Instant::now())))
     }
 }
 impl RepositoryConfigCache {
+    /// Create an isolated cache with an injectable monotonic clock for deterministic tests.
     pub fn with_clock(clock: Arc<dyn Clock>) -> Self {
         Self {
             entries: Mutex::new(HashMap::new()),
@@ -114,6 +119,7 @@ impl RepositoryConfigCache {
             diagnostics: Mutex::new(HashMap::new()),
         }
     }
+    /// Return the process-wide cache shared by comments, CodeQL, webhooks and idle scheduling.
     pub fn shared() -> Arc<Self> {
         static CACHE: OnceLock<Arc<RepositoryConfigCache>> = OnceLock::new();
         Arc::clone(CACHE.get_or_init(|| Arc::new(Self::default())))
@@ -130,14 +136,18 @@ impl RepositoryConfigCache {
         sent.insert((key, issue, reason), now);
         true
     }
+    /// Obtain one repository's refresh lock without holding the registry lock during I/O.
     fn entry(&self, key: RepositoryKey) -> Arc<Entry> {
         Arc::clone(self.entries.lock().unwrap().entry(key).or_default())
     }
+    /// Fence existing and in-flight snapshots without clearing a GitHub retry deadline.
+    /// No entry is allocated when the repository has never requested configuration.
     pub fn invalidate(&self, key: RepositoryKey) {
         if let Some(entry) = self.entries.lock().unwrap().get(&key) {
             entry.generation.fetch_add(1, Ordering::SeqCst);
         }
     }
+    /// Invalidate a known repository when a verified observation changes its default branch.
     pub fn observe_default_branch(&self, key: RepositoryKey, branch: &str) {
         if let Some(entry) = self.entries.lock().unwrap().get(&key) {
             let mut known = entry.branch.lock().unwrap();
@@ -175,6 +185,9 @@ impl RepositoryConfigCache {
         }
     }
 
+    /// Return a fresh snapshot or a typed failure, coalescing concurrent repository refreshes.
+    /// Expired or invalidated snapshots remain diagnostic references only. Failed refreshes
+    /// respect their retry deadline, even if a new invalidation arrives during the request.
     pub async fn load(&self, gh: &Client, key: RepositoryKey, repository: &str) -> ConfigState {
         let entry = self.entry(key);
         // All waiters re-check validity/backoff after taking the per-repo lock.
@@ -242,6 +255,7 @@ impl RepositoryConfigCache {
     }
 }
 
+/// Read a required nonempty identity field without including response content in errors.
 fn required<'a>(v: &'a Value, key: &str) -> Result<&'a str, FetchError> {
     v[key].as_str().filter(|s| !s.is_empty()).ok_or_else(|| {
         FetchError::new(
@@ -251,6 +265,9 @@ fn required<'a>(v: &'a Value, key: &str) -> Result<&'a str, FetchError> {
     })
 }
 
+/// Resolve target metadata and the default ref before reading config at an immutable commit.
+/// Only a file-path 404 after both reads produces defaults. A 304 may reuse only the
+/// same installation/repository, branch, commit and previously cached representation.
 async fn fetch(
     gh: &Client,
     key: RepositoryKey,

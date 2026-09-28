@@ -19,7 +19,9 @@ The contract's mention defaults are not a claim that the #14 routing migration h
 
 An explicit `@bot r= @user` normalizes to an on-behalf approval, with the same
 execution permissions and deployment switch as `r+ as @user`. Its target is mandatory;
-missing, invalid or extra parameters never degrade to a plain approval. Bare `r=`
+missing, invalid or extra parameters never degrade to a plain approval. Sentence
+punctuation after the target (for example `@bot r= @alice。`) is accepted, while
+prose and additional usernames remain invalid. Bare `r=`
 and the broader approval grammar/source migration remain part of #12.
 
 ## Configuration and validation

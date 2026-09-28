@@ -348,6 +348,9 @@ async fn session_open(
     Ok(false)
 }
 
+/// Apply configuration failure/disabled vetoes before the existing comment execution chain.
+/// The injected client/cache let acceptance tests prove rejected commands perform no
+/// session lookup or business action; full mention/session routing remains issue #14.
 async fn execute_comment_with_client(
     gh: &Client,
     cfg: &Config,
@@ -507,6 +510,8 @@ commands like yours work without the mention."
     Ok(())
 }
 
+/// Always log a refusal and reserve the local diagnostic budget before posting its message.
+/// A failed or uncertain comment write is not retried by this in-memory adapter.
 async fn report_config_problem(
     gh: &Client,
     cache: &RepositoryConfigCache,
@@ -528,6 +533,8 @@ async fn report_config_problem(
     }
 }
 
+/// Gate the existing label-triggered CodeQL report using the same disabled/config veto.
+/// Automatic failures propagate to logging instead of posting a diagnostic per event.
 async fn execute_codeql_with_client(
     gh: &Client,
     cfg: &Config,

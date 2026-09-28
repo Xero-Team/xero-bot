@@ -234,6 +234,7 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Parse one verb in a bot mention's scope, keeping malformed approvals non-executable.
     fn verb_tail(&mut self, addressed: bool) {
         // Leading punctuation after the mention is not an error: `@bot, ping`
         // and `@bot: ping` are what people actually type. Prose is skipped too —
@@ -264,6 +265,11 @@ impl<'a> Parser<'a> {
                 match self.peek().cloned() {
                     Some(Tok::User(user)) => {
                         self.pos += 1;
+                        // Sentence punctuation is harmless; prose and extra
+                        // arguments must still invalidate the whole approval.
+                        while matches!(self.peek(), Some(Tok::Punct)) {
+                            self.pos += 1;
+                        }
                         if self.at_boundary() {
                             self.emit(
                                 Command::Approve {

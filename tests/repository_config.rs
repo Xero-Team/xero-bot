@@ -2,10 +2,12 @@ use xero_bot::commands::parse_commands;
 use xero_bot::config::repository::*;
 
 const REPO: &str = "example/project";
+/// Parse one test document and require structural validity before inspecting its domains.
 fn parse(text: &str) -> RepositoryConfig {
     RepositoryConfig::parse(text, REPO).unwrap()
 }
 
+/// Missing sections and legacy idle-only documents must retain every documented default.
 #[test]
 fn defaults_empty_partial_and_idle_only() {
     for text in [
@@ -37,6 +39,7 @@ fn defaults_empty_partial_and_idle_only() {
     assert_eq!(c.mode(CommandId::Help), ManualMode::MentionOnce);
 }
 
+/// Neither spelling, mention evidence, session state nor PR applicability may bypass disabled.
 #[test]
 fn every_alias_shares_its_canonical_disabled_policy_at_all_entrances() {
     for id in CommandId::ALL {
@@ -66,6 +69,7 @@ fn every_alias_shares_its_canonical_disabled_policy_at_all_entrances() {
     }
 }
 
+/// The parser and policy registry must identify the same command and preserve approval targets.
 #[test]
 fn parser_and_config_agree_on_all_aliases_including_r_equals() {
     for id in CommandId::ALL {
@@ -96,6 +100,7 @@ fn parser_and_config_agree_on_all_aliases_including_r_equals() {
     }
 }
 
+/// Ambiguous overrides, unknown commands and invalid modes/TTLs must disable only comments.
 #[test]
 fn alias_collisions_unknown_names_and_auto_are_domain_errors() {
     for text in [
@@ -123,6 +128,7 @@ fn alias_collisions_unknown_names_and_auto_are_domain_errors() {
     }
 }
 
+/// Structural mistakes must never produce a usable partial document or default policy.
 #[test]
 fn syntax_types_unknown_fields_and_duplicates_reject_the_document() {
     for text in [
@@ -146,6 +152,7 @@ fn syntax_types_unknown_fields_and_duplicates_reject_the_document() {
     }
 }
 
+/// Idle semantic failures stay local while the legacy parsing entry point retains validation.
 #[test]
 fn idle_semantics_are_isolated_but_legacy_validation_stays_strict() {
     let cfg = parse("[idle_workflows]\nenabled=true\nidle_minutes=0");
@@ -162,6 +169,7 @@ fn idle_semantics_are_isolated_but_legacy_validation_stays_strict() {
     .is_none());
 }
 
+/// Automatic subscriptions must honor disabled policies and the explicit action whitelist.
 #[test]
 fn event_rules_never_enable_unsupported_or_unsafe_actions() {
     for (command, event, extra, reason) in [
@@ -203,6 +211,7 @@ fn event_rules_never_enable_unsupported_or_unsafe_actions() {
     );
 }
 
+/// One invalid rule stays isolated; duplicate IDs make the entire owning domain unavailable.
 #[test]
 fn rule_failures_stay_per_rule_and_duplicate_ids_disable_only_the_domain() {
     let rule = "[[event_triggers]]\nid='one'\nevent='pull_request.opened'\ncommand='review'\n";
@@ -226,6 +235,7 @@ fn rule_failures_stay_per_rule_and_duplicate_ids_disable_only_the_domain() {
     assert!(cfg.idle.is_ok());
 }
 
+/// Path actions remain independent of comment modes, with shared event and CC-budget limits.
 #[test]
 fn paths_have_independent_static_actions_and_shared_domain_limits() {
     let rule = "[[path_triggers.rules]]\nid='rust'\ninclude=['src/**/*.rs']\nexclude=['src/generated/**']\nlabels=['rust']\ncc=['alice']\n";
@@ -271,6 +281,7 @@ fn paths_have_independent_static_actions_and_shared_domain_limits() {
     );
 }
 
+/// The pure gate must order disabled, applicability and mention checks before caller permissions.
 #[test]
 fn gates_preserve_priority_and_never_grant_execution_authority() {
     let c = Comments::default();
@@ -297,6 +308,7 @@ fn gates_preserve_priority_and_never_grant_execution_authority() {
     assert!(c.gate(CommandId::Approve, true, true, false).is_ok());
 }
 
+/// Malformed approval targets and extra arguments must not emit any executable approval.
 #[test]
 fn r_equals_never_falls_back_to_plain_approval_with_a_bad_target() {
     for text in [
@@ -305,6 +317,13 @@ fn r_equals_never_falls_back_to_plain_approval_with_a_bad_target() {
         "@bot r= @-bad",
         "@bot r= @alice extra",
         "@bot r= @alice @bob",
+        "@bot r= @alice. extra",
+        "@bot r= @alice。请审查",
+        "@bot r= @alice . ! 多余参数",
+        "@bot r= @alice. @bob",
+        "@bot r= @alice。@bob",
+        "@bot r= @alice. @-bad",
+        "@bot r= @alice。 +label",
         "@bot r= please @alice",
         "r= @alice",
     ] {
@@ -312,6 +331,36 @@ fn r_equals_never_falls_back_to_plain_approval_with_a_bad_target() {
         assert!(
             xero_bot::commands::bare_command_candidate(text).is_none(),
             "{text}"
+        );
+    }
+}
+
+/// Sentence punctuation must not invalidate a target or consume a later command.
+#[test]
+fn r_equals_accepts_trailing_punctuation_and_preserves_command_boundaries() {
+    use xero_bot::commands::Command;
+    for (text, has_ping) in [
+        ("@bot r= @alice.", false),
+        ("@bot r= @alice。", false),
+        ("@bot r= @alice!", false),
+        ("@bot r= @alice，！", false),
+        ("@bot r= @alice . ! 。", false),
+        ("@bot r= @alice.; ping", true),
+        ("@bot r= @alice。\n@bot ping", true),
+        ("@bot r= @alice! @bot ping", true),
+    ] {
+        let output = parse_commands("bot", text);
+        let mut expected = vec![Command::Approve {
+            on_behalf_of: Some("alice".into()),
+        }];
+        if has_ping {
+            expected.push(Command::Ping);
+        }
+        assert_eq!(output.commands, expected, "{text}");
+        assert!(
+            output.diagnostics.is_empty(),
+            "{text}: {:?}",
+            output.diagnostics
         );
     }
 }

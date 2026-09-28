@@ -85,6 +85,7 @@ pub fn repository_name(value: &str) -> Result<String, String> {
     Ok(value.to_ascii_lowercase())
 }
 
+/// Extract the idle domain from the shared document, retaining strict structural validation.
 pub fn parse(text: &str, repository: &str) -> Result<Option<Rules>, String> {
     crate::config::repository::RepositoryConfig::parse(text, repository)
         .map_err(|e| e.to_string())?
@@ -92,6 +93,7 @@ pub fn parse(text: &str, repository: &str) -> Result<Option<Rules>, String> {
         .map_err(|e| e.to_string())
 }
 
+/// Validate and normalize enabled idle rules while preserving the existing disabled behavior.
 pub(crate) fn validate(rules: Option<Rules>, repository: &str) -> Result<Option<Rules>, String> {
     let Some(mut rules) = rules.filter(|r| r.enabled) else {
         return Ok(None);

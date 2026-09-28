@@ -74,10 +74,13 @@ impl CommandId {
         Self::Queue,
     ];
 
+    /// Return the canonical TOML key used for diagnostics and policy lookup.
     pub fn name(self) -> &'static str {
         self.aliases()[0]
     }
 
+    /// List every accepted spelling, with the canonical ID first.
+    /// All spellings share one policy entry; arguments are not part of an alias.
     pub fn aliases(self) -> &'static [&'static str] {
         match self {
             Self::Claim => &["claim", "take"],
@@ -99,12 +102,16 @@ impl CommandId {
         }
     }
 
+    /// Resolve an exact TOML command key; reject unknown spellings rather than defaulting.
+    /// The comment lexer performs its own case normalization before calling this lookup.
     pub fn from_name(name: &str) -> Option<Self> {
         Self::ALL
             .into_iter()
             .find(|id| id.aliases().contains(&name))
     }
 
+    /// Return the built-in manual trigger contract; no command defaults to disabled.
+    /// Runtime mention/session routing is connected separately by issue #14.
     pub fn default_mode(self) -> ManualMode {
         match self {
             Self::Claim | Self::Unclaim | Self::Cc | Self::RequestReview | Self::Ready => {
@@ -115,6 +122,7 @@ impl CommandId {
         }
     }
 
+    /// Identify commands whose execution requires a PR diff or review endpoint.
     pub fn requires_pr(self) -> bool {
         matches!(
             self,
@@ -124,6 +132,7 @@ impl CommandId {
 }
 
 impl Command {
+    /// Map a parsed command and its arguments to the canonical policy identity.
     pub fn id(&self) -> CommandId {
         match self {
             Self::Claim => CommandId::Claim,
@@ -187,15 +196,18 @@ pub struct Problem {
     pub detail: &'static str,
 }
 impl Problem {
+    /// Build a diagnostic from a stable reason code and source-free static explanation.
     pub fn new(code: ReasonCode, detail: &'static str) -> Self {
         Self { code, detail }
     }
+    /// Render a short localized refusal without including repository configuration values.
     pub fn message(&self, lang: crate::lang::Lang) -> String {
         match lang {
             crate::lang::Lang::En => format!("Repository configuration blocked this action ({:?}): {}. Check `{CONFIG_PATH}` on the default branch.", self.code, self.detail),
             crate::lang::Lang::Zh => format!("仓库配置阻止了此操作（{:?}）：{}。请检查默认分支上的 `{CONFIG_PATH}`。", self.code, self.zh_detail()),
         }
     }
+    /// Translate reason categories without exposing the underlying TOML or HTTP body.
     fn zh_detail(&self) -> &'static str {
         match self.code {
             ReasonCode::Disabled => "该指令及其别名已禁用",
@@ -222,6 +234,7 @@ pub struct Comments {
     pub ttl_days: u16,
 }
 impl Default for Comments {
+    /// Merge all sixteen built-in modes with the 30-day session TTL contract.
     fn default() -> Self {
         Self {
             modes: CommandId::ALL
@@ -233,6 +246,7 @@ impl Default for Comments {
     }
 }
 impl Comments {
+    /// Return the merged mode for a canonical command, including an explicit disabled mode.
     pub fn mode(&self, id: CommandId) -> ManualMode {
         self.modes[&id]
     }
@@ -249,6 +263,9 @@ impl Comments {
         }
     }
 
+    /// Check disabled, PR applicability, then the manual mention/session requirement.
+    /// The caller supplies mention and session evidence and must still check repository
+    /// permissions before execution; this pure contract does not create or renew sessions.
     pub fn gate(&self, id: CommandId, is_pr: bool, explicit: bool, session: bool) -> Domain<()> {
         let mode = self.enabled(id)?;
         if id.requires_pr() && !is_pr {
@@ -278,6 +295,7 @@ pub enum Event {
     IssueOpened,
 }
 impl Event {
+    /// Recognize supported event names without guessing a default for unknown events.
     fn parse(s: &str) -> Option<Self> {
         match s {
             "pull_request.opened" => Some(Self::PullRequestOpened),
@@ -346,6 +364,7 @@ struct Sessions {
     ttl_days: i64,
 }
 impl Default for Sessions {
+    /// Use the contract TTL when command_sessions is omitted or empty.
     fn default() -> Self {
         Self { ttl_days: 30 }
     }
@@ -367,6 +386,7 @@ struct RawPaths {
     rules: Vec<RawPathRule>,
 }
 impl Default for RawPaths {
+    /// Subscribe future path rules to PR opened/synchronize with a ten-user ceiling; rules remain empty.
     fn default() -> Self {
         Self {
             events: vec![
@@ -413,6 +433,9 @@ impl RepositoryConfig {
         problems
     }
 
+    /// Deserialize strict TOML, then validate independent semantic domains.
+    /// Syntax/shape errors reject the document; domain and rule errors remain inspectable
+    /// through `problems()` and never receive fallback defaults.
     pub fn parse(text: &str, repository: &str) -> Domain<Self> {
         let doc: Document = toml::from_str(text).map_err(|_| {
             Problem::new(
@@ -434,6 +457,8 @@ impl RepositoryConfig {
     }
 }
 
+/// Merge manual overrides only after checking TTL, command names and alias uniqueness.
+/// A semantic failure makes the entire comment domain unavailable.
 fn comments(triggers: BTreeMap<String, Trigger>, sessions: Sessions) -> Domain<Comments> {
     let bad = || {
         Problem::new(
@@ -466,6 +491,7 @@ fn comments(triggers: BTreeMap<String, Trigger>, sessions: Sessions) -> Domain<C
     Ok(comments)
 }
 
+/// Reject duplicate IDs before individual rule validation to avoid ambiguous ownership.
 fn unique_ids<'a>(ids: impl Iterator<Item = &'a str>) -> Domain<()> {
     let mut seen = HashSet::new();
     for id in ids {
@@ -478,6 +504,7 @@ fn unique_ids<'a>(ids: impl Iterator<Item = &'a str>) -> Domain<()> {
     }
     Ok(())
 }
+/// Validate IDs at domain scope and preserve each event rule's independent result.
 fn events(raw: Vec<RawEventRule>, comments: &Domain<Comments>) -> Domain<Vec<Rule<EventRule>>> {
     unique_ids(raw.iter().map(|r| r.id.as_str()))?;
     Ok(raw
@@ -489,6 +516,8 @@ fn events(raw: Vec<RawEventRule>, comments: &Domain<Comments>) -> Domain<Vec<Rul
         })
         .collect())
 }
+/// Check the referenced command and automatic-action whitelist before returning Unsupported.
+/// A disabled command cannot be enabled through an automatic subscription.
 fn event_rule(r: RawEventRule, comments: &Domain<Comments>) -> Domain<EventRule> {
     let bad = || {
         Problem::new(
@@ -514,6 +543,8 @@ fn event_rule(r: RawEventRule, comments: &Domain<Comments>) -> Domain<EventRule>
         "automatic event actions are not implemented yet (#15)",
     ))
 }
+/// Validate shared path settings, then retain independent rule diagnostics.
+/// Static path actions do not inherit the similarly named comment command modes.
 fn paths(raw: RawPaths) -> Domain<Paths> {
     unique_ids(raw.rules.iter().map(|r| r.id.as_str()))?;
     let bad = || {

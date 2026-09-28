@@ -21,11 +21,13 @@ const KEY: RepositoryKey = RepositoryKey {
 #[derive(Default)]
 struct TestClock(AtomicU64);
 impl Clock for TestClock {
+    /// Read the test-controlled monotonic time without consulting the host clock.
     fn now(&self) -> u64 {
         self.0.load(Ordering::SeqCst)
     }
 }
 impl TestClock {
+    /// Move the test clock to an exact expiry or retry boundary without sleeping.
     fn set(&self, time: u64) {
         self.0.store(time, Ordering::SeqCst);
     }
@@ -33,18 +35,22 @@ impl TestClock {
 #[derive(Clone)]
 struct Mutable(Arc<Mutex<ResponseTemplate>>);
 impl Mutable {
+    /// Wrap an API response that tests can change between refresh attempts.
     fn new(response: ResponseTemplate) -> Self {
         Self(Arc::new(Mutex::new(response)))
     }
+    /// Change the next mock response while keeping the route and server identity fixed.
     fn set(&self, response: ResponseTemplate) {
         *self.0.lock().unwrap() = response;
     }
 }
 impl Respond for Mutable {
+    /// Serve the current template consistently to concurrent HTTP requests.
     fn respond(&self, _: &Request) -> ResponseTemplate {
         self.0.lock().unwrap().clone()
     }
 }
+/// Encode a regular-file Contents response with a stable blob SHA and ETag.
 fn file(text: &str) -> ResponseTemplate {
     ResponseTemplate::new(200)
         .insert_header("ETag", "\"blob\"")
@@ -63,6 +69,7 @@ struct Fixture {
     content: Mutable,
 }
 impl Fixture {
+    /// Build an isolated installation client, mutable API routes and deterministic cache clock.
     async fn new(text: &str) -> Self {
         let server = MockServer::start().await;
         let gh = Arc::new(Client {
@@ -109,17 +116,21 @@ impl Fixture {
             content,
         }
     }
+    /// Exercise the production snapshot loader for the fixture's installation/repository key.
     async fn load(&self) -> ConfigState {
         self.cache.load(&self.gh, KEY, REPO).await
     }
+    /// Count all observed requests so cache hits and retry suppression are externally verifiable.
     async fn count(&self) -> usize {
         self.server.received_requests().await.unwrap().len()
     }
 }
+/// Require a blocked state and extract its stable diagnostic category.
 fn reason(state: &ConfigState) -> ReasonCode {
     state.snapshot().unwrap_err().code
 }
 
+/// Snapshot identity must come from the default commit and expire exactly at sixty seconds.
 #[tokio::test]
 async fn immutable_default_branch_snapshot_and_exact_sixty_second_ttl() {
     let f = Fixture::new("[command_triggers]\nreview={mode='disabled'}").await;
@@ -142,6 +153,7 @@ async fn immutable_default_branch_snapshot_and_exact_sixty_second_ttl() {
     assert_eq!(f.count().await, 6);
 }
 
+/// Concurrent callers share one refresh and cannot multiply requests during failure backoff.
 #[tokio::test]
 async fn concurrent_refreshes_share_one_request_sequence_and_failures_share_backoff() {
     let f = Fixture::new("").await;
@@ -156,6 +168,7 @@ async fn concurrent_refreshes_share_one_request_sequence_and_failures_share_back
     assert_eq!(f.count().await, 4);
 }
 
+/// Installation and repository identities must both partition cached policy.
 #[tokio::test]
 async fn keys_include_installation_and_repository_id() {
     let f = Fixture::new("").await;
@@ -177,6 +190,7 @@ async fn keys_include_installation_and_repository_id() {
     assert_eq!(f.count().await, 7);
 }
 
+/// Absent and empty files share defaults but retain distinguishable blob identity.
 #[tokio::test]
 async fn confirmed_absence_and_empty_file_use_defaults_but_keep_distinct_identity() {
     let f = Fixture::new("").await;
@@ -196,6 +210,7 @@ async fn confirmed_absence_and_empty_file_use_defaults_but_keep_distinct_identit
     assert!(s.config.events.as_ref().unwrap().is_empty());
 }
 
+/// Unreadable repository/ref responses must fail before missing-file defaults can be selected.
 #[tokio::test]
 async fn repository_or_branch_404_never_means_absent_config() {
     let f = Fixture::new("").await;
@@ -210,6 +225,7 @@ async fn repository_or_branch_404_never_means_absent_config() {
     assert_eq!(f.count().await, 3);
 }
 
+/// A refresh failure blocks stale policy until the retry deadline and successful revalidation.
 #[tokio::test]
 async fn unreadable_contents_dont_create_permissive_defaults_or_use_stale_snapshot() {
     let f = Fixture::new("").await;
@@ -253,6 +269,7 @@ async fn unreadable_contents_dont_create_permissive_defaults_or_use_stale_snapsh
     assert_eq!(f.count().await, 9);
 }
 
+/// Invalid documents retain a failure state rather than a permissive cached configuration.
 #[tokio::test]
 async fn invalid_toml_is_unavailable_and_retried_after_fifteen_seconds() {
     let f = Fixture::new("[command_triggers]\nreview={mode='disabled'}").await;
@@ -269,6 +286,7 @@ async fn invalid_toml_is_unavailable_and_retried_after_fifteen_seconds() {
     assert_eq!(f.count().await, 9);
 }
 
+/// A push cannot reset a longer GitHub retry deadline.
 #[tokio::test]
 async fn retry_after_extends_backoff_even_when_pushes_arrive() {
     let f = Fixture::new("").await;
@@ -292,6 +310,7 @@ async fn retry_after_extends_backoff_even_when_pushes_arrive() {
     assert_eq!(f.count().await, 2);
 }
 
+/// Both HTTP-date Retry-After and exhausted-quota reset headers extend the minimum delay.
 #[tokio::test]
 async fn retry_after_http_date_and_rate_limit_reset_are_respected() {
     for date_header in [true, false] {
@@ -322,6 +341,7 @@ async fn retry_after_http_date_and_rate_limit_reset_are_respected() {
     }
 }
 
+/// A 304 can renew the matching commit representation but cannot authorize a new commit.
 #[tokio::test]
 async fn conditional_304_revalidates_only_the_same_immutable_representation() {
     let f = Fixture::new("[command_triggers]\nreview={mode='disabled'}").await;
@@ -366,6 +386,7 @@ async fn conditional_304_revalidates_only_the_same_immutable_representation() {
         .contains_key("if-none-match"));
 }
 
+/// Unmatched 304s, directories and malformed file bodies must not become empty configuration.
 #[tokio::test]
 async fn initial_304_and_bad_file_shapes_are_failures() {
     for response in [
@@ -388,6 +409,7 @@ async fn initial_304_and_bad_file_shapes_are_failures() {
     }
 }
 
+/// Default-branch pushes and observed renames invalidate immediately; topic pushes do not.
 #[tokio::test]
 async fn push_and_observed_default_branch_change_invalidate_without_waiting_for_ttl() {
     let f = Fixture::new("").await;
@@ -429,6 +451,7 @@ async fn push_and_observed_default_branch_change_invalidate_without_waiting_for_
     assert_eq!(f.count().await, 9);
 }
 
+/// Expiry discovers an unobserved head change without ever taking policy from a PR fork.
 #[tokio::test]
 async fn missed_webhook_is_recovered_on_ttl_and_fork_fields_are_ignored() {
     let f = Fixture::new("").await;
@@ -449,6 +472,7 @@ async fn missed_webhook_is_recovered_on_ttl_and_fork_fields_are_ignored() {
     assert_eq!(f.count().await, 6);
 }
 
+/// A refresh started before invalidation must not publish its old snapshot afterward.
 #[tokio::test]
 async fn in_flight_refresh_cannot_overwrite_an_invalidation() {
     let f = Fixture::new("").await;
@@ -473,6 +497,7 @@ async fn in_flight_refresh_cannot_overwrite_an_invalidation() {
     assert_eq!(f.count().await, 6);
 }
 
+/// Connection failure stays distinguishable from missing config and suppresses immediate retries.
 #[tokio::test]
 async fn transport_failure_is_typed_and_backed_off() {
     let f = Fixture::new("").await;
@@ -499,6 +524,7 @@ async fn transport_failure_is_typed_and_backed_off() {
     assert_eq!(f.count().await, 0);
 }
 
+/// Diagnostic suppression is scoped to one repository/thread/reason and expires at ten minutes.
 #[test]
 fn diagnostic_budget_is_per_repository_thread_reason_and_ten_minutes() {
     let clock = Arc::new(TestClock::default());
@@ -521,6 +547,7 @@ fn diagnostic_budget_is_per_repository_thread_reason_and_ten_minutes() {
     assert!(cache.claim_diagnostic(KEY, 1, ReasonCode::Disabled));
 }
 
+/// Advancing virtual time must produce a typed timeout and retain the retry budget.
 #[tokio::test]
 async fn request_timeout_is_typed_and_backed_off_with_a_controlled_clock() {
     let f = Fixture::new("").await;
@@ -549,6 +576,7 @@ async fn request_timeout_is_typed_and_backed_off_with_a_controlled_clock() {
     assert_eq!(f.count().await, 1);
 }
 
+/// A concurrent invalidation cannot replace a rate-limit failure with an immediate retry.
 #[tokio::test]
 async fn invalidation_during_a_failed_refresh_preserves_retry_after() {
     let f = Fixture::new("").await;

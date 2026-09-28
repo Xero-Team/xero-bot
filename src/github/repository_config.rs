@@ -13,6 +13,7 @@ pub struct FetchError {
     pub retry_after_secs: u64,
 }
 impl FetchError {
+    /// Create a typed read failure with the minimum fifteen-second retry delay.
     pub(crate) fn new(code: ReasonCode, detail: &'static str) -> Self {
         Self {
             problem: Problem::new(code, detail),
@@ -27,6 +28,7 @@ pub(crate) struct Response {
     pub value: Value,
 }
 
+/// Use the longest of the minimum backoff, Retry-After seconds/date and rate-limit reset.
 fn retry_after(headers: &http::HeaderMap) -> u64 {
     let now = chrono::Utc::now().timestamp();
     let retry = headers
@@ -57,6 +59,9 @@ fn retry_after(headers: &http::HeaderMap) -> u64 {
 }
 
 impl Client {
+    /// Perform one bounded configuration GET, retaining status and conditional-cache headers.
+    /// Only 200 bodies are decoded; 304/404 interpretation belongs to the snapshot loader.
+    /// Errors omit remote bodies and include retry guidance without replaying requests.
     pub(crate) async fn config_get(
         &self,
         route: &str,

@@ -159,6 +159,8 @@ impl Scheduler {
         self.pump_repositories(&repositories, now()).await
     }
 
+    /// Read shared default-branch policy and update scheduling identity only after validation.
+    /// A default-branch change during discovery pauses dispatch until the next discovery pass.
     async fn load_rules(&self, repo: &Repository, timestamp: i64) -> Result<Option<Rules>> {
         self.config_cache
             .observe_default_branch(repo.key, &repo.default_branch);

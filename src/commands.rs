@@ -2,14 +2,14 @@
 //!
 //! A four-stage compiler rather than a set of regex scans:
 //!
-//! 1. [`mask`] blanks regions that render as code or quotation, preserving byte
+//! 1. `mask` blanks regions that render as code or quotation, preserving byte
 //!    offsets so later spans still index the original text.
-//! 2. [`lex`] produces tokens via `char_indices`, so no byte arithmetic can
+//! 2. `lex` produces tokens via `char_indices`, so no byte arithmetic can
 //!    split a codepoint, and lexes `r?` / `r+` / `r-` / `?r` once each as
 //!    distinct kinds.
 //! 3. [`parse`] is recursive descent whose argument loops all stop at the same
 //!    three boundary tokens.
-//! 4. [`resolve`] applies within-comment policy: self-requests, duplicates,
+//! 4. `resolve` applies within-comment policy: self-requests, duplicates,
 //!    contradictory status labels.
 //!
 //! The structure exists to remove ambiguity rather than manage it. The previous
@@ -73,7 +73,7 @@ pub enum Command {
     Claim,
     /// unclaim / release-assignment (remove commenter from assignees)
     Unclaim,
-    /// r+ [as @user] — approve on behalf of commenter (or the named user)
+    /// `r+ [as @user]` — approve on behalf of commenter (or the named user)
     Approve {
         on_behalf_of: Option<String>,
     },
