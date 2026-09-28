@@ -1,0 +1,35 @@
+# Save as .github/xero-bot.toml on the target repository's default branch.
+# Omit any entry to use its built-in default. Do not configure both an ID and
+# its alias. The idle_workflows section can coexist with these sections.
+#
+# Delivery stage: #11 supplies this contract, disabled vetoes and failure gates.
+# Full mention-mode routing and durable session TTLs are connected by #12–#14.
+
+[command_triggers]
+claim   = { mode = "no_mention" } # take
+unclaim = { mode = "no_mention" } # untake / release / release-assignment
+cc      = { mode = "no_mention" }
+"r?"    = { mode = "no_mention" }
+ready   = { mode = "no_mention" } # ?r / reviewer
+"r+"    = { mode = "always_mention" } # r= / r+ as / r+ @user
+"r-"    = { mode = "always_mention" }
+review  = { mode = "mention_once" }
+codeql  = { mode = "mention_once" }
+label   = { mode = "mention_once" } # relabel
+assign  = { mode = "mention_once" }
+author  = { mode = "mention_once" }
+blocked = { mode = "mention_once" }
+ping    = { mode = "mention_once" }
+help    = { mode = "mention_once" } # commands
+queue   = { mode = "mention_once" }
+
+# To disable review, replace its entry above with:
+# review = { mode = "disabled" }
+# Disabled commands and their aliases cannot execute, including via old sessions.
+
+[command_sessions]
+ttl_days = 30 # 1..365; the durable session implementation is #13/#14
+
+# event_triggers and path_triggers.rules default to empty.
+# Explicit rules currently produce Unsupported diagnostics; their executors
+# arrive in #15–#17. mode = "auto" is invalid, never an execution shortcut.

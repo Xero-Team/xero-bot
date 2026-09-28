@@ -9,12 +9,12 @@ use std::path::Path;
 use std::sync::Arc;
 
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 
+use crate::config::cache::{RepositoryConfigCache, RepositoryKey};
 use crate::config::Config;
 use crate::github::actions::{Workflow, WorkflowRun};
 use crate::github::{normalize_login, Client, GhError};
-use config::{Rules, Task, CONFIG_PATH};
+use config::{Rules, Task};
 use store::{Pending, Store, TargetState};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -25,9 +25,11 @@ pub struct Scheduler {
     pump: tokio::sync::Mutex<()>,
     boot: i64,
     poll_secs: u64,
+    config_cache: Arc<RepositoryConfigCache>,
 }
 
 struct Repository {
+    key: RepositoryKey,
     name: String,
     default_branch: String,
     gh: Arc<Client>,
@@ -46,6 +48,7 @@ impl Scheduler {
             pump: tokio::sync::Mutex::new(()),
             boot: now(),
             poll_secs,
+            config_cache: RepositoryConfigCache::shared(),
         })
     }
 
@@ -140,6 +143,10 @@ impl Scheduler {
                 repositories.insert(
                     name.clone(),
                     Repository {
+                        key: RepositoryKey {
+                            installation_id: id,
+                            repository_id: repo["id"].as_i64().ok_or("repository ID missing")?,
+                        },
                         name,
                         default_branch,
                         gh: Arc::clone(&gh),
@@ -152,24 +159,27 @@ impl Scheduler {
         self.pump_repositories(&repositories, now()).await
     }
 
+    /// Read shared default-branch policy and update scheduling identity only after validation.
+    /// A default-branch change during discovery pauses dispatch until the next discovery pass.
     async fn load_rules(&self, repo: &Repository, timestamp: i64) -> Result<Option<Rules>> {
-        let content = match repo
-            .gh
-            .get_file_content(&repo.name, CONFIG_PATH, &repo.default_branch)
-            .await
-        {
-            Ok(Some(content)) => content,
-            Err(GhError::Api { status: 404, .. }) => {
-                self.store.configure(&repo.name, "disabled", timestamp)?;
-                return Ok(None);
-            }
-            Ok(None) => return Err("repository config must be a file".into()),
-            Err(e) => return Err(e.into()),
-        };
-        let rules = config::parse(&content, &repo.name)?;
+        self.config_cache
+            .observe_default_branch(repo.key, &repo.default_branch);
+        let state = self.config_cache.load(&repo.gh, repo.key, &repo.name).await;
+        let snapshot = state.snapshot().map_err(|e| e.to_string())?;
+        // Discovery also supplies the default branch used for workflow validation.
+        // A rename between discovery and refresh must not dispatch using the old one.
+        if snapshot.default_branch != repo.default_branch {
+            return Err("default branch changed during discovery; retry discovery".into());
+        }
+        let rules = snapshot
+            .config
+            .idle
+            .as_ref()
+            .map_err(|e| e.to_string())?
+            .clone();
         self.store.configure(
             &repo.name,
-            &hex::encode(Sha256::digest(content.as_bytes())),
+            snapshot.blob_sha.as_deref().unwrap_or("disabled"),
             timestamp,
         )?;
         Ok(rules)

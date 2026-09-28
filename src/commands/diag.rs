@@ -110,6 +110,11 @@ impl Diagnostic {
                 let what = expected.describe(lang);
                 t!(lang, "`{verb}` needs {what}.", "`{verb}` 需要{what}。")
             }
+            Diagnostic::ExtraArguments { verb: "r=", .. } => t!(
+                lang,
+                "`r=` requires exactly one @username; the approval was not run.",
+                "`r=` 只接受一个 @用户名;未执行审批。"
+            ),
             Diagnostic::ExtraArguments { verb, .. } => t!(
                 lang,
                 "`{verb}` takes no arguments; what followed it was ignored.",

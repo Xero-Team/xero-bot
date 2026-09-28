@@ -2,7 +2,9 @@
 // explicit clock and mocked GitHub, without starting an App or dispatching CI.
 use super::*;
 use base64::Engine;
+use config::CONFIG_PATH;
 use serde_json::json;
+use sha2::Digest;
 use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -33,6 +35,7 @@ fn scheduler() -> Scheduler {
         pump: tokio::sync::Mutex::new(()),
         boot: START,
         poll_secs: 60,
+        config_cache: Arc::new(RepositoryConfigCache::default()),
     }
 }
 
@@ -49,7 +52,7 @@ fn observe(scheduler: &Scheduler, repo: &str, sha: &str, timestamp: i64) {
 }
 
 fn contents(text: &str) -> Value {
-    json!({"type": "file", "encoding": "base64", "content": base64::engine::general_purpose::STANDARD.encode(text)})
+    json!({"type": "file", "sha": hex::encode(sha2::Sha256::digest(text.as_bytes())), "encoding": "base64", "content": base64::engine::general_purpose::STANDARD.encode(text)})
 }
 
 fn run(
@@ -72,6 +75,13 @@ fn run(
 }
 
 async fn standard_mocks(server: &MockServer) {
+    Mock::given(method("GET"))
+        .and(path(format!("/repos/{REPO}")))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"id": 1, "default_branch": "main"})),
+        )
+        .mount(server)
+        .await;
     for (name, id) in [("ci.yml", 10), ("image.yml", 20)] {
         Mock::given(method("GET"))
             .and(path(format!("/repos/{REPO}/actions/workflows/{name}")))
@@ -88,7 +98,14 @@ async fn standard_mocks(server: &MockServer) {
     ] {
         Mock::given(method("GET"))
             .and(path(format!("/repos/{REPO}/contents/{filename}")))
-            .and(query_param("ref", "main"))
+            .and(query_param(
+                "ref",
+                if filename == CONFIG_PATH {
+                    "aaa"
+                } else {
+                    "main"
+                },
+            ))
             .respond_with(ResponseTemplate::new(200).set_body_json(contents(text)))
             .with_priority(10)
             .mount(server)
@@ -157,6 +174,10 @@ async fn fixture() -> (MockServer, Scheduler, BTreeMap<String, Repository>) {
     let repositories = BTreeMap::from([(
         REPO.into(),
         Repository {
+            key: RepositoryKey {
+                installation_id: 1,
+                repository_id: 1,
+            },
             name: REPO.into(),
             default_branch: "main".into(),
             gh,
@@ -664,6 +685,10 @@ async fn related_repository_activity_and_ci_both_block_dispatch() {
     repos.insert(
         other.into(),
         Repository {
+            key: RepositoryKey {
+                installation_id: 1,
+                repository_id: 2,
+            },
             name: other.into(),
             default_branch: "main".into(),
             gh: Arc::clone(&repos[REPO].gh),
@@ -766,24 +791,27 @@ async fn discovers_default_branch_config_and_hot_reloads_disable_or_invalid_rule
     let response = MutableResponse::new(contents(RULES));
     Mock::given(method("GET"))
         .and(path(format!("/repos/{REPO}/contents/{CONFIG_PATH}")))
-        .and(query_param("ref", "main"))
+        .and(query_param("ref", "aaa"))
         .respond_with(response.clone())
         .with_priority(1)
         .mount(&server)
         .await;
     scheduler.pump_repositories(&repos, START).await.unwrap();
     assert!(writes(&server).await.is_empty());
+    scheduler.config_cache.invalidate(repos[REPO].key);
     scheduler
         .pump_repositories(&repos, START + 60)
         .await
         .unwrap();
     assert_eq!(writes(&server).await.len(), 1);
+    scheduler.config_cache.invalidate(repos[REPO].key);
     response.set(contents("[idle_workflows]\nenabled=false"));
     assert!(scheduler
         .pump_repositories(&repos, START + 120)
         .await
         .unwrap()
         .contains("0 tasks"));
+    scheduler.config_cache.invalidate(repos[REPO].key);
     response.set(contents("[idle_workflows]\nenabled='typo'"));
     assert!(scheduler
         .pump_repositories(&repos, START + 180)

@@ -11,6 +11,9 @@ Xero-Team 的组织级 GitHub App 机器人。Rust 实现,单二进制,自托管
 - **CodeQL 质量报告** — 读取仓库存量 code scanning 告警,映射到 PR 变更文件
 - **中英双语回复** — 依 PR 自身的 commit 信息决定用中文还是英文,无需配置
 
+仓库 TOML 读取、指令禁用及配置故障拦截已独立于 idle 开关接入。详见[配置契约与当前交付范围](docs/repository-config.md)及 [#11 验收记录](docs/issue-11-acceptance.md)；完整手动模式与会话路由由 #12–#14 接入。
+
+
 ## 命令参考
 
 评论中发出(大小写不敏感,一条评论可含多条命令,代码块内的内容会被忽略)。

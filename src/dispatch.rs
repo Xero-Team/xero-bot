@@ -3,6 +3,8 @@
 use serde_json::Value;
 
 use crate::commands::parse_commands;
+use crate::config::cache::{RepositoryConfigCache, RepositoryKey};
+use crate::config::repository::{Comments, Problem};
 use crate::config::Config;
 use crate::github::{normalize_login, Client};
 use crate::handlers::{handle_comment, CommentContext};
@@ -99,6 +101,7 @@ pub fn route_event(cfg: &Config, event_header: &str, payload: &Value) -> Routing
             }
 
             Routing::Act(Work::Comment {
+                repository_id: payload["repository"]["id"].as_i64().unwrap_or(0),
                 repo,
                 pr_number,
                 installation_id,
@@ -162,6 +165,7 @@ pub fn route_event(cfg: &Config, event_header: &str, payload: &Value) -> Routing
         } => {
             if !cfg.codeql_label.is_empty() && label == cfg.codeql_label {
                 Routing::Act(Work::Codeql {
+                    repository_id: payload["repository"]["id"].as_i64().unwrap_or(0),
                     repo,
                     pr_number,
                     installation_id,
@@ -234,6 +238,7 @@ pub enum Routing {
 #[derive(Debug)]
 pub enum Work {
     Comment {
+        repository_id: i64,
         repo: String,
         pr_number: i64,
         installation_id: i64,
@@ -273,6 +278,7 @@ pub enum Work {
         installation_id: i64,
     },
     Codeql {
+        repository_id: i64,
         repo: String,
         pr_number: i64,
         installation_id: i64,
@@ -314,6 +320,7 @@ async fn session_open(
     repo: &str,
     issue: i64,
     commenter: &str,
+    policy: &Comments,
 ) -> Result<bool, String> {
     let comments = gh
         .list_issue_comments(repo, issue)
@@ -330,11 +337,239 @@ async fn session_open(
         let Some(body) = c.get("body").and_then(|b| b.as_str()) else {
             continue;
         };
-        if !parse_commands(&cfg.bot_name, body).commands.is_empty() {
+        if parse_commands(&cfg.bot_name, body)
+            .commands
+            .iter()
+            .any(|c| policy.enabled(c.id()).is_ok())
+        {
             return Ok(true);
         }
     }
     Ok(false)
+}
+
+/// Apply configuration failure/disabled vetoes before the existing comment execution chain.
+/// The injected client/cache let acceptance tests prove rejected commands perform no
+/// session lookup or business action; full mention/session routing remains issue #14.
+async fn execute_comment_with_client(
+    gh: &Client,
+    cfg: &Config,
+    cache: &RepositoryConfigCache,
+    work: Work,
+) -> Result<(), String> {
+    let Work::Comment {
+        repository_id,
+        repo,
+        pr_number,
+        installation_id,
+        commenter,
+        pr_author,
+        is_pr,
+        mut commands,
+        diagnostics,
+        comment_lang,
+        mut bare,
+    } = work
+    else {
+        return Err("expected comment work".into());
+    };
+    let key = RepositoryKey {
+        installation_id,
+        repository_id,
+    };
+    let state = cache.load(gh, key, &repo).await;
+    let policy = state.snapshot().and_then(|s| s.config.comments.as_ref());
+    let policy = match policy {
+        Ok(policy) => policy,
+        Err(problem) => {
+            let lang = comment_lang.unwrap_or_default();
+            let message = state
+                .diagnostic(lang)
+                .unwrap_or_else(|| problem.message(lang));
+            report_config_problem(gh, cache, key, &repo, pr_number, problem, &message).await;
+            return Ok(());
+        }
+    };
+    // Show failures in other domains on an explicit status/help request while
+    // keeping independently valid comment commands usable. Dynamic help is #18.
+    if commands.iter().any(|c| {
+        matches!(
+            c,
+            crate::commands::Command::Help | crate::commands::Command::Ping
+        ) && policy.enabled(c.id()).is_ok()
+    }) {
+        for problem in state.snapshot().expect("checked above").config.problems() {
+            report_config_problem(
+                gh,
+                cache,
+                key,
+                &repo,
+                pr_number,
+                problem,
+                &problem.message(comment_lang.unwrap_or_default()),
+            )
+            .await;
+        }
+    }
+    // Apply the configuration veto before session lookups, authorization,
+    // command handlers or any future persistent execution inbox.
+    let mut blocked = Vec::new();
+    commands.retain(|c| match policy.enabled(c.id()) {
+        Ok(_) => true,
+        Err(e) => {
+            blocked.push(e);
+            false
+        }
+    });
+    if let Some(command) = &bare {
+        if let Err(e) = policy.enabled(command.id()) {
+            blocked.push(e);
+            bare = None;
+        }
+    }
+    for problem in &blocked {
+        report_config_problem(
+            gh,
+            cache,
+            key,
+            &repo,
+            pr_number,
+            problem,
+            &problem.message(comment_lang.unwrap_or_default()),
+        )
+        .await;
+    }
+    if commands.is_empty() && bare.is_none() && diagnostics.is_empty() {
+        return Ok(());
+    }
+    // An issue has no commits, and asking for them is a guaranteed 404
+    // per comment, so the comment is the only signal there is.
+    let lang = if is_pr {
+        crate::lang::for_pr(gh, &repo, pr_number, comment_lang).await
+    } else {
+        comment_lang.unwrap_or_default()
+    };
+
+    // The no-mention path. The comment carried a bare command
+    // candidate and nothing else the parser recognized, so this is
+    // the one point where "does this user have a session here?" is
+    // worth an API call: scan their comments on this issue for one
+    // that parsed as commands when addressed to the bot. Their
+    // earlier comment is the session opener; the flag lives in
+    // GitHub, so it survives restarts and needs no database.
+
+    if commands.is_empty() && diagnostics.is_empty() {
+        if let Some(cmd) = bare {
+            match session_open(gh, cfg, &repo, pr_number, &commenter, policy).await {
+                Ok(true) => commands.push(cmd),
+                Ok(false) => {
+                    tracing::info!(
+                        "bare command by @{commenter} on {repo}#{pr_number} ignored: \
+                                 no session (mention @{bot} once to open one)",
+                        bot = cfg.bot_name
+                    );
+                    // The comment *looks* like a command, so silence
+                    // reads as a broken bot. One line teaching the
+                    // one-mention rule, in the PR's language.
+                    let bot = &cfg.bot_name;
+                    let body = match lang {
+                        crate::lang::Lang::En => format!(
+                            "💡 To run commands without mentioning me, run one \
+command *with* a mention first — `@{bot} help` — here on this PR. After that, bare \
+commands like yours work without the mention."
+                        ),
+                        crate::lang::Lang::Zh => format!(
+                            "💡 想不 @ 直接下命令,请先在本 PR 上带 @ 执行一次命令 \
+(如 `@{bot} help`)。之后本 PR 上即可免 @ 使用指令。"
+                        ),
+                    };
+                    let _ = gh.post_issue_comment(&repo, pr_number, &body).await;
+                }
+                Err(e) => {
+                    tracing::warn!("session check for @{commenter} on {repo}#{pr_number}: {e}");
+                }
+            }
+        }
+    }
+
+    let ctx = CommentContext {
+        repo: repo.clone(),
+        pr_number,
+        commenter,
+        pr_author,
+        installation_id,
+        is_pr,
+        lang,
+    };
+    // Rendered here, not at routing time: `handle_comment` takes plain
+    // strings so it needn't know the parser's types, and the wording
+    // needs the language that only this side of the queue knows.
+    let diagnostics: Vec<String> = diagnostics.iter().map(|d| d.message(lang)).collect();
+    let results = handle_comment(gh, cfg, &ctx, commands, diagnostics).await;
+    tracing::info!("comment commands on {repo}#{pr_number}: {results:?}");
+    Ok(())
+}
+
+/// Always log a refusal and reserve the local diagnostic budget before posting its message.
+/// A failed or uncertain comment write is not retried by this in-memory adapter.
+async fn report_config_problem(
+    gh: &Client,
+    cache: &RepositoryConfigCache,
+    key: RepositoryKey,
+    repo: &str,
+    issue: i64,
+    problem: &Problem,
+    message: &str,
+) {
+    tracing::warn!(repo, issue, reason = ?problem.code, "comment blocked by repository configuration");
+    if cache.claim_diagnostic(key, issue, problem.code) {
+        if let Err(error) = gh.post_issue_comment(repo, issue, message).await {
+            tracing::warn!(
+                repo,
+                issue,
+                "configuration diagnostic delivery failed: {error}"
+            );
+        }
+    }
+}
+
+/// Gate the existing label-triggered CodeQL report using the same disabled/config veto.
+/// Automatic failures propagate to logging instead of posting a diagnostic per event.
+async fn execute_codeql_with_client(
+    gh: &Client,
+    cfg: &Config,
+    cache: &RepositoryConfigCache,
+    work: Work,
+) -> Result<(), String> {
+    let Work::Codeql {
+        repository_id,
+        repo,
+        pr_number,
+        installation_id,
+    } = work
+    else {
+        return Err("expected CodeQL work".into());
+    };
+    let state = cache
+        .load(
+            gh,
+            RepositoryKey {
+                installation_id,
+                repository_id,
+            },
+            &repo,
+        )
+        .await;
+    state
+        .snapshot()
+        .and_then(|s| s.config.comments.as_ref())
+        .map_err(|e| e.to_string())?
+        .enabled(crate::config::repository::CommandId::Codeql)
+        .map_err(|e| e.to_string())?;
+    let lang = crate::lang::for_pr(gh, &repo, pr_number, None).await;
+    let status = crate::codeql::run_codeql_report(gh, cfg, &repo, pr_number, lang).await;
+    tracing::info!("codeql report {repo}#{pr_number}: {status}");
+    Ok(())
 }
 
 /// Execute background work. Never panics; all errors are logged.
@@ -347,90 +582,13 @@ pub async fn execute_work(cfg: &Config, work: Work) {
 
 async fn execute_work_inner(cfg: &Config, work: Work) -> Result<(), String> {
     match work {
-        Work::Comment {
-            repo,
-            pr_number,
-            installation_id,
-            commenter,
-            pr_author,
-            is_pr,
-            commands,
-            diagnostics,
-            comment_lang,
-            bare,
+        work @ Work::Comment {
+            installation_id, ..
         } => {
             let gh = Client::installation_resolved(cfg, installation_id)
                 .await
                 .map_err(|e| format!("installation client: {e}"))?;
-
-            // An issue has no commits, and asking for them is a guaranteed 404
-            // per comment, so the comment is the only signal there is.
-            let lang = if is_pr {
-                crate::lang::for_pr(&gh, &repo, pr_number, comment_lang).await
-            } else {
-                comment_lang.unwrap_or_default()
-            };
-
-            // The no-mention path. The comment carried a bare command
-            // candidate and nothing else the parser recognized, so this is
-            // the one point where "does this user have a session here?" is
-            // worth an API call: scan their comments on this issue for one
-            // that parsed as commands when addressed to the bot. Their
-            // earlier comment is the session opener; the flag lives in
-            // GitHub, so it survives restarts and needs no database.
-            let mut commands = commands;
-            if commands.is_empty() && diagnostics.is_empty() {
-                if let Some(cmd) = bare {
-                    match session_open(&gh, cfg, &repo, pr_number, &commenter).await {
-                        Ok(true) => commands.push(cmd),
-                        Ok(false) => {
-                            tracing::info!(
-                                "bare command by @{commenter} on {repo}#{pr_number} ignored: \
-                                 no session (mention @{bot} once to open one)",
-                                bot = cfg.bot_name
-                            );
-                            // The comment *looks* like a command, so silence
-                            // reads as a broken bot. One line teaching the
-                            // one-mention rule, in the PR's language.
-                            let bot = &cfg.bot_name;
-                            let body = match lang {
-                                crate::lang::Lang::En => format!(
-                                    "💡 To run commands without mentioning me, run one \
-command *with* a mention first — `@{bot} help` — here on this PR. After that, bare \
-commands like yours work without the mention."
-                                ),
-                                crate::lang::Lang::Zh => format!(
-                                    "💡 想不 @ 直接下命令,请先在本 PR 上带 @ 执行一次命令 \
-(如 `@{bot} help`)。之后本 PR 上即可免 @ 使用指令。"
-                                ),
-                            };
-                            let _ = gh.post_issue_comment(&repo, pr_number, &body).await;
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                "session check for @{commenter} on {repo}#{pr_number}: {e}"
-                            );
-                        }
-                    }
-                }
-            }
-
-            let ctx = CommentContext {
-                repo: repo.clone(),
-                pr_number,
-                commenter,
-                pr_author,
-                installation_id,
-                is_pr,
-                lang,
-            };
-            // Rendered here, not at routing time: `handle_comment` takes plain
-            // strings so it needn't know the parser's types, and the wording
-            // needs the language that only this side of the queue knows.
-            let diagnostics: Vec<String> = diagnostics.iter().map(|d| d.message(lang)).collect();
-            let results = handle_comment(&gh, cfg, &ctx, commands, diagnostics).await;
-            tracing::info!("comment commands on {repo}#{pr_number}: {results:?}");
-            Ok(())
+            execute_comment_with_client(&gh, cfg, &RepositoryConfigCache::shared(), work).await
         }
         Work::RebaseCheck {
             repo,
@@ -454,17 +612,12 @@ commands like yours work without the mention."
             crate::rebase::handle_base_push(&gh, cfg, &repo, &ref_name).await;
             Ok(())
         }
-        Work::Codeql {
-            repo,
-            pr_number,
-            installation_id,
+        work @ Work::Codeql {
+            installation_id, ..
         } => {
             let gh = Client::installation(cfg, installation_id, "")
                 .map_err(|e| format!("installation client: {e}"))?;
-            let lang = crate::lang::for_pr(&gh, &repo, pr_number, None).await;
-            let status = crate::codeql::run_codeql_report(&gh, cfg, &repo, pr_number, lang).await;
-            tracing::info!("codeql report {repo}#{pr_number}: {status}");
-            Ok(())
+            execute_codeql_with_client(&gh, cfg, &RepositoryConfigCache::shared(), work).await
         }
         Work::PrReview {
             repo,
@@ -1010,3 +1163,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "dispatch/config_tests.rs"]
+mod config_tests;

@@ -40,44 +40,24 @@ pub struct ParsedCommand {
 
 /// Verbs taking no arguments, and the command each produces.
 fn nullary(word: &str) -> Option<Command> {
-    Some(match word {
-        "ping" => Command::Ping,
-        "help" | "commands" => Command::Help,
-        "review" => Command::Review,
-        "codeql" => Command::Codeql,
-        "ready" | "reviewer" => Command::Ready,
-        "author" => Command::Author,
-        "blocked" => Command::Blocked,
-        "claim" | "take" => Command::Claim,
-        "unclaim" | "release-assignment" | "release" | "untake" => Command::Unclaim,
-        "queue" => Command::Queue,
+    use crate::config::repository::CommandId;
+    Some(match CommandId::from_name(word)? {
+        CommandId::Ping => Command::Ping,
+        CommandId::Help => Command::Help,
+        CommandId::Review => Command::Review,
+        CommandId::Codeql => Command::Codeql,
+        CommandId::Ready => Command::Ready,
+        CommandId::Author => Command::Author,
+        CommandId::Blocked => Command::Blocked,
+        CommandId::Claim => Command::Claim,
+        CommandId::Unclaim => Command::Unclaim,
+        CommandId::Queue => Command::Queue,
         _ => return None,
     })
 }
 
 /// Every verb the parser knows, for "did you mean" suggestions.
-pub const VERBS: &[&str] = &[
-    "ping",
-    "help",
-    "commands",
-    "review",
-    "codeql",
-    "ready",
-    "reviewer",
-    "author",
-    "blocked",
-    "claim",
-    "take",
-    "unclaim",
-    "untake",
-    "release",
-    "release-assignment",
-    "cc",
-    "label",
-    "relabel",
-    "assign",
-    "queue",
-];
+pub use crate::config::repository::WORD_ALIASES as VERBS;
 
 pub struct Parsed {
     pub commands: Vec<ParsedCommand>,
@@ -254,6 +234,7 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Parse one verb in a bot mention's scope, keeping malformed approvals non-executable.
     fn verb_tail(&mut self, addressed: bool) {
         // Leading punctuation after the mention is not an error: `@bot, ping`
         // and `@bot: ping` are what people actually type. Prose is skipped too —
@@ -277,6 +258,49 @@ impl<'a> Parser<'a> {
                 self.pos += 1;
                 self.approve_args(start);
             }
+            Some(Tok::ApproveAs) => {
+                self.pos += 1;
+                // Only the explicit alias is introduced here. Bare syntax and
+                // the broader approval grammar migration belong to #12.
+                match self.peek().cloned() {
+                    Some(Tok::User(user)) => {
+                        self.pos += 1;
+                        // Sentence punctuation is harmless; prose and extra
+                        // arguments must still invalidate the whole approval.
+                        while matches!(self.peek(), Some(Tok::Punct)) {
+                            self.pos += 1;
+                        }
+                        if self.at_boundary() {
+                            self.emit(
+                                Command::Approve {
+                                    on_behalf_of: Some(user),
+                                },
+                                start,
+                            );
+                        } else {
+                            self.diagnostics.push(Diagnostic::ExtraArguments {
+                                verb: "r=",
+                                span: self.span(),
+                            });
+                        }
+                    }
+                    Some(Tok::RawUser(raw)) => {
+                        self.diagnostics.push(Diagnostic::InvalidLogin {
+                            raw,
+                            span: self.span(),
+                        });
+                    }
+                    _ => self.diagnostics.push(Diagnostic::MissingArgument {
+                        verb: "r=",
+                        expected: Expected::User,
+                        span: self.span(),
+                    }),
+                }
+                // Invalid targets/extra arguments must not become other commands.
+                while !self.at_boundary() {
+                    self.pos += 1;
+                }
+            }
             Some(Tok::Reject) => {
                 self.pos += 1;
                 self.emit(Command::Reject, start);
@@ -298,8 +322,9 @@ impl<'a> Parser<'a> {
             self.emit(cmd, start);
             return;
         }
-        match word {
-            "cc" => {
+        use crate::config::repository::CommandId;
+        match CommandId::from_name(word) {
+            Some(CommandId::Cc) => {
                 let users = self.user_list();
                 if users.is_empty() {
                     self.diagnostics.push(Diagnostic::MissingArgument {
@@ -311,20 +336,20 @@ impl<'a> Parser<'a> {
                     self.emit(Command::Cc { users }, start);
                 }
             }
-            "assign" => {
+            Some(CommandId::Assign) => {
                 if let Some(user) = self.user_arg("assign") {
                     self.emit(Command::Assign { user }, start);
                 }
             }
-            "label" | "relabel" => self.label_args(start),
-            other => {
+            Some(CommandId::Label) => self.label_args(start),
+            _ => {
                 // An unknown word directly after a mention that opens the line
                 // is a typo worth naming. Anything looser is noise:
                 // `@bot 这个 PR 很好` must not be answered with
                 // "`pr` 不是命令,是否想用 `cc`?".
                 if may_complain {
                     self.diagnostics.push(Diagnostic::unknown_verb(
-                        other.to_string(),
+                        word.to_string(),
                         self.toks[self.pos.saturating_sub(1)].span.clone(),
                     ));
                 }

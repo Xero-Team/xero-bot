@@ -3,6 +3,9 @@
 //! Values in `.env` never override real environment variables, so an
 //! orchestrator's `environment:` block (docker compose) always wins.
 
+pub mod cache;
+pub mod repository;
+
 use std::env;
 use std::path::Path;
 
