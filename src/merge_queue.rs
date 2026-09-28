@@ -25,7 +25,7 @@
 use serde_json::Value;
 
 use crate::config::Config;
-use crate::github::{Client, GhError};
+use crate::github::{Client, GhError, MergeOutcome};
 use crate::lang::Lang;
 use crate::t;
 
@@ -549,6 +549,11 @@ static BACKOFF: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
 > = std::sync::OnceLock::new();
 
+/// All queue triggers in one process share this guard. The periodic driver and
+/// `/cron` used to call `pump_all` independently, so a cron request could reset
+/// staging while the poll loop was folding the same batch.
+static PUMP_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+
 const BACKOFF_DURATION: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
 fn backoff() -> &'static std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>> {
@@ -573,6 +578,10 @@ fn start_backoff(repo: &str) {
     );
 }
 
+fn pump_lock() -> &'static tokio::sync::Mutex<()> {
+    PUMP_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
 /// Pump every installation the App can see, like the rebase sweep.
 ///
 /// Serial on purpose: two concurrent pumps would race the staging ref and
@@ -581,6 +590,9 @@ pub async fn pump_all(cfg: &Config) -> String {
     if !cfg.merge_queue_enabled {
         return "merge queue disabled".into();
     }
+    let Ok(_guard) = pump_lock().try_lock() else {
+        return "merge queue pump already running".into();
+    };
     let app = match crate::github::Client::app_client(cfg) {
         Ok(c) => c,
         Err(e) => return format!("app-client-error: {e}"),
@@ -898,7 +910,11 @@ async fn start_batch(
             .to_string();
         let message = format!("{MARKER_PREFIX}#{n} (head {head_sha})");
         match gh.merge_branches(repo, staging, &head_ref, &message).await {
-            Ok(_) => merged.push(*n),
+            Ok(MergeOutcome::Created(_)) => merged.push(*n),
+            Ok(MergeOutcome::AlreadyMerged) => conflicts.push((
+                *n,
+                "already contained in the staging base; no new staging push was created".into(),
+            )),
             Err(GhError::Api {
                 status: 409,
                 message,
@@ -1042,7 +1058,6 @@ async fn rebuild_from(
     let _ = gh.post_issue_comment(repo, entry.pr, &body).await;
 
     // …and re-merge the members after them (their commits died in the reset).
-    let mut remerged = Vec::new();
     for later in &chain[idx + 1..] {
         let pr = match gh.get_pr(repo, later.pr).await {
             Ok(p) => p,
@@ -1055,7 +1070,7 @@ async fn rebuild_from(
         let head_ref = head_ref_of(&pr);
         let message = format!("{MARKER_PREFIX}#{} (head {})", later.pr, later.head_sha);
         match gh.merge_branches(repo, &staging, &head_ref, &message).await {
-            Ok(_) => remerged.push(later.pr),
+            Ok(MergeOutcome::Created(_) | MergeOutcome::AlreadyMerged) => {}
             Err(e) => {
                 let _ = dequeue_pr(gh, cfg, repo, later.pr, "").await;
                 tracing::warn!("merge queue rebuild: re-merge #{} failed: {e}", later.pr);
