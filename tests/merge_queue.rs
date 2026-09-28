@@ -452,6 +452,54 @@ async fn conflict_drops_one_member_and_keeps_the_batch() {
     );
 }
 
+#[tokio::test]
+async fn already_merged_member_is_not_marked_testing_without_a_new_staging_push() {
+    let server = MockServer::start().await;
+
+    queued_issues_mock().mount(&server).await;
+    repo_info_mock("main").mount(&server).await;
+    testing_label_mock(&[]).mount(&server).await;
+    pr_mock(10, "head10", "open", Some(true))
+        .mount(&server)
+        .await;
+    pr_mock(11, "head11", "open", Some(true))
+        .mount(&server)
+        .await;
+    branch_ref("main", Some("ma1n")).mount(&server).await;
+    branch_ref("staging", None).mount(&server).await;
+    Mock::given(method("POST"))
+        .and(path(format!("/repos/{REPO}/git/refs")))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({})))
+        .mount(&server)
+        .await;
+
+    // #10 is already contained in the base: GitHub returns 204 and no new
+    // staging push exists, so it must leave the queue instead of entering CI.
+    Mock::given(method("POST"))
+        .and(path(format!("/repos/{REPO}/merges")))
+        .and(body_string_contains("feature-10"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!("/repos/{REPO}/merges")))
+        .and(body_string_contains("feature-11"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({"sha": "m11"})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    allow_labels(&server).await;
+    allow_comments(&server).await;
+
+    let outcome = xero_bot::merge_queue::pump_one(&client_for(&server), &queue_cfg(), REPO).await;
+    assert_eq!(
+        outcome,
+        xero_bot::merge_queue::PumpOutcome::Started(vec![11]),
+        "an AlreadyMerged response must not label #10 as testing"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 4. Restart recovery: a mid-batch crash is invisible — the next tick resumes
 // ---------------------------------------------------------------------------

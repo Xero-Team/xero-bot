@@ -988,7 +988,6 @@ or above to approve this PR (currently: {their_perm}).",
         .await
     {
         Ok(_) => {
-            let _ = gh.post_issue_comment(&ctx.repo, ctx.pr_number, &body).await;
             // An approval is one vote and one vote only — the merge queue is
             // what turns it into a merge. Enqueuing after a successful relay
             // keeps r+ meaningful with the queue on; with it off, this is a

@@ -507,7 +507,7 @@ async fn test_r_plus_approves_with_write() {
         .expect(1)
         .mount(&server)
         .await;
-    // APPROVE review + confirmation comment
+    // The APPROVE review itself is the single visible confirmation.
     Mock::given(method("POST"))
         .and(path("/repos/octocat/hello/pulls/7/reviews"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": 99})))
@@ -517,7 +517,7 @@ async fn test_r_plus_approves_with_write() {
     Mock::given(method("POST"))
         .and(path("/repos/octocat/hello/issues/7/comments"))
         .respond_with(ResponseTemplate::new(201).set_body_json(json!({"id": 1})))
-        .expect(1)
+        .expect(0)
         .mount(&server)
         .await;
 

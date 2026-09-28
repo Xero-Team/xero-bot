@@ -1348,7 +1348,17 @@ impl CiState {
 
         // Anything still running (queued/in_progress, pending status) is a
         // reason not to claim green even if some checks passed.
-        let pending = check_states("queued")
+        // Active Checks API runs normally have `status: in_progress` and a
+        // null `conclusion`; looking only at conclusion misread a partially
+        // complete batch as green/unknown while a job was still running.
+        let check_active = checks.iter().any(|c| {
+            matches!(
+                c.get("status").and_then(|s| s.as_str()),
+                Some("queued") | Some("in_progress") | Some("pending")
+            )
+        });
+        let pending = check_active
+            || check_states("queued")
             || check_states("in_progress")
             || check_states("pending")
             || status_states("pending");
@@ -1915,6 +1925,20 @@ parentheses."
         assert_eq!(CiState::combine(&[], &[]), CiState::Unknown);
         // A 403'd checks call with no statuses is also Unknown, not Green.
         assert_eq!(CiState::combine(&[], &[]), CiState::Unknown);
+    }
+
+    #[test]
+    fn active_check_status_keeps_ci_pending_until_conclusion() {
+        let active = json!({
+            "name": "tests",
+            "status": "in_progress",
+            "conclusion": null
+        });
+        let state = CiState::combine(&[check("build", "success"), active], &[]);
+        assert!(
+            matches!(state, CiState::Pending(ref names) if names == &vec!["build"]),
+            "{state:?}"
+        );
     }
 
     /// The rendered section must bind the model: no compile findings on green
