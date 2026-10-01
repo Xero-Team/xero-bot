@@ -33,10 +33,19 @@
 cargo fmt --all -- --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked --all-targets
+RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps
 git diff --check
 ```
 
-以上检查全部通过：**377 个测试通过，0 失败、0 忽略**；fmt、clippy（`-D warnings`）和 `git diff --check` 无错误。新增 10 项表驱动解析验收测试和 5 项分发 HTTP 验收测试，并更新旧语义回归用例。HTTP 测试使用本地 wiremock，不向真实 GitHub 仓库提交审批、标签或评论。
+以上检查全部通过：**380 个测试通过，0 失败、0 忽略**；fmt、clippy 与 rustdoc（`-D warnings`）以及 `git diff --check` 无错误。新增 13 项表驱动解析验收测试和 5 项分发 HTTP 验收测试，并更新旧语义回归用例。HTTP 测试使用本地 wiremock，不向真实 GitHub 仓库提交审批、标签或评论。
+
+## PR #22 审查修复
+
+- [mention 边界](https://github.com/Xero-Team/xero-bot/pull/22#discussion_r4152319158)：中文和外围 Markdown 标点结束账号 token，`@bot请 review`、括号/加粗中的 `r? @alice` 恢复识别；显式参数支持闭合括号。下划线、路径分隔符、错误 bot 后缀仍作为整个非法账号拒绝，不能按合法前缀触发。
+- [跨段落行内代码](https://github.com/Xero-Team/xero-bot/pull/22#discussion_r4152319167)：只在同一段落内匹配反引号，空行、带空白的空行、CRLF 和已遮罩代码/引用块都终止段落；同段跨行代码仍被屏蔽，并保持 UTF-8 原文字节范围。
+- [`cc` 句末标点](https://github.com/Xero-Team/xero-bot/pull/22#discussion_r4152319174)：显式、裸入口和 `?r ... cc` 组合统一接受句末标点及尾逗号；多余散文、非法名单仍拒绝，分号/换行后的下一条指令不被吞并。
+
+以上三项均先用回归测试复现失败，再修复并验证；另补充了候选来源、解析边界和验收测试的函数文档。
 
 ## 范围边界
 

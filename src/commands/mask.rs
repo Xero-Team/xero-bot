@@ -75,10 +75,21 @@ pub fn mask_noncommand_regions(text: &str) -> String {
         text.len(),
         "masking must preserve byte length or every downstream span breaks"
     );
-    // Inline code can span physical lines. Preserve newlines even inside a
-    // span so mention scopes and argument boundaries cannot be joined.
+    // Code spans may wrap lines inside a paragraph, but cannot cross blank
+    // lines. Include whitespace-only/CRLF lines and lines blanked above: a
+    // fenced block or quotation also interrupts the surrounding paragraph.
     let mut inline_masked = String::with_capacity(out.len());
-    mask_inline_code(&mut inline_masked, &out);
+    let mut paragraph_start = 0;
+    let mut line_start = 0;
+    for line in out.split_inclusive('\n') {
+        if line.trim().is_empty() {
+            mask_inline_code(&mut inline_masked, &out[paragraph_start..line_start]);
+            inline_masked.push_str(line);
+            paragraph_start = line_start + line.len();
+        }
+        line_start += line.len();
+    }
+    mask_inline_code(&mut inline_masked, &out[paragraph_start..]);
     inline_masked
 }
 

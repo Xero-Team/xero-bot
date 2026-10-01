@@ -2,6 +2,7 @@
 use xero_bot::commands::{parse_commands, resolve_commands, Command, SourceForm};
 use xero_bot::config::repository::{CommandId, Comments, RepositoryConfig};
 
+/// Extract semantic candidates for syntax assertions without policy resolution.
 fn candidates(text: &str) -> Vec<Command> {
     parse_commands("bot", text)
         .commands
@@ -10,6 +11,7 @@ fn candidates(text: &str) -> Vec<Command> {
         .collect()
 }
 
+/// Verify complete bare blocks preserve aliases, Unicode labels and argument boundaries.
 #[test]
 fn complete_bare_blocks_accept_aliases_whitespace_and_bounded_arguments() {
     for (text, expected) in [
@@ -57,6 +59,7 @@ fn complete_bare_blocks_accept_aliases_whitespace_and_bounded_arguments() {
     }
 }
 
+/// Keep all parser aliases aligned with canonical policy IDs and mention evidence.
 #[test]
 fn every_registered_alias_produces_the_canonical_id_in_both_forms() {
     for id in CommandId::ALL {
@@ -79,6 +82,7 @@ fn every_registered_alias_produces_the_canonical_id_in_both_forms() {
     }
 }
 
+/// Reject prose and Markdown contamination without extracting ordinary bare words.
 #[test]
 fn bare_prose_and_markup_collisions_are_silent_for_the_entire_comment() {
     for text in [
@@ -94,7 +98,6 @@ fn bare_prose_and_markup_collisions_are_silent_for_the_entire_comment() {
         "cc @alice about this",
         "cc @alice 关于这个",
         "cc @alice @bad_name",
-        "cc @alice,",
         "assign @alice @bob",
         "assign @alice later",
         "; claim",
@@ -145,6 +148,7 @@ fn bare_prose_and_markup_collisions_are_silent_for_the_entire_comment() {
     }
 }
 
+/// Compare explicit and bare parameter validation at each supported separator.
 #[test]
 fn parameters_are_identical_and_never_absorb_the_next_command() {
     for prefix in ["", "@bot "] {
@@ -203,6 +207,7 @@ fn parameters_are_identical_and_never_absorb_the_next_command() {
     }
 }
 
+/// Check approval alias equivalence and fail-closed behavior for malformed targets.
 #[test]
 fn approvals_share_target_grammar_and_never_degrade_after_an_error() {
     for prefix in ["", "@bot "] {
@@ -274,6 +279,7 @@ fn approvals_share_target_grammar_and_never_degrade_after_an_error() {
     assert_eq!(candidates(&format!("r= @{}", "a".repeat(39))).len(), 1);
 }
 
+/// Prove mention scope ends at newlines and never matches a different account.
 #[test]
 fn mention_scope_is_exact_case_insensitive_and_ends_at_newline() {
     let text = "@BoT[BoT] claim; cc @alice\nreview; r+\n@other ping";
@@ -306,6 +312,7 @@ fn mention_scope_is_exact_case_insensitive_and_ends_at_newline() {
     }
 }
 
+/// Retain legacy explicit/symbolic positions when the whole comment is not a block.
 #[test]
 fn symbols_and_explicit_commands_survive_prose_without_extracting_bare_words() {
     for (text, expected) in [
@@ -329,6 +336,7 @@ fn symbols_and_explicit_commands_survive_prose_without_extracting_bare_words() {
     }
 }
 
+/// Ensure fenced, indented and inline code or quotations never invoke commands.
 #[test]
 fn code_and_quotes_never_produce_symbolic_or_explicit_candidates() {
     for text in [
@@ -352,6 +360,7 @@ fn code_and_quotes_never_produce_symbolic_or_explicit_candidates() {
     }
 }
 
+/// Validate byte ranges and compound ancestry against the original Unicode source.
 #[test]
 fn utf8_ranges_and_compound_origins_index_the_original_comment() {
     let text = "中文 K 🎉\n@BoT ?r @alice cc @bob; ping\n?r @carol";
@@ -379,6 +388,7 @@ fn utf8_ranges_and_compound_origins_index_the_original_comment() {
     assert_eq!(out.commands[0].source, SourceForm::BareWord);
 }
 
+/// Ensure denied candidates cannot erase allowed statuses or explicit duplicates.
 #[test]
 fn policy_filters_individual_candidates_before_resolution() {
     let policy = RepositoryConfig::parse("[command_triggers]\nblocked={mode='disabled'}", "codeql")
@@ -419,4 +429,183 @@ fn policy_filters_individual_candidates_before_resolution() {
             .is_err(),
         "even a session cannot bypass always_mention"
     );
+}
+
+/// Review regression: prose and Markdown delimiters terminate a mention,
+/// while account-like suffixes still invalidate the entire account token.
+#[test]
+fn review_mentions_stop_at_prose_and_closing_markup() {
+    for (text, expected, explicit) in [
+        ("@bot请 review", Command::Review, true),
+        ("@BoT[BoT]请 review", Command::Review, true),
+        (
+            "(r? @alice)",
+            Command::RequestReview {
+                user: "alice".into(),
+            },
+            false,
+        ),
+        (
+            "**r? @alice**",
+            Command::RequestReview {
+                user: "alice".into(),
+            },
+            false,
+        ),
+        (
+            "r? @alice）",
+            Command::RequestReview {
+                user: "alice".into(),
+            },
+            false,
+        ),
+        (
+            "@bot assign @alice)",
+            Command::Assign {
+                user: "alice".into(),
+            },
+            true,
+        ),
+        (
+            "（@bot assign @alice）",
+            Command::Assign {
+                user: "alice".into(),
+            },
+            true,
+        ),
+    ] {
+        let out = parse_commands("bot", text);
+        assert_eq!(candidates(text), vec![expected], "{text}: {out:?}");
+        assert!(out.diagnostics.is_empty(), "{text}: {out:?}");
+        assert_eq!(out.commands[0].is_explicit(), explicit, "{text}");
+        assert!(text.get(out.commands[0].span.clone()).is_some());
+        if let Some(span) = &out.commands[0].mention_span {
+            assert!(matches!(&text[span.clone()], "@bot" | "@BoT[BoT]"));
+        }
+    }
+    for account in [
+        "bot_extra",
+        "bot[bot]extra",
+        "bot[other]",
+        "bot/other",
+        "bot\\other",
+        "bottle",
+    ] {
+        assert!(
+            candidates(&format!("@{account} ping")).is_empty(),
+            "{account}"
+        );
+    }
+    for suffix in [
+        "_bad",
+        "[bot]",
+        "/other",
+        "\\other",
+        "--bad",
+        " extra",
+        "。请审查",
+        ") @bob",
+    ] {
+        for verb in ["assign", "r=", "r+ as", "r+"] {
+            let text = format!("@bot {verb} @alice{suffix}");
+            let out = parse_commands("bot", &text);
+            assert!(
+                out.commands.is_empty() && !out.diagnostics.is_empty(),
+                "{text}: {out:?}"
+            );
+        }
+    }
+}
+
+/// Review regression: multiline code stays masked within a paragraph, but a
+/// literal backtick cannot hide commands across blank lines or masked blocks.
+#[test]
+fn review_inline_code_cannot_cross_paragraph_boundaries() {
+    for boundary in [
+        "\n\n",
+        "\n \t\n",
+        "\r\n\r\n",
+        "\r\n \t\r\n",
+        "\n```\ncode\n```\n",
+        "\n> quotation\n",
+    ] {
+        let text = format!("Press the ` key.{boundary}@bot r+{boundary}See `foo`.");
+        let out = parse_commands("bot", &text);
+        assert_eq!(
+            candidates(&text),
+            vec![Command::Approve { on_behalf_of: None }],
+            "{text}: {out:?}"
+        );
+        assert!(out.diagnostics.is_empty(), "{text}: {out:?}");
+        assert_eq!(&text[out.commands[0].span.clone()], "r+");
+        assert_eq!(&text[out.commands[0].mention_span.clone().unwrap()], "@bot");
+    }
+    for newline in ["\n", "\r\n"] {
+        let text = format!("`跨行{newline}@bot r+{newline}代码`");
+        let out = parse_commands("bot", &text);
+        assert!(
+            out.commands.is_empty() && out.diagnostics.is_empty(),
+            "{text}: {out:?}"
+        );
+    }
+    assert!(
+        candidates("claim\n\n`code`").is_empty(),
+        "paragraph processing must not fabricate bare blocks"
+    );
+}
+
+/// Review regression: cc shares the sentence suffix grammar without accepting
+/// prose, malformed recipients, or swallowing the next command's parameters.
+#[test]
+fn review_cc_accepts_sentence_suffixes_in_all_entry_points() {
+    for prefix in ["", "@bot ", "?r @carol "] {
+        for users in ["@alice", "@alice,@bob", "@alice @bob"] {
+            let expected_users = if users.contains("@bob") {
+                vec!["alice".into(), "bob".into()]
+            } else {
+                vec!["alice".into()]
+            };
+            for suffix in [".", "。", "!", ",", "，！", " . ! 。", ", ."] {
+                for next in ["", "; assign @dave", "\nassign @dave"] {
+                    let text = format!("{prefix}cc {users}{suffix}{next}");
+                    let out = parse_commands("bot", &text);
+                    let mut expected = Vec::new();
+                    if prefix.starts_with("?r") {
+                        expected.extend([
+                            Command::Ready,
+                            Command::RequestReview {
+                                user: "carol".into(),
+                            },
+                        ]);
+                    }
+                    expected.push(Command::Cc {
+                        users: expected_users.clone(),
+                    });
+                    if !next.is_empty() {
+                        expected.push(Command::Assign {
+                            user: "dave".into(),
+                        });
+                    }
+                    assert_eq!(candidates(&text), expected, "{text}: {out:?}");
+                    assert!(out.diagnostics.is_empty(), "{text}: {out:?}");
+                }
+            }
+        }
+        for bad in [
+            "@alice. about this",
+            "@alice。请看",
+            "@alice! @bob",
+            "@alice, junk",
+            "@alice,@bad_name",
+            "@alice @bob/other",
+        ] {
+            let text = format!("{prefix}cc {bad}");
+            assert!(
+                candidates(&text)
+                    .iter()
+                    .all(|c| !matches!(c, Command::Cc { .. })),
+                "{text}"
+            );
+        }
+    }
 }

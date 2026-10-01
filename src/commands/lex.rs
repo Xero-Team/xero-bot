@@ -158,9 +158,10 @@ impl<'a> Lexer<'a> {
     fn lex_at(&mut self, start: usize) {
         self.chars.next(); // '@'
         let name_start = start + 1;
-        // Read the whole account token: a valid prefix of @bot_extra or
-        // @bot[bot]other must never be mistaken for the configured bot.
-        let end = self.take_while(|c| !c.is_whitespace() && !";@,.!:?。，！：？、".contains(c));
+        // Keep account-like continuations so @bot_extra, @bot[bot]other
+        // and @alice/path cannot pass as a valid prefix. Prose and surrounding
+        // Markdown punctuation end the token, as in @bot请 or (r? @alice).
+        let end = self.take_while(|c| c.is_ascii_alphanumeric() || "-_[]/\\".contains(c));
         let raw = &self.text[name_start..end];
         let lower = raw.to_ascii_lowercase();
         let name = lower.strip_suffix("[bot]").unwrap_or(&lower);

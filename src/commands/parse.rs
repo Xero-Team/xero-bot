@@ -30,19 +30,23 @@ pub struct ParsedCommand {
 }
 
 impl ParsedCommand {
+    /// Return the canonical identity shared by parser aliases and repository policy.
     pub fn id(&self) -> CommandId {
         self.command.id()
     }
 
+    /// Report real bot-mention evidence for the per-candidate trigger gate.
     pub fn is_explicit(&self) -> bool {
         self.mention_span.is_some()
     }
 
+    /// Expose PR applicability without discarding candidate source information.
     pub fn requires_pr(&self) -> bool {
         self.command.requires_pr()
     }
 }
 
+/// Map all registered zero-argument word aliases to their semantic command.
 fn nullary(word: &str) -> Option<Command> {
     Some(match CommandId::from_name(word)? {
         CommandId::Ping => Command::Ping,
@@ -66,6 +70,7 @@ pub struct Parsed {
     pub diagnostics: Vec<Diagnostic>,
 }
 
+/// Try a complete unmasked command block before scanning independent entry points.
 pub(super) fn parse(tokens: &[Token], text: &str, unmasked: bool) -> Parsed {
     if unmasked {
         let mut block = Parser::new(tokens, text, true);
@@ -91,6 +96,7 @@ struct Parser<'a> {
 }
 
 impl<'a> Parser<'a> {
+    /// Initialize a strict block attempt or a permissive explicit/symbolic scan.
     fn new(toks: &'a [Token], text: &'a str, strict: bool) -> Self {
         Self {
             toks,
@@ -104,6 +110,7 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Return uncollapsed candidates and their syntax diagnostics to the caller.
     fn finish(self) -> Parsed {
         Parsed {
             commands: self.commands,
@@ -111,6 +118,7 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Walk the input once, retaining ordinary bare words only in a complete block.
     fn program(&mut self) {
         while self.pos < self.toks.len() {
             let before = self.pos;
@@ -146,10 +154,12 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Inspect the next token without advancing past a command boundary.
     fn peek(&self) -> Option<&'a Tok> {
         self.toks.get(self.pos).map(|t| &t.tok)
     }
 
+    /// Locate the current token, or anchor an EOF diagnostic to the final token.
     fn span(&self) -> Range<usize> {
         self.toks
             .get(self.pos)
@@ -158,10 +168,12 @@ impl<'a> Parser<'a> {
             .unwrap_or(0..0)
     }
 
+    /// Recognize an approval attempt at the start of a line or semicolon item.
     fn segment_start(&self) -> bool {
         self.pos == 0 || matches!(self.toks[self.pos - 1].tok, Tok::Newline | Tok::Semi)
     }
 
+    /// Distinguish a line addressing the bot from a mention embedded in prose.
     fn addressed_at(&self, mention: usize) -> bool {
         self.toks[..mention]
             .iter()
@@ -170,6 +182,7 @@ impl<'a> Parser<'a> {
             .all(|t| matches!(t.tok, Tok::Punct))
     }
 
+    /// Stop parameters at a new bot mention, semicolon, newline or end of input.
     fn at_boundary(&self) -> bool {
         matches!(
             self.peek(),
@@ -177,6 +190,7 @@ impl<'a> Parser<'a> {
         )
     }
 
+    /// Discard an invalid argument tail without consuming the following command.
     fn skip_tail(&mut self) {
         while !self.at_boundary() {
             self.pos += 1;
@@ -196,6 +210,7 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Skip conversational punctuation/prose and remember whether prose occurred.
     fn skip_filler(&mut self) -> bool {
         let mut prose = false;
         while let Some(t @ (Tok::Punct | Tok::Prose)) = self.peek() {
@@ -205,6 +220,7 @@ impl<'a> Parser<'a> {
         prose
     }
 
+    /// Attach original byte ranges and mention evidence to a semantic candidate.
     fn emit(&mut self, command: Command, start: usize, source: SourceForm) {
         let end = self.toks[self.pos.saturating_sub(1)].span.end;
         self.commands.push(ParsedCommand {
@@ -216,6 +232,7 @@ impl<'a> Parser<'a> {
         });
     }
 
+    /// Invalidate this block attempt and diagnose a required argument.
     fn missing(&mut self, verb: &'static str, expected: Expected) {
         self.complete = false;
         self.diagnostics.push(Diagnostic::MissingArgument {
@@ -225,6 +242,7 @@ impl<'a> Parser<'a> {
         });
     }
 
+    /// Reject the entire argument tail so partial parameters cannot execute.
     fn extra(&mut self, verb: &'static str) {
         self.complete = false;
         self.diagnostics.push(Diagnostic::ExtraArguments {
@@ -258,12 +276,13 @@ impl<'a> Parser<'a> {
     }
 
     /// Preserve the existing sentence-punctuation suffix, but never discard
-    /// words, extra users, markup, or malformed login continuations.
+    /// words, extra users, or malformed login continuations. Explicit commands
+    /// may also finish at a closing parenthesis in the surrounding prose.
     fn end_arguments(&mut self, verb: &'static str) -> bool {
         while matches!(self.peek(), Some(Tok::Punct))
-            && self.text[self.span()]
-                .chars()
-                .all(|c| ".,!:?。，！：？、".contains(c))
+            && self.text[self.span()].chars().all(|c| {
+                ".,!:?。，！：？、".contains(c) || (self.mention.is_some() && ")）".contains(c))
+            })
         {
             self.pos += 1;
         }
@@ -291,6 +310,13 @@ impl<'a> Parser<'a> {
             }
             if matches!(self.peek(), Some(Tok::Punct)) && &self.text[self.span()] == "," {
                 self.pos += 1;
+                // A comma separates recipients only when a recipient follows.
+                // Otherwise it is sentence punctuation, including at EOF.
+                if !matches!(self.peek(), Some(Tok::User(_) | Tok::RawUser(_))) {
+                    return self.end_arguments("cc").then_some(users);
+                }
+            } else if matches!(self.peek(), Some(Tok::Punct)) {
+                return self.end_arguments("cc").then_some(users);
             } else if !matches!(self.peek(), Some(Tok::User(_) | Tok::RawUser(_)))
                 || self.toks[self.pos - 1].span.end == self.span().start
             {
@@ -300,6 +326,7 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Apply one real bot mention to semicolon-separated commands on its line.
     fn mention_command(&mut self) {
         let addressed = self.addressed_at(self.pos);
         self.mention = Some(self.span());
@@ -318,6 +345,7 @@ impl<'a> Parser<'a> {
         self.mention = None;
     }
 
+    /// Parse one command using strict block or explicit conversational syntax.
     fn verb_tail(&mut self, addressed: bool) {
         let after_prose = if self.strict {
             false
@@ -413,6 +441,7 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Require exactly one assign/reviewer target and a valid command ending.
     fn single_user(&mut self, verb: &'static str, start: usize, source: SourceForm) {
         let user = self.user_arg(verb);
         let valid_end = self.end_arguments(verb);
@@ -426,6 +455,7 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Accept a complete list of signed labels, rejecting partially valid lists.
     fn label_args(&mut self, start: usize, source: SourceForm) {
         let mut add = Vec::new();
         let mut remove = Vec::new();
@@ -490,6 +520,7 @@ impl<'a> Parser<'a> {
         );
     }
 
+    /// Expand the ready/reviewer/cc shorthand with shared compound provenance.
     fn short_ready(&mut self) {
         let start = self.span().start;
         let first = self.commands.len();
