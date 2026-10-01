@@ -1,46 +1,49 @@
-//! Stage 3: recursive descent over the token stream.
-//!
-//! Grammar:
-//!
-//! ```text
-//! program   := item*
-//! item      := command | <advance one token>
-//! command   := Bot verb_tail (Semi verb_tail)*
-//!            | ShortReady short_args
-//!            | ReviewReq user_arg               -- bare `r? @user`
-//! verb_tail := Word(v) args_for(v)
-//!            | ReviewReq user_arg
-//!            | Approve approve_args
-//!            | Reject
-//! ```
-//!
-//! Two rules do most of the work:
-//!
-//! * Every argument loop stops at `Bot`, `Semi` or `Newline`. That one rule is
-//!   what bounds a command's arguments — the old parser let them run to the end
-//!   of the comment, so `@bot cc @a` collected every later `@mention` and
-//!   `@bot label +x` collected every later `+tok`.
-//! * `?r`, `r?`, `r+` and `r-` arrive as distinct token kinds, so no two
-//!   readings can claim the same text. The old scanner ran three regex passes
-//!   that avoided each other with a four-character window, which double-fired
-//!   on `@bot[bot] r? @alice` and silently dropped `@bot, r? @alice`.
+//! Parse candidates without applying trigger policy, deduplication or conflicts.
+//! Ordinary bare words require an entirely valid command block. If that check
+//! fails, only explicit mentions and existing symbolic entry points are scanned.
 
 use std::ops::Range;
 
 use super::diag::{Diagnostic, Expected};
 use super::lex::{is_valid_label, Tok, Token};
 use super::Command;
+use crate::config::repository::CommandId;
 
-/// A command plus where it appeared, so execution order follows the text.
+/// How the command was written, independent of whether policy permits it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceForm {
+    ExplicitMention,
+    BareWord,
+    Symbol,
+}
+
+/// All offsets are byte ranges into the original, unmodified comment.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ParsedCommand {
     pub command: Command,
-    pub start: usize,
+    pub span: Range<usize>,
+    pub source: SourceForm,
+    /// The actual bot mention governing this candidate; never crosses a newline.
+    pub mention_span: Option<Range<usize>>,
+    /// Shared range of the `?r ...` expression that generated these candidates.
+    pub compound_span: Option<Range<usize>>,
 }
 
-/// Verbs taking no arguments, and the command each produces.
+impl ParsedCommand {
+    pub fn id(&self) -> CommandId {
+        self.command.id()
+    }
+
+    pub fn is_explicit(&self) -> bool {
+        self.mention_span.is_some()
+    }
+
+    pub fn requires_pr(&self) -> bool {
+        self.command.requires_pr()
+    }
+}
+
 fn nullary(word: &str) -> Option<Command> {
-    use crate::config::repository::CommandId;
     Some(match CommandId::from_name(word)? {
         CommandId::Ping => Command::Ping,
         CommandId::Help => Command::Help,
@@ -56,7 +59,6 @@ fn nullary(word: &str) -> Option<Command> {
     })
 }
 
-/// Every verb the parser knows, for "did you mean" suggestions.
 pub use crate::config::repository::WORD_ALIASES as VERBS;
 
 pub struct Parsed {
@@ -64,45 +66,85 @@ pub struct Parsed {
     pub diagnostics: Vec<Diagnostic>,
 }
 
-pub fn parse(tokens: &[Token]) -> Parsed {
-    let mut p = Parser {
-        toks: tokens,
-        pos: 0,
-        commands: Vec::new(),
-        diagnostics: Vec::new(),
-    };
-    p.program();
-    Parsed {
-        commands: p.commands,
-        diagnostics: p.diagnostics,
+pub(super) fn parse(tokens: &[Token], text: &str, unmasked: bool) -> Parsed {
+    if unmasked {
+        let mut block = Parser::new(tokens, text, true);
+        block.program();
+        if block.complete && block.diagnostics.is_empty() {
+            return block.finish();
+        }
     }
+    let mut scan = Parser::new(tokens, text, false);
+    scan.program();
+    scan.finish()
 }
 
 struct Parser<'a> {
     toks: &'a [Token],
+    text: &'a str,
     pos: usize,
+    strict: bool,
+    complete: bool,
+    mention: Option<Range<usize>>,
     commands: Vec<ParsedCommand>,
     diagnostics: Vec<Diagnostic>,
 }
 
 impl<'a> Parser<'a> {
+    fn new(toks: &'a [Token], text: &'a str, strict: bool) -> Self {
+        Self {
+            toks,
+            text,
+            pos: 0,
+            strict,
+            complete: true,
+            mention: None,
+            commands: Vec::new(),
+            diagnostics: Vec::new(),
+        }
+    }
+
+    fn finish(self) -> Parsed {
+        Parsed {
+            commands: self.commands,
+            diagnostics: self.diagnostics,
+        }
+    }
+
     fn program(&mut self) {
         while self.pos < self.toks.len() {
             let before = self.pos;
-            match &self.toks[self.pos].tok {
-                Tok::Bot => self.mention_command(),
-                Tok::ShortReady => self.short_ready(),
-                Tok::ReviewReq => self.bare_review_request(),
+            match self.peek() {
+                Some(Tok::Bot) => self.mention_command(),
+                Some(Tok::ShortReady) => self.short_ready(),
+                Some(Tok::ReviewReq) if !self.strict => self.bare_review_request(),
+                Some(Tok::Semi) => {
+                    if self.strict && self.segment_start() {
+                        self.complete = false;
+                    }
+                    self.pos += 1;
+                }
+                Some(Tok::Newline) => self.pos += 1,
+                Some(Tok::Approve | Tok::ApproveAs | Tok::Reject)
+                    if self.strict || self.segment_start() =>
+                {
+                    let before = self.commands.len();
+                    self.verb_tail(false);
+                    // Outside a complete block, approval symbols still warrant
+                    // syntax diagnostics but cannot produce bare candidates.
+                    if !self.strict {
+                        self.commands.truncate(before);
+                    }
+                }
+                _ if self.strict => self.verb_tail(false),
                 _ => self.pos += 1,
             }
-            // Guarantee forward progress even if a branch declines to consume.
             if self.pos == before {
+                self.complete = false;
                 self.pos += 1;
             }
         }
     }
-
-    // --- helpers ---------------------------------------------------------
 
     fn peek(&self) -> Option<&'a Tok> {
         self.toks.get(self.pos).map(|t| &t.tok)
@@ -116,13 +158,10 @@ impl<'a> Parser<'a> {
             .unwrap_or(0..0)
     }
 
-    /// True when the mention at `mention` opens its line, ignoring punctuation
-    /// such as a list bullet.
-    ///
-    /// This is what separates an address to the bot from a reference to it. Both
-    /// execute verbs — `@bot cc @a @bot assign @b` has always worked — but only
-    /// an address may be told off for an unrecognised word. Otherwise
-    /// `cc @bot about this` answers "`about` 不是命令".
+    fn segment_start(&self) -> bool {
+        self.pos == 0 || matches!(self.toks[self.pos - 1].tok, Tok::Newline | Tok::Semi)
+    }
+
     fn addressed_at(&self, mention: usize) -> bool {
         self.toks[..mention]
             .iter()
@@ -131,20 +170,32 @@ impl<'a> Parser<'a> {
             .all(|t| matches!(t.tok, Tok::Punct))
     }
 
-    /// True at a hard command boundary: a new mention, a `;`, or end of line.
     fn at_boundary(&self) -> bool {
         matches!(
             self.peek(),
-            None | Some(Tok::Bot) | Some(Tok::Semi) | Some(Tok::Newline)
+            None | Some(Tok::Bot | Tok::Semi | Tok::Newline)
         )
     }
 
-    /// Skip filler inside a command's arguments. Punctuation between arguments
-    /// is not meaningful, so `cc @a, @b` works.
-    ///
-    /// Returns whether any of it was prose. Callers that report a mistake use
-    /// that to stay quiet: an unknown word is a typo when it sits right after
-    /// the mention and just a word when a sentence got there first.
+    fn skip_tail(&mut self) {
+        while !self.at_boundary() {
+            self.pos += 1;
+        }
+    }
+
+    /// Conversational mention tails may still contain the legacy anywhere
+    /// shortcuts. Parameter errors use skip_tail instead, so malformed arguments
+    /// cannot manufacture another command.
+    fn scan_symbolic_tail(&mut self) {
+        while !self.at_boundary() {
+            match self.peek() {
+                Some(Tok::ShortReady) => self.short_ready(),
+                Some(Tok::ReviewReq) => self.bare_review_request(),
+                _ => self.pos += 1,
+            }
+        }
+    }
+
     fn skip_filler(&mut self) -> bool {
         let mut prose = false;
         while let Some(t @ (Tok::Punct | Tok::Prose)) = self.peek() {
@@ -154,344 +205,331 @@ impl<'a> Parser<'a> {
         prose
     }
 
-    fn emit(&mut self, command: Command, start: usize) {
-        self.commands.push(ParsedCommand { command, start });
+    fn emit(&mut self, command: Command, start: usize, source: SourceForm) {
+        let end = self.toks[self.pos.saturating_sub(1)].span.end;
+        self.commands.push(ParsedCommand {
+            command,
+            span: start..end,
+            source,
+            mention_span: self.mention.clone(),
+            compound_span: None,
+        });
     }
 
-    /// Consume the next argument as a login, reporting why if it isn't one.
+    fn missing(&mut self, verb: &'static str, expected: Expected) {
+        self.complete = false;
+        self.diagnostics.push(Diagnostic::MissingArgument {
+            verb,
+            expected,
+            span: self.span(),
+        });
+    }
+
+    fn extra(&mut self, verb: &'static str) {
+        self.complete = false;
+        self.diagnostics.push(Diagnostic::ExtraArguments {
+            verb,
+            span: self.span(),
+        });
+        self.skip_tail();
+    }
+
+    /// Parameters never skip prose/punctuation to find a later login.
     fn user_arg(&mut self, verb: &'static str) -> Option<String> {
-        self.skip_filler();
-        match self.peek() {
+        match self.peek().cloned() {
             Some(Tok::User(u)) => {
-                let u = u.clone();
                 self.pos += 1;
                 Some(u)
             }
             Some(Tok::RawUser(raw)) => {
-                let raw = raw.clone();
-                let span = self.span();
+                self.complete = false;
+                self.diagnostics.push(Diagnostic::InvalidLogin {
+                    raw,
+                    span: self.span(),
+                });
                 self.pos += 1;
-                self.diagnostics
-                    .push(Diagnostic::InvalidLogin { raw, span });
                 None
             }
             _ => {
-                self.diagnostics.push(Diagnostic::MissingArgument {
-                    verb,
-                    expected: Expected::User,
-                    span: self.span(),
-                });
+                self.missing(verb, Expected::User);
                 None
             }
         }
     }
 
-    /// Collect logins up to the next boundary.
-    fn user_list(&mut self) -> Vec<String> {
-        let mut users = Vec::new();
-        while !self.at_boundary() {
-            match self.peek() {
-                Some(Tok::User(u)) => {
-                    let u = u.clone();
-                    if !users.contains(&u) {
-                        users.push(u);
-                    }
-                    self.pos += 1;
-                }
-                Some(Tok::RawUser(raw)) => {
-                    let raw = raw.clone();
-                    let span = self.span();
-                    self.pos += 1;
-                    self.diagnostics
-                        .push(Diagnostic::InvalidLogin { raw, span });
-                }
-                _ => self.pos += 1,
-            }
+    /// Preserve the existing sentence-punctuation suffix, but never discard
+    /// words, extra users, markup, or malformed login continuations.
+    fn end_arguments(&mut self, verb: &'static str) -> bool {
+        while matches!(self.peek(), Some(Tok::Punct))
+            && self.text[self.span()]
+                .chars()
+                .all(|c| ".,!:?。，！：？、".contains(c))
+        {
+            self.pos += 1;
         }
-        users
+        if self.at_boundary() {
+            true
+        } else {
+            self.extra(verb);
+            false
+        }
     }
 
-    // --- productions -----------------------------------------------------
+    /// Exactly one or more logins, optionally separated by commas.
+    fn user_list(&mut self) -> Option<Vec<String>> {
+        let mut users: Vec<String> = Vec::new();
+        loop {
+            let Some(user) = self.user_arg("cc") else {
+                self.skip_tail();
+                return None;
+            };
+            if !users.iter().any(|u| u.eq_ignore_ascii_case(&user)) {
+                users.push(user);
+            }
+            if self.at_boundary() {
+                return Some(users);
+            }
+            if matches!(self.peek(), Some(Tok::Punct)) && &self.text[self.span()] == "," {
+                self.pos += 1;
+            } else if !matches!(self.peek(), Some(Tok::User(_) | Tok::RawUser(_)))
+                || self.toks[self.pos - 1].span.end == self.span().start
+            {
+                self.extra("cc");
+                return None;
+            }
+        }
+    }
 
-    /// `Bot verb_tail (Semi verb_tail)*`
-    ///
-    /// A mention's scope covers the rest of its line; `;` starts another
-    /// command inside it, so one mention can carry several.
     fn mention_command(&mut self) {
         let addressed = self.addressed_at(self.pos);
-        self.pos += 1; // Bot
+        self.mention = Some(self.span());
+        self.pos += 1;
         loop {
             self.verb_tail(addressed);
             if matches!(self.peek(), Some(Tok::Semi)) {
                 self.pos += 1;
-                // A trailing `;` with nothing after it is harmless.
                 if self.at_boundary() {
                     break;
                 }
-                continue;
+            } else {
+                break;
             }
-            break;
         }
+        self.mention = None;
     }
 
-    /// Parse one verb in a bot mention's scope, keeping malformed approvals non-executable.
     fn verb_tail(&mut self, addressed: bool) {
-        // Leading punctuation after the mention is not an error: `@bot, ping`
-        // and `@bot: ping` are what people actually type. Prose is skipped too —
-        // `@bot 请 review 一下` should still run — but it's remembered, because
-        // it decides whether an unrecognised word counts as a typo.
-        let after_prose = self.skip_filler();
+        let after_prose = if self.strict {
+            false
+        } else {
+            self.skip_filler()
+        };
         let start = self.span().start;
-
         match self.peek().cloned() {
             Some(Tok::Word(word)) => {
                 self.pos += 1;
-                self.verb_with_args(&word, start, addressed && !after_prose);
-            }
-            Some(Tok::ReviewReq) => {
-                self.pos += 1;
-                if let Some(user) = self.user_arg("r?") {
-                    self.emit(Command::RequestReview { user }, start);
-                }
-            }
-            Some(Tok::Approve) => {
-                self.pos += 1;
-                self.approve_args(start);
-            }
-            Some(Tok::ApproveAs) => {
-                self.pos += 1;
-                // Only the explicit alias is introduced here. Bare syntax and
-                // the broader approval grammar migration belong to #12.
-                match self.peek().cloned() {
-                    Some(Tok::User(user)) => {
-                        self.pos += 1;
-                        // Sentence punctuation is harmless; prose and extra
-                        // arguments must still invalidate the whole approval.
-                        while matches!(self.peek(), Some(Tok::Punct)) {
-                            self.pos += 1;
-                        }
-                        if self.at_boundary() {
-                            self.emit(
-                                Command::Approve {
-                                    on_behalf_of: Some(user),
-                                },
-                                start,
-                            );
-                        } else {
-                            self.diagnostics.push(Diagnostic::ExtraArguments {
-                                verb: "r=",
+                let source = if self.mention.is_some() {
+                    SourceForm::ExplicitMention
+                } else {
+                    SourceForm::BareWord
+                };
+                if let Some(cmd) = nullary(&word) {
+                    if self.strict
+                        && (!self.at_boundary()
+                            || (self.mention.is_none() && matches!(self.peek(), Some(Tok::Bot))))
+                    {
+                        self.complete = false;
+                        self.skip_tail();
+                        return;
+                    }
+                    // Explicit nullary commands retain their conversational syntax.
+                    // The span covers the command, not the ignored prose following it.
+                    self.emit(cmd, start, source);
+                    if !self.strict {
+                        if self.toks[self.pos..]
+                            .iter()
+                            .take_while(|t| !matches!(t.tok, Tok::Bot | Tok::Semi | Tok::Newline))
+                            .any(|t| matches!(t.tok, Tok::User(_) | Tok::Plus(_) | Tok::Minus(_)))
+                        {
+                            self.diagnostics.push(Diagnostic::IgnoredArguments {
+                                verb: VERBS.iter().copied().find(|v| *v == word).unwrap(),
                                 span: self.span(),
                             });
                         }
+                        self.scan_symbolic_tail();
                     }
-                    Some(Tok::RawUser(raw)) => {
-                        self.diagnostics.push(Diagnostic::InvalidLogin {
-                            raw,
-                            span: self.span(),
-                        });
-                    }
-                    _ => self.diagnostics.push(Diagnostic::MissingArgument {
-                        verb: "r=",
-                        expected: Expected::User,
-                        span: self.span(),
-                    }),
+                    return;
                 }
-                // Invalid targets/extra arguments must not become other commands.
-                while !self.at_boundary() {
-                    self.pos += 1;
+                // A word command needs whitespace before its first argument:
+                // an email-shaped `cc@alice` is not an instruction.
+                if matches!(
+                    CommandId::from_name(&word),
+                    Some(CommandId::Cc | CommandId::Assign | CommandId::Label)
+                ) && !self.at_boundary()
+                    && self.toks[self.pos - 1].span.end == self.span().start
+                {
+                    self.extra(CommandId::from_name(&word).unwrap().name());
+                    return;
+                }
+                match CommandId::from_name(&word) {
+                    Some(CommandId::Cc) => {
+                        if let Some(users) = self.user_list() {
+                            self.emit(Command::Cc { users }, start, source);
+                        }
+                    }
+                    Some(CommandId::Assign) => self.single_user("assign", start, source),
+                    Some(CommandId::Label) => self.label_args(start, source),
+                    _ => {
+                        self.complete = false;
+                        if addressed && !after_prose {
+                            self.diagnostics.push(Diagnostic::unknown_verb(
+                                word,
+                                self.toks[self.pos - 1].span.clone(),
+                            ));
+                        }
+                        if self.strict {
+                            self.skip_tail();
+                        } else {
+                            self.scan_symbolic_tail();
+                        }
+                    }
                 }
             }
+            Some(Tok::ReviewReq) => {
+                self.pos += 1;
+                self.single_user("r?", start, SourceForm::Symbol);
+            }
+            Some(Tok::Approve | Tok::ApproveAs) => self.approve_args(),
             Some(Tok::Reject) => {
                 self.pos += 1;
-                self.emit(Command::Reject, start);
-            }
-            // A mention with nothing command-like after it. Staying silent here
-            // is deliberate: `@bot 谢谢!` must not draw a reply. Only a word
-            // that looks like a verb attempt earns a diagnostic, which is
-            // decided in `verb_with_args`.
-            _ => {}
-        }
-    }
-
-    /// `may_complain` gates only the unknown-word diagnostic. A verb the parser
-    /// does recognise is a clear enough signal on its own, so its own problems
-    /// (a missing argument, a bad login) are always reported.
-    fn verb_with_args(&mut self, word: &str, start: usize, may_complain: bool) {
-        if let Some(cmd) = nullary(word) {
-            self.reject_extra_args(word, start);
-            self.emit(cmd, start);
-            return;
-        }
-        use crate::config::repository::CommandId;
-        match CommandId::from_name(word) {
-            Some(CommandId::Cc) => {
-                let users = self.user_list();
-                if users.is_empty() {
-                    self.diagnostics.push(Diagnostic::MissingArgument {
-                        verb: "cc",
-                        expected: Expected::Users,
-                        span: self.span(),
-                    });
-                } else {
-                    self.emit(Command::Cc { users }, start);
+                if self.end_arguments("r-") {
+                    self.emit(Command::Reject, start, SourceForm::Symbol);
                 }
             }
-            Some(CommandId::Assign) => {
-                if let Some(user) = self.user_arg("assign") {
-                    self.emit(Command::Assign { user }, start);
-                }
-            }
-            Some(CommandId::Label) => self.label_args(start),
+            Some(Tok::ShortReady) => self.short_ready(),
             _ => {
-                // An unknown word directly after a mention that opens the line
-                // is a typo worth naming. Anything looser is noise:
-                // `@bot 这个 PR 很好` must not be answered with
-                // "`pr` 不是命令,是否想用 `cc`?".
-                if may_complain {
-                    self.diagnostics.push(Diagnostic::unknown_verb(
-                        word.to_string(),
-                        self.toks[self.pos.saturating_sub(1)].span.clone(),
-                    ));
-                }
+                self.complete = false;
             }
         }
     }
 
-    fn label_args(&mut self, start: usize) {
+    fn single_user(&mut self, verb: &'static str, start: usize, source: SourceForm) {
+        let user = self.user_arg(verb);
+        let valid_end = self.end_arguments(verb);
+        if let (Some(user), true) = (user, valid_end) {
+            let cmd = if verb == "assign" {
+                Command::Assign { user }
+            } else {
+                Command::RequestReview { user }
+            };
+            self.emit(cmd, start, source);
+        }
+    }
+
+    fn label_args(&mut self, start: usize, source: SourceForm) {
         let mut add = Vec::new();
         let mut remove = Vec::new();
+        let mut valid = true;
         while !self.at_boundary() {
             match self.peek().cloned() {
-                Some(Tok::Plus(name)) => {
-                    let span = self.span();
-                    self.pos += 1;
-                    if is_valid_label(&name) {
+                Some(Tok::Plus(name) | Tok::Minus(name)) => {
+                    if !is_valid_label(&name) {
+                        valid = false;
+                        self.diagnostics.push(Diagnostic::InvalidLabel {
+                            raw: name,
+                            span: self.span(),
+                        });
+                    } else if matches!(self.peek(), Some(Tok::Plus(_))) {
                         add.push(name);
                     } else {
-                        self.diagnostics
-                            .push(Diagnostic::InvalidLabel { raw: name, span });
-                    }
-                }
-                Some(Tok::Minus(name)) => {
-                    let span = self.span();
-                    self.pos += 1;
-                    if is_valid_label(&name) {
                         remove.push(name);
-                    } else {
-                        self.diagnostics
-                            .push(Diagnostic::InvalidLabel { raw: name, span });
                     }
+                    self.pos += 1;
                 }
-                _ => self.pos += 1,
+                _ => {
+                    self.extra("label");
+                    valid = false;
+                }
             }
         }
         if add.is_empty() && remove.is_empty() {
-            self.diagnostics.push(Diagnostic::MissingArgument {
-                verb: "label",
-                expected: Expected::Labels,
-                span: self.span(),
-            });
-        } else {
-            self.emit(Command::Label { add, remove }, start);
+            self.missing("label", Expected::Labels);
+        } else if valid {
+            self.emit(Command::Label { add, remove }, start, source);
         }
+        self.complete &= valid;
     }
 
-    /// `r+`, `r+ @user`, `r+ as @user`
-    fn approve_args(&mut self, start: usize) {
-        self.skip_filler();
-        if matches!(self.peek(), Some(Tok::As)) {
+    /// All three spellings share exactly the same target/tail validation.
+    fn approve_args(&mut self) {
+        let start = self.span().start;
+        let required = matches!(self.peek(), Some(Tok::ApproveAs));
+        let verb = if required { "r=" } else { "r+" };
+        self.pos += 1;
+        let has_as = matches!(self.peek(), Some(Tok::As));
+        if has_as && !required {
             self.pos += 1;
         }
-        self.skip_filler();
-        let on_behalf_of = match self.peek() {
-            Some(Tok::User(u)) => {
-                let u = u.clone();
-                self.pos += 1;
-                Some(u)
+        let target = if required || has_as || !self.at_boundary() {
+            // Plain r+ is valid only when it really has no target arguments.
+            let user = self.user_arg(verb);
+            let valid_end = self.end_arguments(verb);
+            match (user, valid_end) {
+                (Some(user), true) => Some(user),
+                _ => return,
             }
-            Some(Tok::RawUser(raw)) => {
-                let raw = raw.clone();
-                let span = self.span();
-                self.pos += 1;
-                self.diagnostics
-                    .push(Diagnostic::InvalidLogin { raw, span });
-                None
-            }
-            _ => None,
+        } else {
+            None
         };
-        self.emit(Command::Approve { on_behalf_of }, start);
+        self.emit(
+            Command::Approve {
+                on_behalf_of: target,
+            },
+            start,
+            SourceForm::Symbol,
+        );
     }
 
-    /// `?r`, `?r @user`, `?r cc @a @b`, `?r @user cc @b`
-    ///
-    /// `@user` requests review from that user — it used to be dropped in
-    /// silence, so `?r @alice` only set the label and looked broken.
     fn short_ready(&mut self) {
         let start = self.span().start;
-        self.pos += 1; // ?r
-        self.emit(Command::Ready, start);
-
-        self.skip_filler();
-        // A reviewer, if one was named. `?r` requires the `@` sigil, unlike the
-        // bare `r?` form, so a following bare word stays available for verbs.
-        if let Some(Tok::User(u)) = self.peek().cloned() {
+        let first = self.commands.len();
+        self.pos += 1;
+        self.emit(Command::Ready, start, SourceForm::Symbol);
+        if !self.strict {
+            self.skip_filler();
+        }
+        if let Some(Tok::User(user)) = self.peek().cloned() {
             let at = self.span().start;
             self.pos += 1;
-            self.emit(Command::RequestReview { user: u }, at);
+            self.emit(Command::RequestReview { user }, at, SourceForm::Symbol);
         }
-
-        self.skip_filler();
-        // `cc` must be the whole token; `starts_with("cc")` used to make
-        // `?r ccache @alice` parse as a cc.
+        if !self.strict {
+            self.skip_filler();
+        }
         if matches!(self.peek(), Some(Tok::Word(w)) if w == "cc") {
             let at = self.span().start;
             self.pos += 1;
-            let users = self.user_list();
-            if users.is_empty() {
-                self.diagnostics.push(Diagnostic::MissingArgument {
-                    verb: "cc",
-                    expected: Expected::Users,
-                    span: self.span(),
-                });
-            } else {
-                self.emit(Command::Cc { users }, at);
+            if let Some(users) = self.user_list() {
+                self.emit(Command::Cc { users }, at, SourceForm::Symbol);
             }
+        }
+        let end = self.toks[self.pos - 1].span.end;
+        for c in &mut self.commands[first..] {
+            c.compound_span = Some(start..end);
+        }
+        if self.strict && !self.at_boundary() {
+            self.complete = false;
         }
     }
 
-    /// Bare `r? @user` anywhere in a comment, no mention needed.
+    /// Preserve r?'s existing anywhere-in-prose position rule.
     fn bare_review_request(&mut self) {
         let start = self.span().start;
-        self.pos += 1; // r?
-                       // Deliberately no diagnostic when a user doesn't follow: a rhetorical
-                       // "who should review this r?" is prose, not a failed command.
+        self.pos += 1;
         self.skip_filler();
-        if let Some(Tok::User(u)) = self.peek().cloned() {
+        if let Some(Tok::User(user)) = self.peek().cloned() {
             self.pos += 1;
-            self.emit(Command::RequestReview { user: u }, start);
-        }
-    }
-
-    /// Nullary verbs ignore trailing text, but flag it when it looks like an
-    /// argument the user expected to matter.
-    fn reject_extra_args(&mut self, verb: &str, _start: usize) {
-        let mut sig = None;
-        let mut scan = self.pos;
-        while let Some(t) = self.toks.get(scan) {
-            if matches!(t.tok, Tok::Bot | Tok::Semi | Tok::Newline) {
-                break;
-            }
-            if matches!(t.tok, Tok::User(_) | Tok::Plus(_) | Tok::Minus(_)) {
-                sig = Some(t.span.clone());
-                break;
-            }
-            scan += 1;
-        }
-        if let Some(span) = sig {
-            if let Some(v) = VERBS.iter().find(|v| **v == verb) {
-                self.diagnostics
-                    .push(Diagnostic::ExtraArguments { verb: v, span });
-            }
+            self.emit(Command::RequestReview { user }, start, SourceForm::Symbol);
         }
     }
 }

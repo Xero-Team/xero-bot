@@ -11,7 +11,7 @@ Features:
 - **CodeQL quality reports** — reads the repo's existing code scanning alerts and maps them to files changed in the PR
 - **Bilingual replies** — answers in English or Chinese, chosen from the PR's own commit messages; no configuration
 
-Repository TOML loading, disabled-command vetoes and configuration failure handling are available independently of the idle scheduler. See the [configuration contract and current delivery scope](docs/repository-config.md); full mention-mode/session routing follows in #12–#14.
+Repository TOML loading, disabled-command vetoes and configuration failure handling are available independently of the idle scheduler. See the [configuration contract and current delivery scope](docs/repository-config.md); strict parsing and per-candidate mention gates are available; durable session lifecycle follows in #13–#14.
 
 
 ## Command reference
@@ -23,16 +23,24 @@ comments from the same API for both. The four that need a PR are `review`, `code
 `r-`; used in an issue they say so rather than failing silently. In an issue `r? @user` is an
 assignment, since an issue has no reviewers.
 
-### Mention-free sessions
+### Mention-free commands
 
-Once a user has run **one** command with a mention (`@xero-review help`) on a PR or issue,
-their session on it is open: their later comments can use the mention-free forms below without
-`@`. Only an explicit command is recognized — a comment has to *open* with the verb, and prose
-is never parsed. The verbs that work without a mention are the unambiguous ones: `review`,
-`codeql`, `ready`, `author`, `blocked`, `ping`, `help`, and bare `r+` / `r-`. Argument-taking
-verbs (`claim`, `label`, `cc`, `assign`) and the combined forms still need the mention; bare
-`r? @user` and `?r` never needed one. A mention-less command from someone who has no session
-gets one line of explanation instead of silence.
+Ordinary bare commands require the **entire comment** to be a command block: use
+newlines or semicolons between complete instructions, for example `claim` or
+`take; cc @alice`. Prose, list bullets, code and quotations invalidate the bare
+block. `review 一下` is no longer accepted; use `review` or `@xero-review review 一下`.
+Arguments stay on their command's line: `cc @alice about this` and
+`assign @alice @bob` are invalid. Explicit mentions and the existing `r?` / `?r`
+shortcuts retain their positions in prose, but every candidate is checked against
+repository policy before duplicates or conflicting statuses are resolved.
+
+By default, `claim`, `unclaim`, `cc`, `r?` and `ready` need no mention. `r+` and
+`r-` require a mention **every time**; `r= @user`, `r+ as @user` and `r+ @user`
+are equivalent approval forms, and invalid/missing targets never become ordinary
+approvals. Other commands use `mention_once`. Session evidence still comes from
+the same user's explicit, enabled commands in the thread's history; durable TTL,
+source ordering and authorization preflight remain #13/#14. See the
+[parser acceptance record](docs/issue-12-acceptance.md) for the delivered boundaries.
 
 | Command | Description |
 |---|---|

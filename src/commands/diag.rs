@@ -54,6 +54,10 @@ pub enum Diagnostic {
         expected: Expected,
         span: Range<usize>,
     },
+    IgnoredArguments {
+        verb: &'static str,
+        span: Range<usize>,
+    },
     ExtraArguments {
         verb: &'static str,
         span: Range<usize>,
@@ -116,6 +120,11 @@ impl Diagnostic {
                 "`r=` 只接受一个 @用户名;未执行审批。"
             ),
             Diagnostic::ExtraArguments { verb, .. } => t!(
+                lang,
+                "`{verb}` has unexpected arguments; the command was not run.",
+                "`{verb}` 含有多余或不合法的参数;未执行该命令。"
+            ),
+            Diagnostic::IgnoredArguments { verb, .. } => t!(
                 lang,
                 "`{verb}` takes no arguments; what followed it was ignored.",
                 "`{verb}` 不接受参数,后面的内容被忽略了。"

@@ -8,13 +8,14 @@ use super::Command;
 use crate::github::normalize_login;
 
 /// Apply within-comment policy: drop self-requests, collapse duplicates, and
-/// resolve contradictory status labels.
+/// resolve contradictory status labels. Input MUST contain only candidates that
+/// have passed the caller's per-candidate trigger policy.
 pub fn resolve(
     bot_name: &str,
     mut parsed: Vec<ParsedCommand>,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> Vec<Command> {
-    parsed.sort_by_key(|c| c.start);
+    parsed.sort_by_key(|c| c.span.start);
 
     let me = normalize_login(bot_name);
     parsed.retain(|c| match &c.command {
@@ -22,7 +23,7 @@ pub fn resolve(
             if normalize_login(user) == me =>
         {
             diagnostics.push(Diagnostic::SelfRequestIgnored {
-                span: c.start..c.start,
+                span: c.span.clone(),
             });
             false
         }

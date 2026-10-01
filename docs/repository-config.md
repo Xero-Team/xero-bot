@@ -9,20 +9,21 @@ See the [complete defaults](../examples/repository-config.toml),
 
 ## Delivery scope
 
-This change provides a shared configuration contract and reader, plus configuration
-failure and `disabled` vetoes in existing comment/CodeQL-label entry points. It does
-not add automatic actions. Strict bare-command parsing and complete mention-mode
-routing/session lifecycle are implemented by #12–#14. Until then, enabled commands
-continue using the existing parser and history-based session handling: the new
-`ttl_days` field is validated but does not yet expire those legacy sessions.
-The contract's mention defaults are not a claim that the #14 routing migration has shipped.
+The shared configuration reader provides configuration failure and `disabled`
+vetoes in comment/CodeQL-label entry points. #12 adds strict command-block parsing,
+source-bearing candidates and per-candidate mention gates before deduplication or
+status resolution. It does not add automatic actions or persistent sessions.
+Session evidence still uses history reads of the same user's explicit, enabled
+commands. `ttl_days` is validated but does not expire those legacy sessions;
+durable lifetime, source ordering and authorization preflight remain #13/#14.
+See the [#12 acceptance record](issue-12-acceptance.md).
 
-An explicit `@bot r= @user` normalizes to an on-behalf approval, with the same
-execution permissions and deployment switch as `r+ as @user`. Its target is mandatory;
-missing, invalid or extra parameters never degrade to a plain approval. Sentence
-punctuation after the target (for example `@bot r= @alice。`) is accepted, while
-prose and additional usernames remain invalid. Bare `r=`
-and the broader approval grammar/source migration remain part of #12.
+`r= @user`, `r+ as @user` and `r+ @user` normalize to the same on-behalf approval,
+with unchanged execution permissions and deployment switch. Missing, invalid or
+extra parameters invalidate the candidate; they never degrade to a plain approval.
+Sentence punctuation after the target (for example `@bot r= @alice。`) remains
+accepted. Bare approval syntax is parsed in a complete command block but its
+execution still requires a mention by default, even with existing session evidence.
 
 ## Configuration and validation
 

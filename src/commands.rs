@@ -1,32 +1,8 @@
 //! Comment command language.
 //!
-//! A four-stage compiler rather than a set of regex scans:
-//!
-//! 1. `mask` blanks regions that render as code or quotation, preserving byte
-//!    offsets so later spans still index the original text.
-//! 2. `lex` produces tokens via `char_indices`, so no byte arithmetic can
-//!    split a codepoint, and lexes `r?` / `r+` / `r-` / `?r` once each as
-//!    distinct kinds.
-//! 3. [`parse`] is recursive descent whose argument loops all stop at the same
-//!    three boundary tokens.
-//! 4. `resolve` applies within-comment policy: self-requests, duplicates,
-//!    contradictory status labels.
-//!
-//! The structure exists to remove ambiguity rather than manage it. The previous
-//! parser ran three regex passes that avoided each other using a
-//! four-character window, which both double-fired on `@bot[bot] r? @alice` and
-//! silently dropped `@bot, r? @alice`; and it mixed offsets from a lowercased
-//! copy with slices of the original, which panicked on any comment containing
-//! U+212A KELVIN SIGN.
-//!
-//! Semantics follow rust-lang/triagebot:
-//! - `@bot <verb>` anywhere in a comment, case-insensitive
-//! - several commands under one mention, separated by `;`
-//! - bare `r? @user`, and `?r` shorthand for ready
-//! - fenced code, inline code and blockquotes never trigger
-//!
-//! Text the bot doesn't understand stays silent unless it looks like a failed
-//! command — see [`diag`].
+//! Mask and lex the original comment, then return uncollapsed candidates with
+//! their source evidence. Callers must gate each candidate before passing the
+//! permitted subset to `resolve_commands`. Parsing itself performs no I/O.
 
 pub mod diag;
 mod lex;
@@ -39,7 +15,8 @@ pub use diag::Diagnostic;
 /// approval: the shape check belongs in one place, and the lexer's is the one
 /// the parser already trusts.
 pub use lex::is_valid_login;
-pub use parse::ParsedCommand;
+pub use parse::{ParsedCommand, SourceForm};
+pub use resolve::resolve as resolve_commands;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
@@ -54,7 +31,7 @@ pub enum Command {
     Cc {
         users: Vec<String>,
     },
-    /// ready / review / reviewer — set waiting-on-review, clear siblings
+    /// ready / ?r / reviewer — set waiting-on-review, clear siblings
     Ready,
     /// author — set waiting-on-author, clear siblings
     Author,
@@ -101,7 +78,7 @@ impl Command {
 /// Commands, plus any complaints about what couldn't be understood.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ParseOutput {
-    pub commands: Vec<Command>,
+    pub commands: Vec<ParsedCommand>,
     pub diagnostics: Vec<Diagnostic>,
 }
 
@@ -111,65 +88,15 @@ impl ParseOutput {
     }
 }
 
-/// Compile a comment body into commands.
+/// Parse a comment into candidates; this does not authorize any execution.
+/// Masked code/quotes cannot be erased to fabricate a valid bare command block.
 pub fn parse_commands(bot_name: &str, text: &str) -> ParseOutput {
     let masked = mask::mask_noncommand_regions(text);
     let tokens = lex::lex(bot_name, &masked);
-    let parsed = parse::parse(&tokens);
-    let mut diagnostics = parsed.diagnostics;
-    let commands = resolve::resolve(bot_name, parsed.commands, &mut diagnostics);
+    let parsed = parse::parse(&tokens, &masked, masked == text);
     ParseOutput {
-        commands,
-        diagnostics,
-    }
-}
-
-/// The verbs a session can invoke without re-mentioning the bot, and the
-/// command each stands for.
-///
-/// Deliberately a small list. Every entry is a word that, opening a line,
-/// is almost certainly addressed at the bot; the argument-taking verbs
-/// (`claim`, `label`, `cc`, `assign`) stay out of it — they collide with
-/// ordinary prose ("claim 是什么意思?"), and a misfired command is worse
-/// than an un-executed one. Bare `r?` / `?r` don't appear here because the
-/// parser already runs them anywhere, mention or not.
-fn bare_verbs(word: &str) -> Option<Command> {
-    Some(match word {
-        "review" => Command::Review,
-        "codeql" => Command::Codeql,
-        "ready" => Command::Ready,
-        "author" => Command::Author,
-        "blocked" => Command::Blocked,
-        "ping" => Command::Ping,
-        "help" => Command::Help,
-        _ => return None,
-    })
-}
-
-/// Would `text` open with a command a session could run without a mention?
-///
-/// Reads the first line only, over masked text, so fenced code, quotes and
-/// inline code are already gone. A leading run of punctuation — a list
-/// bullet, a stray comma — is skipped, but prose is not: a line starting
-/// with words is prose, not a command. The rest of the line is ignored, so
-/// `review` / `review 一下` both match; the verb itself is the signal.
-///
-/// `None` for everything else, which includes comment text that the regular
-/// parser already handled — callers check that first.
-pub fn bare_command_candidate(text: &str) -> Option<Command> {
-    use lex::Tok;
-    let masked = mask::mask_noncommand_regions(text);
-    let first_line = masked.lines().next().unwrap_or("");
-    let tokens = lex::lex("", first_line);
-    let mut tokens = tokens
-        .iter()
-        .skip_while(|t| matches!(t.tok, Tok::Punct))
-        .peekable();
-    match tokens.next()?.tok.clone() {
-        Tok::Word(w) => bare_verbs(&w),
-        Tok::Approve => Some(Command::Approve { on_behalf_of: None }),
-        Tok::Reject => Some(Command::Reject),
-        _ => None,
+        commands: parsed.commands,
+        diagnostics: parsed.diagnostics,
     }
 }
 
@@ -179,7 +106,8 @@ mod tests {
 
     /// Just the commands, for the many tests that don't care about diagnostics.
     fn cmds(bot: &str, text: &str) -> Vec<Command> {
-        parse_commands(bot, text).commands
+        let mut out = parse_commands(bot, text);
+        resolve_commands(bot, out.commands, &mut out.diagnostics)
     }
 
     // ---- behavioural baseline (carried over from the regex parser) --------
@@ -290,8 +218,7 @@ mod tests {
             vec![Command::Unclaim]
         );
         // take / untake are aliases of claim / unclaim — same commands, not
-        // new ones. Like claim itself they need the mention: the bare list
-        // deliberately excludes argumentless-but-prose-prone verbs.
+        // new ones. Bare forms require a complete command block.
         assert_eq!(
             cmds("xero-review", "@xero-review take"),
             vec![Command::Claim]
@@ -300,8 +227,8 @@ mod tests {
             cmds("xero-review", "@xero-review untake"),
             vec![Command::Unclaim]
         );
-        assert_eq!(bare_command_candidate("take"), None);
-        assert_eq!(bare_command_candidate("untake"), None);
+        assert_eq!(cmds("bot", "take"), vec![Command::Claim]);
+        assert_eq!(cmds("bot", "untake"), vec![Command::Unclaim]);
     }
 
     #[test]
@@ -348,13 +275,10 @@ mod tests {
         );
     }
 
-    /// `queue` is deliberately absent from the bare (mention-free) verb list:
-    /// "queue" is ordinary prose in a way "review" rarely is, and a misfired
-    /// status command is worse than an un-executed one — same policy as
-    /// `claim`/`label`.
     #[test]
-    fn queue_is_not_a_bare_verb() {
-        assert_eq!(bare_command_candidate("queue"), None);
+    fn queue_is_a_strict_bare_verb() {
+        assert_eq!(cmds("bot", "queue"), vec![Command::Queue]);
+        assert!(cmds("bot", "queue this later").is_empty());
     }
 
     #[test]
@@ -615,8 +539,12 @@ mod tests {
 
     #[test]
     fn duplicate_commands_collapse() {
-        let out = parse_commands("bot", "@bot review; review");
-        assert_eq!(out.commands, vec![Command::Review]);
+        let mut out = parse_commands("bot", "@bot review; review");
+        assert_eq!(out.commands.len(), 2);
+        assert_eq!(
+            resolve_commands("bot", out.commands, &mut out.diagnostics),
+            vec![Command::Review]
+        );
         assert!(
             out.diagnostics
                 .iter()
@@ -630,8 +558,12 @@ mod tests {
     /// did both operations and posted two contradictory replies.
     #[test]
     fn conflicting_status_labels_keep_the_last() {
-        let out = parse_commands("bot", "@bot ready; blocked");
-        assert_eq!(out.commands, vec![Command::Blocked]);
+        let mut out = parse_commands("bot", "@bot ready; blocked");
+        assert_eq!(out.commands.len(), 2);
+        assert_eq!(
+            resolve_commands("bot", out.commands, &mut out.diagnostics),
+            vec![Command::Blocked]
+        );
         assert!(
             out.diagnostics
                 .iter()

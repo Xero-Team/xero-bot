@@ -68,6 +68,7 @@ impl Fixture {
             .mount(&server).await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(201).set_body_json(json!({"id":99})))
+            .with_priority(10)
             .mount(&server)
             .await;
         Self {
@@ -328,4 +329,151 @@ async fn unsupported_event_rules_are_reported_by_help_without_disabling_comments
     assert_eq!(bodies.len(), 2);
     assert!(bodies.iter().any(|b| b.contains("Unsupported")));
     assert!(bodies.iter().any(|b| b.contains("xero-bot commands")));
+}
+
+/// Syntax errors produce a diagnostic only: no configuration, commit, history,
+/// permission lookup or business endpoint is consulted.
+#[tokio::test]
+async fn parser_errors_never_reach_github_action_or_lookup_apis() {
+    let f = Fixture::new("").await;
+    for (i, text) in [
+        "@bot r=",
+        "r+ as",
+        "@bot r+ @bad_name",
+        "@bot r+ @alice extra",
+        "@bot assign @alice @bob",
+        "@bot cc @alice about this",
+        "@bot reviwe",
+    ]
+    .iter()
+    .enumerate()
+    {
+        f.comment(text, i as i64 + 1).await;
+    }
+    let requests = f.server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 7);
+    assert!(requests
+        .iter()
+        .all(|r| r.method == "POST" && r.url.path().ends_with("/comments")));
+    assert!(requests
+        .iter()
+        .all(|r| !String::from_utf8_lossy(&r.body).contains("APPROVE")));
+}
+
+/// Existing symbolic shortcuts are candidates, not exemptions from the gate.
+#[tokio::test]
+async fn symbols_cannot_bypass_always_mention_even_in_compounds() {
+    let f = Fixture::new("[command_triggers]\nready={mode='always_mention'}\n'r?'={mode='always_mention'}\ncc={mode='always_mention'}").await;
+    for (i, text) in ["?r", "r? @bob", "?r @bob cc @carol", "r+", "r= @bob", "r-"]
+        .iter()
+        .enumerate()
+    {
+        f.comment(text, i as i64 + 1).await;
+    }
+    assert_eq!(f.assert_only_config_and_diagnostics().await, 6);
+}
+
+/// A denied duplicate must not erase the candidate with an explicit mention.
+#[tokio::test]
+async fn denied_bare_duplicate_does_not_erase_explicit_approval() {
+    let mut f = Fixture::new("").await;
+    f.cfg.merge_queue_enabled = false;
+    Mock::given(method("GET"))
+        .and(path(format!("/repos/{REPO}/pulls/1/commits")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .mount(&f.server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "/repos/{REPO}/collaborators/alice/permission"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"permission":"write"})))
+        .expect(1)
+        .mount(&f.server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!("/repos/{REPO}/pulls/1/reviews")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id":1})))
+        .expect(1)
+        .mount(&f.server)
+        .await;
+    let Routing::Act(mut work) = f.route("r+\n@bot r+", 1) else {
+        panic!("not routed")
+    };
+    if let Work::Comment { pr_author, .. } = &mut work {
+        *pr_author = "bob".into();
+    }
+    execute_comment_with_client(&f.gh, &f.cfg, &f.cache, work)
+        .await
+        .unwrap();
+    let requests = f.server.received_requests().await.unwrap();
+    assert!(!requests
+        .iter()
+        .any(|r| r.method == "GET" && r.url.path().ends_with("/comments")));
+    let approvals: Vec<_> = requests
+        .iter()
+        .filter(|r| r.method == "POST" && r.url.path().ends_with("/reviews"))
+        .collect();
+    assert_eq!(approvals.len(), 1);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&approvals[0].body).unwrap()["event"],
+        "APPROVE"
+    );
+}
+
+/// A disabled conflicting status must be removed before status resolution.
+#[tokio::test]
+async fn disabled_blocked_does_not_cancel_permitted_ready() {
+    let f = Fixture::new("[command_triggers]\nblocked={mode='disabled'}").await;
+    Mock::given(method("GET"))
+        .and(path(format!("/repos/{REPO}/issues/1/labels")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .mount(&f.server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!("/repos/{REPO}/issues/1/labels")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .expect(1)
+        .mount(&f.server)
+        .await;
+    let Routing::Act(mut work) = f.route("@bot ready; blocked", 1) else {
+        panic!("not routed")
+    };
+    if let Work::Comment { is_pr, .. } = &mut work {
+        *is_pr = false;
+    }
+    execute_comment_with_client(&f.gh, &f.cfg, &f.cache, work)
+        .await
+        .unwrap();
+    let requests = f.server.received_requests().await.unwrap();
+    let label_write = requests
+        .iter()
+        .find(|r| r.method == "POST" && r.url.path().ends_with("/labels"))
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&label_write.body).unwrap()["labels"],
+        json!(["waiting-on-review"])
+    );
+}
+
+/// History queries are shared by candidates, and bare history cannot establish
+/// a session merely because the new parser now recognizes it.
+#[tokio::test]
+async fn bare_history_cannot_self_authorize_a_block_of_session_commands() {
+    let f = Fixture::new("").await;
+    Mock::given(method("GET"))
+        .and(path(format!("/repos/{REPO}/issues/1/comments")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            {"user":{"login":"alice"}, "body":"help\nping"},
+            {"user":{"login":"alice"}, "body":"r? @bob"},
+            {"user":{"login":"bob"}, "body":"@bot help"}
+        ])))
+        .expect(1)
+        .mount(&f.server)
+        .await;
+    f.comment("ping\nhelp", 1).await;
+    let requests = f.server.received_requests().await.unwrap();
+    let posts: Vec<_> = requests.iter().filter(|r| r.method == "POST").collect();
+    assert_eq!(posts.len(), 1);
+    assert!(String::from_utf8_lossy(&posts[0].body).contains("SessionRequired"));
 }
