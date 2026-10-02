@@ -76,6 +76,7 @@ pub fn is_valid_login(s: &str) -> bool {
         && s.len() <= 39
         && !s.starts_with('-')
         && !s.ends_with('-')
+        && !s.contains("--")
         && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
 }
 
@@ -93,7 +94,11 @@ pub fn is_valid_label(s: &str) -> bool {
 pub fn lex(bot_name: &str, text: &str) -> Vec<Token> {
     Lexer {
         text,
-        bot: bot_name.to_ascii_lowercase(),
+        bot: bot_name
+            .to_ascii_lowercase()
+            .strip_suffix("[bot]")
+            .unwrap_or(bot_name)
+            .to_ascii_lowercase(),
         chars: text.char_indices().peekable(),
         out: Vec::new(),
     }
@@ -153,33 +158,19 @@ impl<'a> Lexer<'a> {
     fn lex_at(&mut self, start: usize) {
         self.chars.next(); // '@'
         let name_start = start + 1;
-        let name_end = self.take_while(|c| c.is_ascii_alphanumeric() || c == '-');
-        let name = &self.text[name_start..name_end];
-
-        // An optional `[bot]` suffix, consumed case-insensitively. GitHub's
-        // mention autocomplete inserts it for Apps. Folding it into the token
-        // here is what removed the old scanner's `+ 4` window heuristic.
-        // `get(..5)` yields None unless byte 5 is a char boundary, so a name
-        // followed by multibyte text can't split a codepoint here.
-        let mut end = name_end;
-        if self
-            .text
-            .get(name_end..)
-            .and_then(|rest| rest.get(..5))
-            .is_some_and(|p| p.eq_ignore_ascii_case("[bot]"))
-        {
-            for _ in 0..5 {
-                self.chars.next();
-            }
-            end = name_end + 5;
-        }
-
-        if name.eq_ignore_ascii_case(&self.bot) {
+        // Keep account-like continuations so @bot_extra, @bot[bot]other
+        // and @alice/path cannot pass as a valid prefix. Prose and surrounding
+        // Markdown punctuation end the token, as in @bot请 or (r? @alice).
+        let end = self.take_while(|c| c.is_ascii_alphanumeric() || "-_[]/\\".contains(c));
+        let raw = &self.text[name_start..end];
+        let lower = raw.to_ascii_lowercase();
+        let name = lower.strip_suffix("[bot]").unwrap_or(&lower);
+        if !self.bot.is_empty() && is_valid_login(name) && name == self.bot {
             self.push(Tok::Bot, start..end);
-        } else if is_valid_login(name) {
-            self.push(Tok::User(name.to_string()), start..end);
+        } else if is_valid_login(raw) {
+            self.push(Tok::User(raw.to_string()), start..end);
         } else {
-            self.push(Tok::RawUser(name.to_string()), start..end);
+            self.push(Tok::RawUser(raw.to_string()), start..end);
         }
     }
 

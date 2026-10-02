@@ -11,7 +11,7 @@ Xero-Team 的组织级 GitHub App 机器人。Rust 实现,单二进制,自托管
 - **CodeQL 质量报告** — 读取仓库存量 code scanning 告警,映射到 PR 变更文件
 - **中英双语回复** — 依 PR 自身的 commit 信息决定用中文还是英文,无需配置
 
-仓库 TOML 读取、指令禁用及配置故障拦截已独立于 idle 开关接入。详见[配置契约与当前交付范围](docs/repository-config.md)及 [#11 验收记录](docs/issue-11-acceptance.md)；完整手动模式与会话路由由 #12–#14 接入。
+仓库 TOML 读取、指令禁用及配置故障拦截已独立于 idle 开关接入。详见[配置契约与当前交付范围](docs/repository-config.md)及 [#11 验收记录](docs/issue-11-acceptance.md)；严格解析与逐候选模式检查已接入；持久化会话生命周期由 #13/#14 完成。
 
 
 ## 命令参考
@@ -22,14 +22,19 @@ Xero-Team 的组织级 GitHub App 机器人。Rust 实现,单二进制,自托管
 只有 `review`、`codeql`、`r+`、`r-` 这四条需要 PR,在 issue 上使用会明确回复说明而非静默失败。
 在 issue 上 `r? @用户` 只是指派,因为 issue 没有 reviewer。
 
-### 免 @ 会话
+### 免 @ 指令
 
-同一用户在同一 PR/issue 上**带 @ 执行过一次命令**(如 `@xero-review help`)后,会话即已开启:
-之后的评论可以用下述免 @ 形式直接下指令。只有**明确的指令**才会被解析 —— 评论必须以动词
-**开头**,散文永远不会被当成命令。可免 @ 的动词是无歧义的那几个:`review`、`codeql`、`ready`、
-`author`、`blocked`、`ping`、`help`,以及裸 `r+` / `r-`。带参数的动词(`claim`、`label`、
-`cc`、`assign`)和组合形式仍需带 @;裸 `r? @user` 与 `?r` 本来就无需 @。没有会话的用户发免 @
-指令会收到一行说明,而不是石沉大海。
+裸单词命令要求**整条评论都是指令块**：用换行或分号分隔完整指令，例如 `claim`、
+`take; cc @alice`。混入散文、列表符号、代码或引用后，不再提取裸单词命令。
+`review 一下` 不再有效，请改用 `review` 或 `@xero-review review 一下`。
+参数不跨行、不跨分号；`cc @alice about this`、`assign @alice @bob` 无效。
+显式 @ 和既有 `r?` / `?r` 快捷入口仍可出现在散文中，但所有候选都先逐项检查仓库策略，
+再做重复折叠和状态冲突处理。
+
+默认 `claim`、`unclaim`、`cc`、`r?`、`ready` 无需 @；`r+`、`r-` **每次都须 @**。
+`r= @user`、`r+ as @user`、`r+ @user` 语义一致，缺失、非法或多余参数不会降级为普通批准。
+其他命令使用 `mention_once`。目前会话证据仍读取同一用户在同一线程中的显式、未禁用历史指令；
+持久化 TTL、源评论顺序和授权预检留给 #13/#14。完整边界见[解析器验收记录](docs/issue-12-acceptance.md)。
 
 | 命令 | 说明 |
 |---|---|

@@ -16,6 +16,7 @@ pub fn mask_noncommand_regions(text: &str) -> String {
     // each other.
     let mut fence: Option<(char, usize)> = None;
     let mut prev_line_blank = true;
+    let mut indented = false;
 
     for line in text.split_inclusive('\n') {
         let has_newline = line.ends_with('\n');
@@ -30,7 +31,7 @@ pub fn mask_noncommand_regions(text: &str) -> String {
         if let Some((fence_char, fence_len)) = fence {
             mask_whole_line = true;
             if let Some((c, n)) = fence_delimiter(trimmed) {
-                if c == fence_char && n >= fence_len {
+                if c == fence_char && n >= fence_len && trimmed[n..].trim().is_empty() {
                     fence = None;
                 }
             }
@@ -46,19 +47,22 @@ pub fn mask_noncommand_regions(text: &str) -> String {
             // this the bot re-executes commands quoted back at it — including
             // its own help table.
             mask_whole_line = true;
-        } else if prev_line_blank && is_indented_code(body) {
+        } else if (prev_line_blank || indented) && is_indented_code(body) {
             // Indented code only starts after a blank line. The trade-off is
             // that a 4-space-indented list continuation mentioning a command
             // becomes a false negative; that beats today's false positive,
             // where a pasted indented example actually runs.
             mask_whole_line = true;
+            indented = true;
+        } else if !trimmed.is_empty() {
+            indented = false;
         }
 
         if mask_whole_line {
             blank_into(&mut out, body);
             prev_line_blank = false;
         } else {
-            mask_inline_code(&mut out, body);
+            out.push_str(body);
             prev_line_blank = trimmed.is_empty();
         }
         if has_newline {
@@ -71,7 +75,22 @@ pub fn mask_noncommand_regions(text: &str) -> String {
         text.len(),
         "masking must preserve byte length or every downstream span breaks"
     );
-    out
+    // Code spans may wrap lines inside a paragraph, but cannot cross blank
+    // lines. Include whitespace-only/CRLF lines and lines blanked above: a
+    // fenced block or quotation also interrupts the surrounding paragraph.
+    let mut inline_masked = String::with_capacity(out.len());
+    let mut paragraph_start = 0;
+    let mut line_start = 0;
+    for line in out.split_inclusive('\n') {
+        if line.trim().is_empty() {
+            mask_inline_code(&mut inline_masked, &out[paragraph_start..line_start]);
+            inline_masked.push_str(line);
+            paragraph_start = line_start + line.len();
+        }
+        line_start += line.len();
+    }
+    mask_inline_code(&mut inline_masked, &out[paragraph_start..]);
+    inline_masked
 }
 
 /// A fence opener/closer: three or more backticks or tildes.
@@ -91,7 +110,7 @@ fn is_indented_code(body: &str) -> bool {
     body.starts_with('\t') || body.starts_with("    ")
 }
 
-/// Mask inline code spans within one line, writing the result to `out`.
+/// Mask inline code spans (including multiline spans), writing to `out`.
 ///
 /// A run of N backticks opens a span that only a run of exactly N closes, per
 /// CommonMark. An unmatched backtick is literal text, so it stays.
@@ -114,7 +133,7 @@ fn mask_inline_code(out: &mut String, body: &str) {
                 rest = &after_open[span_len..];
             }
             None => {
-                // no closer on this line: the backticks are literal
+                // No matching closer: the backticks are literal.
                 out.push_str(delim);
                 rest = content;
             }
@@ -142,8 +161,8 @@ fn find_closing_run(s: &str, n: usize) -> Option<usize> {
 /// Push as many spaces as `s` has bytes. Spaces are one byte each, so this is
 /// what keeps the output length equal to the input length.
 fn blank_into(out: &mut String, s: &str) {
-    for _ in 0..s.len() {
-        out.push(' ');
+    for byte in s.bytes() {
+        out.push(if byte == b'\n' { '\n' } else { ' ' });
     }
 }
 

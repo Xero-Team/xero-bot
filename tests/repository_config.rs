@@ -91,7 +91,10 @@ fn parser_and_config_agree_on_all_aliases_including_r_equals() {
     for text in ["@bot r+ as @alice", "@bot r+ @alice", "@bot r= @alice"] {
         let out = parse_commands("bot", text);
         assert_eq!(
-            out.commands,
+            out.commands
+                .into_iter()
+                .map(|c| c.command)
+                .collect::<Vec<_>>(),
             vec![xero_bot::commands::Command::Approve {
                 on_behalf_of: Some("alice".into())
             }],
@@ -325,13 +328,8 @@ fn r_equals_never_falls_back_to_plain_approval_with_a_bad_target() {
         "@bot r= @alice. @-bad",
         "@bot r= @alice。 +label",
         "@bot r= please @alice",
-        "r= @alice",
     ] {
         assert!(parse_commands("bot", text).commands.is_empty(), "{text}");
-        assert!(
-            xero_bot::commands::bare_command_candidate(text).is_none(),
-            "{text}"
-        );
     }
 }
 
@@ -356,7 +354,15 @@ fn r_equals_accepts_trailing_punctuation_and_preserves_command_boundaries() {
         if has_ping {
             expected.push(Command::Ping);
         }
-        assert_eq!(output.commands, expected, "{text}");
+        assert_eq!(
+            output
+                .commands
+                .into_iter()
+                .map(|c| c.command)
+                .collect::<Vec<_>>(),
+            expected,
+            "{text}"
+        );
         assert!(
             output.diagnostics.is_empty(),
             "{text}: {:?}",
