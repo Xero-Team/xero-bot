@@ -336,43 +336,43 @@ impl Client {
     }
 
     pub async fn post(&self, route: &str, body: Option<Value>) -> Result<Value, GhError> {
-        self.crab
-            .post(route, body.as_ref())
-            .await
-            .map_err(classify_octo_error)
+        crate::trigger_state::runtime::write(self, "POST", route, body).await
     }
 
     pub async fn patch(&self, route: &str, body: Option<Value>) -> Result<Value, GhError> {
-        self.crab
-            .patch(route, body.as_ref())
-            .await
-            .map_err(classify_octo_error)
+        crate::trigger_state::runtime::write(self, "PATCH", route, body).await
     }
 
     pub async fn put(&self, route: &str, body: Option<Value>) -> Result<Value, GhError> {
-        self.crab
-            .put(route, body.as_ref())
-            .await
-            .map_err(classify_octo_error)
+        crate::trigger_state::runtime::write(self, "PUT", route, body).await
     }
 
     pub async fn delete(&self, route: &str) -> Result<(), GhError> {
-        self.crab
-            .delete::<Value, _, _>(route, None::<&Value>)
+        crate::trigger_state::runtime::write(self, "DELETE", route, None)
             .await
             .map(|_| ())
-            .map_err(classify_octo_error)
     }
 
-    /// DELETE with a JSON body (remove assignees), returning the response.
-    ///
-    /// The body used to be discarded. It is the only evidence of what the call
-    /// actually did — see [`Client::remove_assignees`].
+    /// DELETE with a JSON body; retain the response for assignment verification.
     pub async fn delete_with_body(&self, route: &str, body: Value) -> Result<Value, GhError> {
-        self.crab
-            .delete::<Value, _, _>(route, Some(&body))
-            .await
-            .map_err(classify_octo_error)
+        crate::trigger_state::runtime::write(self, "DELETE", route, Some(body)).await
+    }
+
+    /// Network-only half of the durable write boundary; never retries POSTs.
+    pub(crate) async fn raw_write(
+        &self,
+        method: &str,
+        route: &str,
+        body: Option<Value>,
+    ) -> Result<Value, GhError> {
+        match method {
+            "POST" => self.crab.post(route, body.as_ref()).await,
+            "PATCH" => self.crab.patch(route, body.as_ref()).await,
+            "PUT" => self.crab.put(route, body.as_ref()).await,
+            "DELETE" => self.crab.delete(route, body.as_ref()).await,
+            _ => return Err(GhError::BadShape("unsupported write method".into())),
+        }
+        .map_err(classify_octo_error)
     }
 
     /// GET returning raw text with a custom Accept header (diffs).

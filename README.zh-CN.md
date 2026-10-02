@@ -11,7 +11,7 @@ Xero-Team 的组织级 GitHub App 机器人。Rust 实现,单二进制,自托管
 - **CodeQL 质量报告** — 读取仓库存量 code scanning 告警,映射到 PR 变更文件
 - **中英双语回复** — 依 PR 自身的 commit 信息决定用中文还是英文,无需配置
 
-仓库 TOML 读取、指令禁用及配置故障拦截已独立于 idle 开关接入。详见[配置契约与当前交付范围](docs/repository-config.md)及 [#11 验收记录](docs/issue-11-acceptance.md)；严格解析与逐候选模式检查已接入；持久化会话生命周期由 #13/#14 完成。
+仓库 TOML 读取、指令禁用及配置故障拦截已独立于 idle 开关接入。详见[配置契约与当前交付范围](docs/repository-config.md)及 [#11 验收记录](docs/issue-11-acceptance.md)；严格解析与逐候选模式检查已接入；[#13 持久化状态存储](docs/issue-13-acceptance.md)已接入，会话生命周期策略由 #14 完成。
 
 
 ## 命令参考
@@ -34,7 +34,7 @@ Xero-Team 的组织级 GitHub App 机器人。Rust 实现,单二进制,自托管
 默认 `claim`、`unclaim`、`cc`、`r?`、`ready` 无需 @；`r+`、`r-` **每次都须 @**。
 `r= @user`、`r+ as @user`、`r+ @user` 语义一致，缺失、非法或多余参数不会降级为普通批准。
 其他命令使用 `mention_once`。目前会话证据仍读取同一用户在同一线程中的显式、未禁用历史指令；
-持久化 TTL、源评论顺序和授权预检留给 #13/#14。完整边界见[解析器验收记录](docs/issue-12-acceptance.md)。
+持久化存储及源时间/TTL 查询接口已由 #13 提供；会话策略与授权预检接入留给 #14。完整边界见[解析器验收记录](docs/issue-12-acceptance.md)。
 
 | 命令 | 说明 |
 |---|---|
@@ -229,6 +229,7 @@ GitHub → Settings → Developer settings → GitHub Apps → **New GitHub App*
   | 路径 | 内容 | 可否清理 |
   |---|---|---|
   | `repos/{owner}__{repo}/pr-{编号}` | 每个 PR 一份浅 checkout(深度 `CHECKOUT_DEPTH`,默认 100) | 可以 — 已合并的 PR 目录可安全删除 |
+  | `command-triggers.sqlite` 及 WAL | 触发 inbox、动作回执、会话记录和永久通知预算 | 不要删 |
   | `sessions/{owner}__{repo}` | `pi` 会话,**按仓库共享** = 项目理解的增量记忆 | 不要删 |
   | `codex/{owner}__{repo}-pr{编号}-{sha}.md` | `codex` 单轮输出,读完即删 | 无需管理 |
 
@@ -295,6 +296,11 @@ src/
 └── main.rs            自托管 axum 服务器
 ```
 
-状态持久化:标签、PR 审查记忆和合并队列状态存于 GitHub。可选的空闲 workflow
+状态持久化:触发 inbox、指令/写入回执、会话存储原语和通知预算始终保存于
+`XERO_DATA_DIR/command-triggers.sqlite`,不依赖 idle 开关。须单实例使用持久卷;
+未知非幂等写入暂停核对。详见[运维与恢复](docs/trigger-state.md)及
+[#13 验收记录](docs/issue-13-acceptance.md)。会话生命周期策略接入仍由 #14 完成。
+
+标签、PR 审查记忆和合并队列状态存于 GitHub。可选的空闲 workflow
 调度器额外在 `XERO_DATA_DIR` 下使用 SQLite 保存活动时间、触发记录和重试历史,
 无需外部数据库服务。
