@@ -46,7 +46,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps
 git diff --check
 ```
 
-以上检查全部通过：**424 个测试通过，0 失败、0 忽略**。其中新增 44 项测试（36 项状态/HTTP 验收、4 项 webhook 入口验收、4 项进程/CLI 验收，含子进程测试入口）。fmt、clippy、rustdoc（`-D warnings`）及 `git diff --check` 均通过。
+以上检查全部通过：**429 个测试通过，0 失败、0 忽略**。其中新增 49 项测试（41 项状态/HTTP 验收、4 项 webhook 入口验收、4 项进程/CLI 验收，含子进程测试入口）。fmt、clippy、rustdoc（`-D warnings`）及 `git diff --check` 均通过。
 
 ## 运维与范围边界
 
@@ -84,3 +84,26 @@ SQLite 与 GitHub 不能组成事务，**不承诺跨崩溃 exactly-once**。未
 新增复审回归位于 `src/trigger_state/review_tests.rs` 和 webhook 入口测试。
 
 复审新增 13 项回归；全仓库 424 项测试通过，0 失败、0 忽略。格式、clippy、rustdoc 及 diff 检查全部通过。
+
+
+## 后续审查：调度器异常退出隔离
+
+[审查意见](https://github.com/Xero-Team/xero-bot/pull/23#discussion_r4163077893)
+指出，单个任务的记账失败仍能经 `?` 提前退出 `pump_with`，进而丢弃全部在途 futures。
+已核实相同问题也存在于运行中 `claim_inbox` 和周期 `cleanup_inbox` 的错误路径。
+
+修复统一保存首个错误，停止领取新任务和周期清理，继续等待已经领取的任务，直到各自完成
+或触发原有超时，再返回首个错误。等待期间的其他错误照常记录，不覆盖最初失败。
+启动阶段尚无 worker 时的存储错误仍立即返回；进程退出或外部取消继续走既有未知状态恢复。
+
+新增 `src/trigger_state/drain_tests.rs` 的 5 项回归：
+
+- 实际 HTTP POST 已到达 mock 服务、延迟返回期间，注入 `finish_inbox`、`recover_delivery`
+  失败或陈旧 inbox 尝试编号，健康任务仍保存成功回执，随后到达的任务保持未领取。
+- 在 HTTP 请求发送后注入 `claim_inbox` 失败，验证其不会取消在途请求。
+- 使用 Tokio 虚拟时间触发生产代码的 60 秒清理周期并注入 DELETE 故障，健康任务仍完成。
+- 等待期间出现第二个记账错误，返回值仍保留首错，第三个健康任务正常完成。
+- 等待期间出现真正卡住的任务，原有单项超时仍生效，发送意图保持 unknown，inbox 退避重试。
+
+前三项回归先在修复前复现失败，再在修复后通过；复核调度循环所有可能返回错误的位置，
+确认 worker 存在时不再因存储错误提前退出。最终全量 **429 项测试通过，0 失败、0 忽略**；fmt、clippy（`-D warnings`）、rustdoc（`-D warnings`）及 `git diff --check` 均通过。

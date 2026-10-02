@@ -1163,3 +1163,6 @@ async fn claim_insert_failure_keeps_inbox_retryable_even_without_an_operation_ro
 
 #[path = "review_tests.rs"]
 mod review;
+
+#[path = "drain_tests.rs"]
+mod drain;

@@ -22,7 +22,11 @@ syntax diagnostics and executable command candidates still enter the inbox.
 
 Comment work uses up to eight concurrent durable workers. Free slots are refilled
 while other work runs, including for events arriving during a slow review. Each
-delivery keeps its own timeout and recovery ownership. The opened/path envelopes currently record
+delivery keeps its own timeout and recovery ownership. A local bookkeeping,
+claim, or periodic cleanup error stops new claims and maintenance. The pump keeps
+polling already claimed workers until they finish or reach their own deadlines,
+then returns the first error. It does not cancel healthy in-flight writes because
+another delivery failed to save its state. The opened/path envelopes currently record
 inputs only: automatic action planning belongs to #15–#17. Rebase, CodeQL label,
 native review/merge queue, and idle workflow routing keep their existing switches
 and are not dispatched a second time by this worker.

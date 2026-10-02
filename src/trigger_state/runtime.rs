@@ -211,7 +211,8 @@ impl Runtime {
     }
 
     /// Production scheduling with an injectable processor/clock duration for
-    /// concurrency tests. Futures stay owned here; cancellation drops them.
+    /// concurrency tests. Local storage errors stop admission and drain owned
+    /// futures before returning the first error; external cancellation drops them.
     pub(super) async fn pump_with<F, Fut>(
         &self,
         run: F,
@@ -232,26 +233,42 @@ impl Runtime {
         let mut cleanup_at = tokio::time::Instant::now();
         let mut workers = FuturesUnordered::new();
         let mut count = 0;
+        let mut failure = None;
         loop {
-            while workers.len() < 8 {
-                let Some(item) = self.store.claim_inbox(now())? else {
-                    break;
+            while failure.is_none() && workers.len() < 8 {
+                let item = match self.store.claim_inbox(now()) {
+                    Ok(Some(item)) => item,
+                    Ok(None) => break,
+                    Err(error) => {
+                        tracing::error!("trigger inbox claim failed; draining workers: {error}");
+                        failure.get_or_insert(error);
+                        break;
+                    }
                 };
                 let work = run(item.context.clone());
                 workers.push(self.process_item(item, work, timeout));
             }
             if workers.is_empty() {
-                return Ok(count);
+                return failure.map_or(Ok(count), Err);
             }
+            // Never use `?` while workers are owned here: a local bookkeeping
+            // error must not cancel another delivery's in-flight external write.
+            // Existing per-item timeouts bound this drain, even for hung work.
             tokio::select! {
                 result = workers.next() => {
-                    result.expect("worker set is nonempty")?;
+                    if let Err(error) = result.expect("worker set is nonempty") {
+                        tracing::error!("trigger bookkeeping failed; draining workers: {error}");
+                        failure.get_or_insert(error);
+                    }
                     count += 1;
                 }
-                _ = tokio::time::sleep(poll) => {}
+                _ = tokio::time::sleep(poll), if failure.is_none() => {}
             }
-            if cleanup_at.elapsed() >= std::time::Duration::from_secs(60) {
-                self.store.cleanup_inbox(now())?;
+            if failure.is_none() && cleanup_at.elapsed() >= std::time::Duration::from_secs(60) {
+                if let Err(error) = self.store.cleanup_inbox(now()) {
+                    tracing::error!("trigger inbox cleanup failed; draining workers: {error}");
+                    failure.get_or_insert(error);
+                }
                 cleanup_at = tokio::time::Instant::now();
             }
         }
