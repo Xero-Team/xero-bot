@@ -45,7 +45,7 @@ when a business operation is reclaimed by another delivery. Successful sibling c
 receipts rather than sending another request. The worker replans through current
 repository configuration, applicability and existing command permission checks;
 it does not send stored requests directly from the inbox. A changed PR head/base
-supersedes unsent work. #14 still owns the session policy integration and the
+supersedes unsent work. Issue 14 consumes the session primitives and adds the
 additional `r-` permission gate.
 
 ## Uncertain writes
@@ -96,12 +96,12 @@ reclaim slots. Recipient records and successful/unknown actions have no ordinary
 expiry or seven-day scheduler cleanup. Closing/reopening a PR, configuration
 changes and deleting comments do not reset them. Path matching/aggregation is #16/#17.
 
-`record_wake` stores repository/thread/GitHub user/source comment IDs and GitHub
+`record_wake` stores installation/repository/issue-or-PR number/GitHub user/source comment IDs and GitHub
 source time. `session_before` selects a wake strictly before the calling comment,
 using comment ID to order equal timestamps, with the caller's current TTL. The
-same source comment cannot renew itself on edit. The #14 consumer must record
+same source comment cannot renew itself on edit. The Issue 14 consumer records
 only a genuine explicit mention that passes applicability and authorization;
-this module does not infer wake-ups, scan history, or change existing session policy.
+this module does not infer wake-ups or scan history.
 
 ## Inbox retention
 

@@ -521,6 +521,13 @@ async fn reject_reports_error_when_every_dismissal_fails() {
         ])))
         .mount(&server)
         .await;
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "/repos/{REPO}/collaborators/alice/permission"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"permission": "write"})))
+        .mount(&server)
+        .await;
     Mock::given(method("PUT"))
         .and(path(format!("/repos/{REPO}/pulls/7/reviews/99/dismissals")))
         .respond_with(ResponseTemplate::new(500).set_body_string("boom"))

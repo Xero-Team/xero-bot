@@ -201,7 +201,7 @@ async fn disabled_bare_command_cannot_use_even_an_existing_session() {
     assert_eq!(f.assert_only_config_and_diagnostics().await, 1);
 }
 
-/// A currently disabled historical command cannot qualify as a legacy session opener.
+/// A currently disabled historical command cannot qualify as a historical session evidence.
 #[tokio::test]
 async fn disabled_history_does_not_open_a_legacy_session_for_another_command() {
     let f = Fixture::new("[command_triggers]\nhelp={mode='disabled'}").await;
@@ -213,21 +213,8 @@ async fn disabled_history_does_not_open_a_legacy_session_for_another_command() {
         )
         .mount(&f.server)
         .await;
-    let state = f
-        .cache
-        .load(
-            &f.gh,
-            RepositoryKey {
-                installation_id: 7,
-                repository_id: 9,
-            },
-            REPO,
-        )
-        .await;
-    let policy = state.snapshot().unwrap().config.comments.as_ref().unwrap();
-    assert!(!session_open(&f.gh, &f.cfg, REPO, 1, "alice", policy)
-        .await
-        .unwrap());
+    f.comment("ping", 1).await;
+    assert_eq!(f.assert_only_config_and_diagnostics().await, 1);
 }
 
 /// Configuration failures permit bounded status replies while suppressing every bundled command.
@@ -456,8 +443,7 @@ async fn disabled_blocked_does_not_cancel_permitted_ready() {
     );
 }
 
-/// History queries are shared by candidates, and bare history cannot establish
-/// a session merely because the new parser now recognizes it.
+/// An upgrade never scans history to infer a session, even for parsed candidates.
 #[tokio::test]
 async fn bare_history_cannot_self_authorize_a_block_of_session_commands() {
     let f = Fixture::new("").await;
@@ -468,7 +454,7 @@ async fn bare_history_cannot_self_authorize_a_block_of_session_commands() {
             {"user":{"login":"alice"}, "body":"r? @bob"},
             {"user":{"login":"bob"}, "body":"@bot help"}
         ])))
-        .expect(1)
+        .expect(0)
         .mount(&f.server)
         .await;
     f.comment("ping\nhelp", 1).await;

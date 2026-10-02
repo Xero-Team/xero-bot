@@ -111,7 +111,7 @@ impl CommandId {
     }
 
     /// Return the built-in manual trigger contract; no command defaults to disabled.
-    /// Runtime mention/session routing is connected separately by issue #14.
+    /// Runtime mention/session routing is connected by the Issue 14 dispatch path.
     pub fn default_mode(self) -> ManualMode {
         match self {
             Self::Claim | Self::Unclaim | Self::Cc | Self::RequestReview | Self::Ready => {
@@ -177,6 +177,7 @@ pub enum ReasonCode {
     RequiresPr,
     MentionRequired,
     SessionRequired,
+    SessionUnavailable,
     RepositoryUnavailable,
     BranchUnavailable,
     Forbidden,
@@ -214,6 +215,7 @@ impl Problem {
             ReasonCode::Unsupported => "该功能尚未支持",
             ReasonCode::MentionRequired => "需要显式 @ 机器人",
             ReasonCode::SessionRequired => "需要有效的显式 @ 会话",
+            ReasonCode::SessionUnavailable => "会话存储不可用，请稍后重试",
             ReasonCode::RequiresPr => "该指令仅适用于 PR",
             ReasonCode::Forbidden => "GitHub 拒绝读取配置",
             ReasonCode::RateLimited => "GitHub API 已限流，请稍后重试",

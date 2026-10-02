@@ -208,6 +208,11 @@ async fn reject_dismisses_bot_approval() {
         ])))
         .mount(&server)
         .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/octocat/hello/collaborators/alice/permission"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"permission": "write"})))
+        .mount(&server)
+        .await;
     // The assertion that matters: the dismissal is actually issued.
     Mock::given(method("PUT"))
         .and(path("/repos/octocat/hello/pulls/7/reviews/99/dismissals"))
