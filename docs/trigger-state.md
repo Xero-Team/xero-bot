@@ -5,19 +5,24 @@ The server always opens `XERO_DATA_DIR/command-triggers.sqlite`, even with
 volume. A second owner of the same database fails at startup. Different volumes
 are **not coordinated**; active replicas are unsupported. Docker Compose already
 mounts `/data`. Keep the database and its WAL together; stop the server before a
-filesystem backup or offline administration.
+filesystem backup or offline administration. Version 1 databases migrate transactionally
+to version 2, retaining intents, receipts, sessions, and recipient reservations.
 
 ## Ingress and execution
 
 After signature verification, the server commits a recovery envelope before
-acknowledging `issue_comment.created`, `issues.opened`, and
+acknowledging actionable `issue_comment.created`, `issues.opened`, and
 `pull_request.opened/synchronize`. It keeps delivery, repository, installation,
 thread/comment/user IDs, GitHub source time, applicable head/base SHA and the
 comment text required for parsing. It does not store authentication headers,
 installation tokens or arbitrary webhook fields. Missing required metadata is a
 400; persistence failure is a retryable 503, with no background command execution.
+Pure routing filters ordinary prose and self replies before storing comment text;
+syntax diagnostics and executable command candidates still enter the inbox.
 
-Comment work uses the durable worker. The opened/path envelopes currently record
+Comment work uses up to eight concurrent durable workers. Free slots are refilled
+while other work runs, including for events arriving during a slow review. Each
+delivery keeps its own timeout and recovery ownership. The opened/path envelopes currently record
 inputs only: automatic action planning belongs to #15–#17. Rebase, CodeQL label,
 native review/merge queue, and idle workflow routing keep their existing switches
 and are not dispatched a second time by this worker.
@@ -30,7 +35,9 @@ and head SHAs are audit/snapshot data, never part of a lifetime recipient key.
 
 Each command and each of its external writes have separate rows. An immediate
 SQLite transaction claims a unique key before a GitHub call. Attempt numbers
-fence late completions. Successful sibling commands and external writes reuse
+fence late completions and stale reconciliation results. The immutable original
+delivery remains audit data; `lease_delivery` identifies the current attempt owner
+when a business operation is reclaimed by another delivery. Successful sibling commands and external writes reuse
 receipts rather than sending another request. The worker replans through current
 repository configuration, applicability and existing command permission checks;
 it does not send stored requests directly from the inbox. A changed PR head/base
@@ -41,7 +48,9 @@ additional `r-` permission gate.
 
 States are `pending`, `running`, `succeeded`, `failed`, `unknown`, and `superseded`.
 On startup or after a cancelled/timed-out worker, abandoned `running` operations
-first become `unknown`. The worker has a 15 minute execution limit. Retryable
+first become `unknown`. Each worker has a 15 minute execution limit. An interrupted
+delivery only fences its own attempts, after its request futures have been dropped;
+healthy concurrent deliveries are unaffected. Retryable
 planning/configuration failures use exponential backoff, capped at one hour.
 
 A send-intent record is committed before the HTTP request. If it was never
@@ -60,7 +69,10 @@ its status and diagnostic. It is not resent automatically.
 a missing set can be retried with backoff after live preflight. This idempotent
 exception does not extend to comments, reviews, assignments or arbitrary writes.
 Known HTTP rejections are recorded separately and need an operator retry when
-appropriate. Review fallback after a definite rejection keeps separate receipts.
+appropriate. Bodyless DELETE 204 responses are recorded as success without JSON
+parsing; DELETEs that return assignment data still retain that response. Removing
+an absent label also records a successful no-op. Review fallback after a definite
+rejection keeps separate receipts.
 
 **SQLite and GitHub do not share a transaction. This is not exactly-once delivery.**
 Pausing ambiguous writes trades automatic compensation for fewer duplicates. A
@@ -87,6 +99,15 @@ same source comment cannot renew itself on edit. The #14 consumer must record
 only a genuine explicit mention that passes applicability and authorization;
 this module does not infer wake-ups, scan history, or change existing session policy.
 
+## Inbox retention
+
+Only successful inbox envelopes older than 30 days are eligible for cleanup, in
+batches of at most 500. Envelopes linked to pending, running, unknown or failed
+operations are retained, including links through the current lease owner. Cleanup
+runs before pumping and periodically during sustained work. It never deletes
+operation receipts, sessions, recipient deduplication or notification budgets.
+The retention window is independent of session TTL and idle scheduler cleanup.
+
 ## Offline operations
 
 Stop the server first. The admin command takes the same exclusive lock, so it
@@ -96,11 +117,15 @@ never performs network writes.
 ```sh
 trigger-state /data list
 trigger-state /data inbox
+trigger-state /data inbox LAST_DELIVERY_FROM_PREVIOUS_PAGE
 trigger-state /data show SHA256_FROM_MARKER
 trigger-state /data confirm-success SHA256_FROM_MARKER 'Verified App comment/review URL and marker'
 trigger-state /data confirm-not-sent SHA256_FROM_MARKER 'Verified evidence that no request reached GitHub'
 trigger-state /data retry SHA256_FROM_MARKER 'Definite rejection corrected; retry authorized'
 ```
+
+`inbox` returns at most 100 rows in delivery-ID order. Use the last delivery ID
+as the next cursor; an empty page ends the listing.
 
 `retry` accepts a `failed` row only. An `unknown` row requires `confirm-success`
 or `confirm-not-sent`; a missing marker alone does not justify the latter.

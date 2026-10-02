@@ -2,7 +2,7 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-Org-wide GitHub App bot for the Xero-Team. Written in Rust — a single self-hosted binary (Docker / VPS).
+Org-wide GitHub App bot for the Xero-Team. Written in Rust — a self-hosted server with an offline state administration CLI (Docker / VPS).
 
 Features:
 - **triagebot-style comment commands** — `r?`, `?r cc`, label management, assign/claim, `r+` approval on behalf, and more

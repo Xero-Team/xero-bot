@@ -40,12 +40,14 @@ impl EventContext {
         ) {
             return Ok(None);
         }
+        /// Require a positive GitHub identifier before accepting recovery context.
         fn id(value: &Value) -> Result<i64> {
             value
                 .as_i64()
                 .filter(|n| *n > 0)
                 .ok_or_else(|| "missing positive GitHub ID".into())
         }
+        /// Copy an optional string without retaining unrelated payload fields.
         fn string(value: &Value) -> Option<String> {
             value.as_str().map(str::to_owned)
         }

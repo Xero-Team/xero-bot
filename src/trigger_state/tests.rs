@@ -12,6 +12,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 struct Dir(PathBuf);
 impl Dir {
+    /// Allocate isolated temporary state for persistence and restart tests.
     fn new() -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let path = std::env::temp_dir().join(format!(
@@ -24,21 +25,25 @@ impl Dir {
     }
 }
 impl Drop for Dir {
+    /// Remove only the fixture-owned state directory.
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
+/// Build a complete source event with extra token fields that must be discarded.
 fn payload() -> Value {
     json!({"action":"created","repository":{"id":9,"full_name":"example/project","token":"never-store-me"},"installation":{"id":7,"token":"never-store-me"},
         "issue":{"id":88,"number":3,"user":{"login":"alice"}},
         "comment":{"id":20,"created_at":"2026-10-02T01:00:00Z","body":"@bot ping","user":{"id":5,"login":"alice","type":"User"}},"token":"never-store-me"})
 }
+/// Capture the standard comment fixture using the production allowlist.
 fn context() -> EventContext {
     EventContext::capture("issue_comment", &payload(), Some("delivery-1"))
         .unwrap()
         .unwrap()
 }
+/// Construct a stable operation intent for storage and recovery tests.
 fn spec(key: &str, kind: &str) -> OperationSpec {
     OperationSpec {
         key: key.into(),
@@ -49,6 +54,7 @@ fn spec(key: &str, kind: &str) -> OperationSpec {
         request: json!({"method":"POST","route":"/repos/example/project/issues/3/comments","body":{"body":"hello"}}),
     }
 }
+/// Leave a claimed operation interrupted, with optional persisted send intent.
 fn unknown(store: &Store, spec: &OperationSpec, sent: bool) -> Operation {
     let claim = store.claim(spec, 100).unwrap().unwrap();
     if sent {
@@ -58,6 +64,7 @@ fn unknown(store: &Store, spec: &OperationSpec, sent: bool) -> Operation {
     store.get(&spec.key).unwrap().unwrap()
 }
 
+/// Verify that context is allowlisted and invalid identity never becomes an accepted event.
 #[test]
 fn context_is_allowlisted_and_invalid_identity_never_becomes_an_accepted_event() {
     let ctx = context();
@@ -89,6 +96,7 @@ fn context_is_allowlisted_and_invalid_identity_never_becomes_an_accepted_event()
     assert_eq!(pr.base_sha.as_deref(), Some("base"));
 }
 
+/// Verify that keys use semantic parameters and never delivery config or head.
 #[test]
 fn keys_use_semantic_parameters_and_never_delivery_config_or_head() {
     use crate::commands::{parse_commands, Command};
@@ -108,6 +116,7 @@ fn keys_use_semantic_parameters_and_never_delivery_config_or_head() {
     assert!(recipient_key(9, 88, "org/team").is_err());
 }
 
+/// Verify that concurrent deliveries claim one business action and one inbox owner.
 #[test]
 fn concurrent_deliveries_claim_one_business_action_and_one_inbox_owner() {
     let dir = Dir::new();
@@ -148,6 +157,7 @@ fn concurrent_deliveries_claim_one_business_action_and_one_inbox_owner() {
     assert!(store.enqueue(&conflict, 101).is_err());
 }
 
+/// Verify that restart preserves unknown success and rejects stale completions.
 #[test]
 fn restart_preserves_unknown_success_and_rejects_stale_completions() {
     let dir = Dir::new();
@@ -189,6 +199,7 @@ fn restart_preserves_unknown_success_and_rejects_stale_completions() {
     assert!(store.claim_inbox(200).unwrap().is_some());
 }
 
+/// Verify that notifications share transactional lifetime budget and release only proven unsent.
 #[test]
 fn notifications_share_transactional_lifetime_budget_and_release_only_proven_unsent() {
     let dir = Dir::new();
@@ -243,7 +254,7 @@ fn notifications_share_transactional_lifetime_budget_and_release_only_proven_uns
     assert!(later.operation.recipients.is_empty());
     store
         .resolve_unknown(
-            &reserved.operation.spec.key,
+            &store.get(&reserved.operation.spec.key).unwrap().unwrap(),
             "not_sent",
             None,
             "operator proved no send",
@@ -283,6 +294,7 @@ fn notifications_share_transactional_lifetime_budget_and_release_only_proven_uns
         .is_err());
 }
 
+/// Verify that sessions are scoped persistent and ordered by source not arrival.
 #[test]
 fn sessions_are_scoped_persistent_and_ordered_by_source_not_arrival() {
     let dir = Dir::new();
@@ -329,6 +341,7 @@ fn sessions_are_scoped_persistent_and_ordered_by_source_not_arrival() {
     assert!(store.session_before(&call, 30).unwrap().is_some());
 }
 
+/// Build an installation-like client against the local mock server.
 fn client(server: &MockServer) -> Client {
     Client {
         crab: crate::github::client_builder()
@@ -340,6 +353,7 @@ fn client(server: &MockServer) -> Client {
         app_slug: "bot".into(),
     }
 }
+/// Mount a method/path-specific JSON response on the local GitHub mock.
 async fn response(server: &MockServer, verb: &str, route: &str, status: u16, value: Value) {
     Mock::given(method(verb))
         .and(path(route))
@@ -348,6 +362,7 @@ async fn response(server: &MockServer, verb: &str, route: &str, status: u16, val
         .await;
 }
 
+/// Verify that forged marker wrong app and missing result stay unknown without post.
 #[tokio::test]
 async fn forged_marker_wrong_app_and_missing_result_stay_unknown_without_post() {
     let dir = Dir::new();
@@ -385,6 +400,7 @@ async fn forged_marker_wrong_app_and_missing_result_stay_unknown_without_post() 
     }
 }
 
+/// Verify that remote success local crash reconciles comments and reviews by verified marker.
 #[tokio::test]
 async fn remote_success_local_crash_reconciles_comments_and_reviews_by_verified_marker() {
     let dir = Dir::new();
@@ -408,6 +424,7 @@ async fn remote_success_local_crash_reconciles_comments_and_reviews_by_verified_
     }
 }
 
+/// Verify that labels reconcile then backoff retry but unsent comment retries without network.
 #[tokio::test]
 async fn labels_reconcile_then_backoff_retry_but_unsent_comment_retries_without_network() {
     let dir = Dir::new();
@@ -461,6 +478,7 @@ async fn labels_reconcile_then_backoff_retry_but_unsent_comment_retries_without_
     assert_eq!(retry_delay(u32::MAX), 3600);
 }
 
+/// Verify that admin requires evidence and never blindly retries unknown.
 #[test]
 fn admin_requires_evidence_and_never_blindly_retries_unknown() {
     let dir = Dir::new();
@@ -484,6 +502,7 @@ fn admin_requires_evidence_and_never_blindly_retries_unknown() {
     assert_eq!(store.get("admin").unwrap().unwrap().state, State::Pending);
 }
 
+/// Serve a verified default-branch repository configuration to runtime tests.
 async fn policy(server: &MockServer, text: &str) {
     response(
         server,
@@ -503,6 +522,7 @@ async fn policy(server: &MockServer, text: &str) {
     .await;
     response(server,"GET","/repos/example/project/contents/.github/xero-bot.toml",200,json!({"sha":"blob","type":"file","encoding":"base64","content":base64::engine::general_purpose::STANDARD.encode(text)})).await;
 }
+/// Configure deterministic bot identity with idle scheduling disabled.
 fn cfg() -> Config {
     let mut cfg = Config::from_env();
     cfg.app_id = "1".into();
@@ -512,6 +532,7 @@ fn cfg() -> Config {
     cfg
 }
 
+/// Verify that production commands survive duplicate delivery and restart without idle.
 #[tokio::test]
 async fn production_commands_survive_duplicate_delivery_and_restart_without_idle() {
     let dir = Dir::new();
@@ -547,6 +568,7 @@ async fn production_commands_survive_duplicate_delivery_and_restart_without_idle
     assert_eq!(runtime.store.list(Some(State::Succeeded)).unwrap().len(), 2);
 }
 
+/// Verify that partial comment failure never repeats successful command or unknown write.
 #[tokio::test]
 async fn partial_comment_failure_never_repeats_successful_command_or_unknown_write() {
     let dir = Dir::new();
@@ -594,6 +616,7 @@ async fn partial_comment_failure_never_repeats_successful_command_or_unknown_wri
     assert_eq!(runtime.store.list(Some(State::Unknown)).unwrap().len(), 2);
 }
 
+/// Verify that unavailable configuration is pending and recovery obeys new disabled policy.
 #[tokio::test]
 async fn unavailable_configuration_is_pending_and_recovery_obeys_new_disabled_policy() {
     let dir = Dir::new();
@@ -659,6 +682,7 @@ async fn unavailable_configuration_is_pending_and_recovery_obeys_new_disabled_po
         .all(|op| op.spec.kind != "command"));
 }
 
+/// Verify that old head is superseded before any recovered write.
 #[tokio::test]
 async fn old_head_is_superseded_before_any_recovered_write() {
     let dir = Dir::new();
@@ -706,6 +730,7 @@ async fn old_head_is_superseded_before_any_recovered_write() {
         .all(|r| r.method == "GET"));
 }
 
+/// Verify that resumed approval rechecks current permission before reaching approval api.
 #[tokio::test]
 async fn resumed_approval_rechecks_current_permission_before_reaching_approval_api() {
     let dir = Dir::new();
@@ -770,6 +795,7 @@ async fn resumed_approval_rechecks_current_permission_before_reaching_approval_a
         .all(|r| !(r.method == "POST" && r.url.path().ends_with("/reviews"))));
 }
 
+/// Verify that retry of failed suboperation does not repeat successful label write.
 #[tokio::test]
 async fn retry_of_failed_suboperation_does_not_repeat_successful_label_write() {
     let dir = Dir::new();
@@ -840,6 +866,7 @@ async fn retry_of_failed_suboperation_does_not_repeat_successful_label_write() {
     assert!(runtime.store.list(Some(State::Unknown)).unwrap().is_empty());
 }
 
+/// Verify that actual remote success local commit failure recovers without second post.
 #[tokio::test]
 async fn actual_remote_success_local_commit_failure_recovers_without_second_post() {
     let dir = Dir::new();
@@ -890,6 +917,7 @@ async fn actual_remote_success_local_commit_failure_recovers_without_second_post
     assert!(runtime.store.list(Some(State::Unknown)).unwrap().is_empty());
 }
 
+/// Verify that storage failure at send boundary makes zero external writes.
 #[tokio::test]
 async fn storage_failure_at_send_boundary_makes_zero_external_writes() {
     let dir = Dir::new();
@@ -913,6 +941,7 @@ async fn storage_failure_at_send_boundary_makes_zero_external_writes() {
         .all(|r| r.method == "GET"));
 }
 
+/// Verify that abandoned notification reservations survive restart and sent work cannot be superseded.
 #[test]
 fn abandoned_notification_reservations_survive_restart_and_sent_work_cannot_be_superseded() {
     let dir = Dir::new();
@@ -937,6 +966,7 @@ fn abandoned_notification_reservations_survive_restart_and_sent_work_cannot_be_s
     assert!(next.operation.recipients.is_empty());
 }
 
+/// Verify that cancellation after http send stays unknown and never reposts absent marker.
 #[tokio::test]
 async fn cancellation_after_http_send_stays_unknown_and_never_reposts_absent_marker() {
     use std::sync::atomic::AtomicBool;
@@ -1004,6 +1034,7 @@ async fn cancellation_after_http_send_stays_unknown_and_never_reposts_absent_mar
     );
 }
 
+/// Verify that failed budget transaction rolls back both claim and reservations.
 #[test]
 fn failed_budget_transaction_rolls_back_both_claim_and_reservations() {
     let dir = Dir::new();
@@ -1033,6 +1064,7 @@ fn failed_budget_transaction_rolls_back_both_claim_and_reservations() {
     assert_eq!(next.operation.recipients, vec!["alice"]);
 }
 
+/// Verify that a late worker cannot complete a new attempt.
 #[test]
 fn a_late_worker_cannot_complete_a_new_attempt() {
     let dir = Dir::new();
@@ -1041,7 +1073,13 @@ fn a_late_worker_cannot_complete_a_new_attempt() {
     let first = store.claim(&s, 100).unwrap().unwrap();
     store.recover_running(100, 101).unwrap();
     store
-        .resolve_unknown(&s.key, "not_sent", None, "no send intent", 102)
+        .resolve_unknown(
+            &store.get(&s.key).unwrap().unwrap(),
+            "not_sent",
+            None,
+            "no send intent",
+            102,
+        )
         .unwrap();
     let second = store.claim(&s, 103).unwrap().unwrap();
     assert_eq!(second.attempt, first.attempt + 1);
@@ -1053,6 +1091,7 @@ fn a_late_worker_cannot_complete_a_new_attempt() {
         .unwrap();
 }
 
+/// Verify that administrative success requires assignment receipt and resumes failed parent.
 #[test]
 fn administrative_success_requires_assignment_receipt_and_resumes_failed_parent() {
     let dir = Dir::new();
@@ -1089,6 +1128,7 @@ fn administrative_success_requires_assignment_receipt_and_resumes_failed_parent(
     );
 }
 
+/// Verify that claim insert failure keeps inbox retryable even without an operation row.
 #[tokio::test]
 async fn claim_insert_failure_keeps_inbox_retryable_even_without_an_operation_row() {
     let dir = Dir::new();
@@ -1120,3 +1160,6 @@ async fn claim_insert_failure_keeps_inbox_retryable_even_without_an_operation_ro
         .iter()
         .all(|r| r.method == "GET"));
 }
+
+#[path = "review_tests.rs"]
+mod review;

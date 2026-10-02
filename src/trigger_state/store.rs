@@ -18,6 +18,7 @@ pub enum State {
     Superseded,
 }
 impl State {
+    /// Map state variants to their stable SQL representation.
     fn name(self) -> &'static str {
         match self {
             Self::Pending => "pending",
@@ -47,6 +48,8 @@ pub struct Operation {
     pub spec: OperationSpec,
     pub state: State,
     pub attempts: u32,
+    /// Delivery that owns the current attempt; the original spec remains immutable.
+    pub lease_delivery: String,
     pub sent: bool,
     pub result: Option<Value>,
     pub detail: String,
@@ -63,6 +66,17 @@ pub struct Claim {
 pub struct InboxItem {
     pub context: EventContext,
     pub attempt: u32,
+}
+
+/// Raw SQL fields before fallible JSON decoding into an operation.
+struct OperationRow {
+    spec: String,
+    state: String,
+    attempts: u32,
+    sent: bool,
+    result: Option<String>,
+    detail: String,
+    lease_delivery: String,
 }
 
 pub struct Store(Mutex<Connection>);
@@ -88,6 +102,7 @@ impl Store {
             );
             CREATE TABLE IF NOT EXISTS operations(
                 key TEXT PRIMARY KEY, parent TEXT, delivery TEXT NOT NULL, spec TEXT NOT NULL,
+                lease_delivery TEXT NOT NULL DEFAULT '',
                 state TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0,
                 sent INTEGER NOT NULL DEFAULT 0, result TEXT, detail TEXT NOT NULL DEFAULT '',
                 next_at INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL
@@ -95,6 +110,8 @@ impl Store {
             CREATE INDEX IF NOT EXISTS operation_parent ON operations(parent);
             CREATE INDEX IF NOT EXISTS operation_delivery_state ON operations(delivery,state);
             CREATE INDEX IF NOT EXISTS inbox_due ON inbox(state,next_at);
+            CREATE INDEX IF NOT EXISTS inbox_retention ON inbox(state,updated_at);
+            CREATE INDEX IF NOT EXISTS operation_running_age ON operations(state,updated_at);
             CREATE TABLE IF NOT EXISTS recipients(
                 repository INTEGER NOT NULL, pr INTEGER NOT NULL, login TEXT NOT NULL,
                 operation TEXT NOT NULL REFERENCES operations(key), committed INTEGER NOT NULL DEFAULT 0,
@@ -112,9 +129,27 @@ impl Store {
             );
             COMMIT;")?;
         let version: i64 = db.query_row("SELECT version FROM trigger_meta", [], |r| r.get(0))?;
-        if version != 1 {
+        if !matches!(version, 1 | 2) {
             return Err("unsupported trigger database version".into());
         }
+        if version == 1 {
+            let has_owner = db
+                .prepare("PRAGMA table_info(operations)")?
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+                .iter()
+                .any(|name| name == "lease_delivery");
+            db.execute_batch("BEGIN IMMEDIATE;")?;
+            if !has_owner {
+                db.execute_batch(
+                    "ALTER TABLE operations ADD COLUMN lease_delivery TEXT NOT NULL DEFAULT '';",
+                )?;
+            }
+            db.execute_batch("UPDATE operations SET lease_delivery=delivery WHERE lease_delivery=''; UPDATE trigger_meta SET version=2; COMMIT;")?;
+        }
+        db.execute_batch(
+            "CREATE INDEX IF NOT EXISTS operation_lease ON operations(lease_delivery,state);",
+        )?;
         let store = Self(Mutex::new(db));
         // All attempts from the previous owner have lost their authority. First
         // make uncertainty explicit; only reconciliation can make them runnable.
@@ -122,12 +157,14 @@ impl Store {
         Ok(store)
     }
 
+    /// Acquire the connection for a short synchronous transaction only.
     fn db(&self) -> Result<MutexGuard<'_, Connection>> {
         self.0
             .lock()
             .map_err(|_| "trigger database mutex poisoned".into())
     }
 
+    /// Commit a recovery envelope once; reject conflicting reuse of a delivery ID.
     pub fn enqueue(&self, context: &EventContext, now: i64) -> Result<bool> {
         let db = self.db()?;
         let text = serde_json::to_string(context)?;
@@ -148,15 +185,30 @@ impl Store {
         Ok(added == 1)
     }
 
+    /// Return the first bounded page of inbox diagnostics.
     pub fn inbox_status(&self) -> Result<Vec<Value>> {
+        self.inbox_status_page(None, 100)
+    }
+
+    /// Page in stable delivery-ID order; pass the last delivery as the cursor.
+    pub fn inbox_status_page(&self, after: Option<&str>, limit: usize) -> Result<Vec<Value>> {
         let db = self.db()?;
-        let mut stmt = db.prepare(
-            "SELECT delivery,state,attempts,next_at,detail FROM inbox ORDER BY updated_at,delivery",
-        )?;
-        let rows = stmt.query_map([], |r| Ok(serde_json::json!({"delivery":r.get::<_,String>(0)?,"state":r.get::<_,String>(1)?,"attempts":r.get::<_,u32>(2)?,"next_at":r.get::<_,i64>(3)?,"detail":r.get::<_,String>(4)?})))?.collect::<std::result::Result<Vec<_>,_>>()?;
+        let mut stmt = db.prepare("SELECT delivery,state,attempts,next_at,detail FROM inbox WHERE (?1 IS NULL OR delivery>?1) ORDER BY delivery LIMIT ?2")?;
+        let rows = stmt.query_map(params![after,limit.clamp(1,500) as i64], |r| Ok(serde_json::json!({"delivery":r.get::<_,String>(0)?,"state":r.get::<_,String>(1)?,"attempts":r.get::<_,u32>(2)?,"next_at":r.get::<_,i64>(3)?,"detail":r.get::<_,String>(4)?})))?.collect::<std::result::Result<Vec<_>,_>>()?;
         Ok(rows)
     }
 
+    /// Retain 30 days of completed envelopes. Never delete failed/recoverable
+    /// work, operations, sessions, or lifetime recipient/budget records.
+    pub fn cleanup_inbox(&self, now: i64) -> Result<usize> {
+        Ok(self.db()?.execute("DELETE FROM inbox WHERE delivery IN (
+            SELECT i.delivery FROM inbox i WHERE i.state='succeeded' AND i.updated_at<?1
+            AND NOT EXISTS(SELECT 1 FROM operations o WHERE (o.delivery=i.delivery OR o.lease_delivery=i.delivery)
+                AND o.state NOT IN ('succeeded','superseded'))
+            ORDER BY i.updated_at,i.delivery LIMIT 500)",[now.saturating_sub(30*86400)])?)
+    }
+
+    /// Atomically claim one due envelope without holding a lock over execution.
     pub fn claim_inbox(&self, now: i64) -> Result<Option<InboxItem>> {
         let mut db = self.db()?;
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -185,11 +237,13 @@ impl Store {
         Ok(())
     }
 
+    /// Defer a previously interrupted envelope using its fenced inbox attempt.
     pub fn defer_interrupted_inbox(&self, item: &InboxItem, now: i64) -> Result<()> {
         self.db()?.execute("UPDATE inbox SET state='pending',next_at=?3,detail='worker interrupted' WHERE delivery=?1 AND attempts=?2 AND state='unknown'",params![item.context.delivery,item.attempt,now+retry_delay(item.attempt)])?;
         Ok(())
     }
 
+    /// Requeue interrupted planners; their external writes remain independently fenced.
     pub fn resume_inbox(&self, now: i64) -> Result<usize> {
         Ok(self.db()?.execute(
             "UPDATE inbox SET state='pending',next_at=?1 WHERE state='unknown'",
@@ -215,24 +269,28 @@ impl Store {
         Ok(count)
     }
 
+    /// Called only after this delivery's future has completed or been dropped.
+    /// Other deliveries, including a prior owner of the same business key, are
+    /// unaffected. Initial process recovery still uses recover_running.
+    pub fn recover_delivery(&self, delivery: &str, now: i64) -> Result<usize> {
+        let count = self.db()?.execute("UPDATE operations SET state='unknown',detail='delivery worker ended without a receipt',updated_at=?2 WHERE lease_delivery=?1 AND state='running'",params![delivery,now])?;
+        if count > 0 {
+            tracing::error!(
+                delivery,
+                count,
+                "interrupted trigger writes require reconciliation"
+            );
+        }
+        Ok(count)
+    }
+
+    /// Read the immutable intent, current lease and recipient reservations together.
     fn operation(db: &Connection, key: &str) -> Result<Option<Operation>> {
-        let row: Option<(String, String, u32, bool, Option<String>, String)> = db
-            .query_row(
-                "SELECT spec,state,attempts,sent,result,detail FROM operations WHERE key=?1",
-                [key],
-                |r| {
-                    Ok((
-                        r.get(0)?,
-                        r.get(1)?,
-                        r.get(2)?,
-                        r.get(3)?,
-                        r.get(4)?,
-                        r.get(5)?,
-                    ))
-                },
-            )
-            .optional()?;
-        let Some((spec, state, attempts, sent, result, detail)) = row else {
+        let row: Option<OperationRow> = db.query_row(
+            "SELECT spec,state,attempts,sent,result,detail,lease_delivery FROM operations WHERE key=?1",
+            [key], |r| Ok(OperationRow {spec:r.get(0)?,state:r.get(1)?,attempts:r.get(2)?,sent:r.get(3)?,result:r.get(4)?,detail:r.get(5)?,lease_delivery:r.get(6)?})
+        ).optional()?;
+        let Some(row) = row else {
             return Ok(None);
         };
         let mut stmt =
@@ -241,19 +299,22 @@ impl Store {
             .query_map([key], |r| r.get(0))?
             .collect::<std::result::Result<Vec<String>, _>>()?;
         Ok(Some(Operation {
-            spec: serde_json::from_str(&spec)?,
-            state: serde_json::from_value(Value::String(state))?,
-            attempts,
-            sent,
-            result: result.map(|s| serde_json::from_str(&s)).transpose()?,
-            detail,
+            spec: serde_json::from_str(&row.spec)?,
+            state: serde_json::from_value(Value::String(row.state))?,
+            attempts: row.attempts,
+            lease_delivery: row.lease_delivery,
+            sent: row.sent,
+            result: row.result.map(|s| serde_json::from_str(&s)).transpose()?,
+            detail: row.detail,
             recipients,
         }))
     }
+    /// Look up one business operation without changing its state.
     pub fn get(&self, key: &str) -> Result<Option<Operation>> {
         Self::operation(&*self.db()?, key)
     }
 
+    /// Return operation audit records, optionally restricted to one state.
     pub fn list(&self, state: Option<State>) -> Result<Vec<Operation>> {
         let db = self.db()?;
         let mut stmt = db.prepare(
@@ -278,10 +339,12 @@ impl Store {
         Ok(())
     }
 
+    /// Detect work belonging to either this original delivery or its current lease.
     pub fn unresolved(&self, delivery: &str) -> Result<bool> {
-        Ok(self.db()?.query_row("SELECT EXISTS(SELECT 1 FROM operations WHERE delivery=?1 AND state IN ('pending','running','unknown'))",[delivery],|r|r.get(0))?)
+        Ok(self.db()?.query_row("SELECT EXISTS(SELECT 1 FROM operations WHERE (delivery=?1 OR lease_delivery=?1) AND state IN ('pending','running','unknown'))",[delivery],|r|r.get(0))?)
     }
 
+    /// Read independently checkpointed writes belonging to a command planner.
     pub fn children(&self, parent: &str) -> Result<Vec<Operation>> {
         let db = self.db()?;
         let mut stmt = db.prepare("SELECT key FROM operations WHERE parent=?1 ORDER BY key")?;
@@ -293,6 +356,7 @@ impl Store {
             .collect()
     }
 
+    /// Atomically acquire a pending operation and bind the attempt to this delivery.
     pub fn claim(&self, spec: &OperationSpec, now: i64) -> Result<Option<Claim>> {
         self.claim_with_recipients(spec, &[], None, now)
     }
@@ -312,6 +376,7 @@ impl Store {
         self.claim_with_recipients(spec, users, Some(max), now)
     }
 
+    /// Claim an operation and reserve any requested notification budget atomically.
     fn claim_with_recipients(
         &self,
         spec: &OperationSpec,
@@ -330,7 +395,7 @@ impl Store {
             "INSERT OR IGNORE INTO operations(key,parent,delivery,spec,updated_at) VALUES(?1,?2,?3,?4,?5)",
             params![spec.key, spec.parent, spec.context.delivery, serde_json::to_string(spec)?, now],
         )?;
-        let changed = tx.execute("UPDATE operations SET state='running',attempts=attempts+1,sent=0,updated_at=?2 WHERE key=?1 AND state='pending' AND next_at<=?2", params![spec.key,now])?;
+        let changed = tx.execute("UPDATE operations SET state='running',attempts=attempts+1,sent=0,updated_at=?2,lease_delivery=?3 WHERE key=?1 AND state='pending' AND next_at<=?2", params![spec.key,now,spec.context.delivery])?;
         if changed == 0 {
             tx.commit()?;
             return Ok(None);
@@ -368,6 +433,7 @@ impl Store {
         Ok(())
     }
 
+    /// Commit a fenced result and update reservations without releasing unknown writes.
     pub fn finish(
         &self,
         claim: &Claim,
@@ -422,7 +488,7 @@ impl Store {
     /// evidence of no send. Only explicit `not_sent` may release reservations.
     pub fn resolve_unknown(
         &self,
-        key: &str,
+        expected: &Operation,
         outcome: &str,
         result: Option<&Value>,
         evidence: &str,
@@ -433,8 +499,12 @@ impl Store {
         }
         let mut db = self.db()?;
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let key = expected.spec.key.as_str();
         let op = Self::operation(&tx, key)?.ok_or("unknown operation key")?;
-        if op.state != State::Unknown {
+        if op.attempts != expected.attempts {
+            return Err("stale reconciliation attempt".into());
+        }
+        if expected.state != State::Unknown || op.state != State::Unknown {
             return Err("operation is not unknown".into());
         }
         if outcome == "retry_idempotent" && op.spec.kind != "ensure_labels" {
@@ -540,6 +610,7 @@ impl Store {
         Ok(())
     }
 
+    /// Insert an authorized mention source once, so edits cannot renew its source time.
     pub fn record_wake(&self, wake: &SessionWake) -> Result<()> {
         if [
             wake.repository_id,
@@ -556,6 +627,7 @@ impl Store {
         Ok(())
     }
 
+    /// Find an earlier wake in this user/thread scope within the supplied TTL.
     pub fn session_before(&self, call: &SessionWake, ttl_days: u16) -> Result<Option<SessionWake>> {
         if ttl_days == 0 {
             return Ok(None);

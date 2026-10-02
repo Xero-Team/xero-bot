@@ -46,7 +46,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps
 git diff --check
 ```
 
-以上检查全部通过：**411 个测试通过，0 失败、0 忽略**。其中新增 31 项测试（24 项状态/HTTP 验收、3 项 webhook 入口验收、4 项进程/CLI 验收，含子进程测试入口）。fmt、clippy、rustdoc（`-D warnings`）及 `git diff --check` 均通过。
+以上检查全部通过：**424 个测试通过，0 失败、0 忽略**。其中新增 44 项测试（36 项状态/HTTP 验收、4 项 webhook 入口验收、4 项进程/CLI 验收，含子进程测试入口）。fmt、clippy、rustdoc（`-D warnings`）及 `git diff --check` 均通过。
 
 ## 运维与范围边界
 
@@ -63,3 +63,24 @@ SQLite 与 GitHub 不能组成事务，**不承诺跨崩溃 exactly-once**。未
 创建规则、路径匹配和聚合通知消费者分别由 #15–#17 接入。通知消费者只能发送实际预占名单，
 名单为空必须跳过发送。rebase、CodeQL 标签事件、原生 review 合并队列及 idle scheduler
 继续走既有开关和路由。本验收只对应 #13，不能据此宣称父 issue #10 已整体完成。
+
+
+## PR #23 审查修复与全量复审
+
+| 问题 | 修复与回归证据 |
+| --- | --- |
+| [DELETE 204 被 JSON 反序列化误判](https://github.com/Xero-Team/xero-bot/pull/23#discussion_r4162637736) | 在 Octocrab 0.44.1 复现 EOF 错误；无请求体 DELETE 校验原始响应状态，204 不再进入 unknown；403/404/503 状态保留，指派删除仍读取响应 |
+| [长 review 阻塞后续命令](https://github.com/Xero-Team/xero-bot/pull/23#discussion_r4162637743) | 最多 8 个并发 worker，持续填补空位；长任务未结束时，后来到达的短任务已完成；20 个重复 delivery 实际只 POST 一次 |
+| 一个 worker 结束影响其他领取 | 恢复按当前 lease_delivery 隔离，健康任务不受影响；数据库 v1→v2 事务迁移保留证据 |
+| 原始 delivery 与当前领取者不一致 | 独立保留当前领取者，重领后恢复只作用于新 owner，原始 delivery 留作审计 |
+| 旧未发送证据放行新一次未知写入 | 核对提交校验尝试编号及 unknown 状态，旧证据不能将新一轮未知结果改回 pending |
+| 普通评论永久入库、查询无限增长 | 路由过滤散文和 bot 自回复；只清理超过 30 天且无未完成/失败关联动作的 succeeded inbox，每批最多 500；CLI 每页 100；永久动作和通知账本保留 |
+| 删除不存在标签错误记为失败 | 已用回归复现；标签移除的明确 404 记为成功无操作，与既有语义一致；其他 DELETE 错误不改变 |
+| 函数契约说明不足 | 补齐持久化接口、执行边界、管理入口及测试意图的 rustdoc 注释 |
+
+复审覆盖全部实现、部署配置、CLI、文档与测试，重点核查验签/入库顺序、
+任务作用域、事务与状态迁移、重启及取消、marker 身份、权限/配置/快照、
+通知预算与永久去重、会话源时间、存储升级和独立旧路由。修复后未发现新增阻塞问题。
+新增复审回归位于 `src/trigger_state/review_tests.rs` 和 webhook 入口测试。
+
+复审新增 13 项回归；全仓库 424 项测试通过，0 失败、0 忽略。格式、clippy、rustdoc 及 diff 检查全部通过。

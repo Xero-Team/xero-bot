@@ -1,15 +1,21 @@
 //! Offline administration: stop the server first so this process can own /data.
 use xero_bot::trigger_state::{operation_marker, Store};
 
+/// Run one offline query or evidence-backed state transition under exclusive ownership.
 fn run() -> xero_bot::trigger_state::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let usage = "usage: trigger-state DATA_DIR list|inbox|show [OPERATION_SHA256]\n       trigger-state DATA_DIR confirm-success|confirm-not-sent|retry OPERATION_SHA256 EVIDENCE [RECEIPT_JSON]\nStop the server first. Unknown writes cannot be blindly retried; confirm-not-sent requires external evidence.";
+    let usage = "usage: trigger-state DATA_DIR list|inbox|show [CURSOR_OR_OPERATION_SHA256]\n       trigger-state DATA_DIR confirm-success|confirm-not-sent|retry OPERATION_SHA256 EVIDENCE [RECEIPT_JSON]\nStop the server first. Unknown writes cannot be blindly retried; confirm-not-sent requires external evidence.";
     if args.len() < 2 {
         return Err(usage.into());
     }
     let store = Store::open(std::path::Path::new(&args[0]))?;
     if args[1] == "inbox" {
-        println!("{}", serde_json::to_string_pretty(&store.inbox_status()?)?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(
+                &store.inbox_status_page(args.get(2).map(String::as_str), 100)?
+            )?
+        );
         return Ok(());
     }
     let operations = store.list(None)?;
@@ -49,6 +55,7 @@ fn run() -> xero_bot::trigger_state::Result<()> {
     );
     Ok(())
 }
+/// Report administration errors and exit without starting a server or sending requests.
 fn main() {
     if let Err(error) = run() {
         eprintln!("{error}");

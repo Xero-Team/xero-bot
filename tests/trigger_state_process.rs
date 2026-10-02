@@ -5,9 +5,11 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use xero_bot::trigger_state::{EventContext, OperationSpec, State, Store};
 
+/// Build a complete event for the child process crash protocol.
 fn context() -> EventContext {
     EventContext::capture("issue_comment",&json!({"action":"created","repository":{"id":1,"full_name":"test/repo"},"installation":{"id":2},"issue":{"id":3,"number":1,"user":{"login":"alice"}},"comment":{"id":4,"body":"@bot ping","created_at":"2026-10-02T00:00:00Z","user":{"id":5,"login":"alice","type":"User"}}}),Some("crash-delivery")).unwrap().unwrap()
 }
+/// Create the operation whose durability is checked after abnormal process exit.
 fn spec() -> OperationSpec {
     OperationSpec {
         key: "crash-action".into(),
@@ -20,6 +22,7 @@ fn spec() -> OperationSpec {
 }
 struct Dir(PathBuf);
 impl Dir {
+    /// Allocate a unique directory shared only with this test child.
     fn new() -> Self {
         static N: AtomicU64 = AtomicU64::new(0);
         let p = std::env::temp_dir().join(format!(
@@ -32,11 +35,13 @@ impl Dir {
     }
 }
 impl Drop for Dir {
+    /// Remove the fixture volume after the child has exited.
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
+/// Exit without destructors at the requested persistence boundary, or hold the volume lock.
 #[test]
 fn crash_child() {
     let Ok(dir) = std::env::var("XERO_TEST_CRASH_DIR") else {
@@ -68,6 +73,7 @@ fn crash_child() {
     }
     std::process::exit(91);
 }
+/// Launch only the crash helper test with an explicit fixture directory and fault point.
 fn child(dir: &Dir, point: &str) -> Command {
     let mut c = Command::new(std::env::current_exe().unwrap());
     c.args(["--exact", "crash_child", "--nocapture"])
@@ -78,6 +84,7 @@ fn child(dir: &Dir, point: &str) -> Command {
     c
 }
 
+/// Check database evidence after real process termination at each crash boundary.
 #[test]
 fn crash_inbox_claim_send_and_remote_success_leave_durable_evidence() {
     for point in [
@@ -111,6 +118,7 @@ fn crash_inbox_claim_send_and_remote_success_leave_durable_evidence() {
     }
 }
 
+/// Prove exclusive ownership across processes and automatic lock release on SIGKILL.
 #[test]
 fn second_process_refuses_same_volume_and_sigkill_releases_ownership() {
     let dir = Dir::new();
@@ -142,6 +150,7 @@ fn second_process_refuses_same_volume_and_sigkill_releases_ownership() {
     assert!(Store::open(&dir.0).is_ok());
 }
 
+/// Exercise the packaged admin binary against a stopped process and persist its decision.
 #[test]
 fn offline_admin_cli_lists_and_records_explicit_confirmation() {
     let dir = Dir::new();

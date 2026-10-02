@@ -2,7 +2,7 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-Xero-Team 的组织级 GitHub App 机器人。Rust 实现,单二进制,自托管部署(Docker / VPS)。
+Xero-Team 的组织级 GitHub App 机器人。Rust 实现,主服务与离线状态管理 CLI,自托管部署(Docker / VPS)。
 
 功能:
 - **triagebot 风格评论命令** — `r?`、`?r cc`、label 管理、assign/claim、`r+` 代审批等

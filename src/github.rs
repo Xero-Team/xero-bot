@@ -335,18 +335,22 @@ impl Client {
         paginate(&self.crab, route).await
     }
 
+    /// Send a POST through the current durable scope, when one is active.
     pub async fn post(&self, route: &str, body: Option<Value>) -> Result<Value, GhError> {
         crate::trigger_state::runtime::write(self, "POST", route, body).await
     }
 
+    /// Checkpoint a resource update when invoked by a durable command.
     pub async fn patch(&self, route: &str, body: Option<Value>) -> Result<Value, GhError> {
         crate::trigger_state::runtime::write(self, "PATCH", route, body).await
     }
 
+    /// Send a PUT with the same durable receipt and uncertainty handling as other writes.
     pub async fn put(&self, route: &str, body: Option<Value>) -> Result<Value, GhError> {
         crate::trigger_state::runtime::write(self, "PUT", route, body).await
     }
 
+    /// Delete without a response payload, accepting successful 204 responses.
     pub async fn delete(&self, route: &str) -> Result<(), GhError> {
         crate::trigger_state::runtime::write(self, "DELETE", route, None)
             .await
@@ -369,6 +373,17 @@ impl Client {
             "POST" => self.crab.post(route, body.as_ref()).await,
             "PATCH" => self.crab.patch(route, body.as_ref()).await,
             "PUT" => self.crab.put(route, body.as_ref()).await,
+            "DELETE" if body.is_none() => {
+                let response = self
+                    .crab
+                    ._delete(route, None::<&Value>)
+                    .await
+                    .map_err(classify_octo_error)?;
+                octocrab::map_github_error(response)
+                    .await
+                    .map_err(classify_octo_error)?;
+                return Ok(Value::Null);
+            }
             "DELETE" => self.crab.delete(route, body.as_ref()).await,
             _ => return Err(GhError::BadShape("unsupported write method".into())),
         }

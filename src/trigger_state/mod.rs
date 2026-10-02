@@ -47,10 +47,12 @@ pub fn manual_key(repository: i64, comment: i64, command: &crate::commands::Comm
     serde_json::json!(["manual", repository, comment, command.id().name(), args]).to_string()
 }
 
+/// Key an opened rule independently of delivery, configuration, and head SHA.
 pub fn opened_key(repository: i64, thread: i64, rule: &str) -> String {
     serde_json::json!(["opened", repository, thread, rule]).to_string()
 }
 
+/// Validate and normalize a personal login for lifetime PR notification deduplication.
 pub fn recipient_key(repository: i64, pr: i64, login: &str) -> Result<String> {
     if !crate::commands::is_valid_login(login) {
         return Err("notification recipient must be a personal GitHub login".into());

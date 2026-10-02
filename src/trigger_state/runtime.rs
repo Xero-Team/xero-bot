@@ -3,7 +3,7 @@ use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use futures::FutureExt;
+use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
@@ -13,13 +13,16 @@ use crate::config::cache::RepositoryConfigCache;
 use crate::config::Config;
 use crate::github::{Client, GhError};
 
+/// Use epoch seconds for restart-safe scheduling and audit timestamps.
 fn now() -> i64 {
     crate::github::chrono_now_secs()
 }
+/// Represent local persistence failures as a GitHub-boundary refusal.
 fn error(message: impl ToString) -> GhError {
     GhError::BadShape(message.to_string())
 }
 
+/// Derive a stable hidden marker from the business operation key.
 pub fn operation_marker(key: &str) -> String {
     format!(
         "<!-- xero-trigger:{} -->",
@@ -49,7 +52,7 @@ pub async fn reconcile(
     let spec = &operation.spec;
     if !operation.sent {
         store.resolve_unknown(
-            &spec.key,
+            operation,
             "not_sent",
             None,
             "request was never marked for sending",
@@ -76,7 +79,7 @@ pub async fn reconcile(
                 && object["id"].as_i64().is_some_and(|id| id > 0)
         }) {
             store.resolve_unknown(
-                &spec.key,
+                operation,
                 "succeeded",
                 Some(&receipt(found)),
                 "verified operation marker and App author",
@@ -107,7 +110,7 @@ pub async fn reconcile(
             })
         });
         store.resolve_unknown(
-            &spec.key,
+            operation,
             if present {
                 "succeeded"
             } else {
@@ -160,9 +163,11 @@ struct Frame {
 }
 tokio::task_local! { static ACTIVE: Arc<Frame>; }
 
+/// Report whether this task is inside a durable trigger execution scope.
 pub(crate) fn active() -> bool {
     ACTIVE.try_with(|_| ()).is_ok()
 }
+/// Capture the configuration and PR snapshot used by subsequent command claims.
 pub(crate) fn snapshot(config: &str, head: Option<&str>, base: Option<&str>) -> Result<()> {
     if let Ok(frame) = ACTIVE.try_with(Arc::clone) {
         *frame
@@ -182,6 +187,7 @@ pub struct Runtime {
     pump: tokio::sync::Mutex<()>,
 }
 impl Runtime {
+    /// Acquire exclusive state ownership before starting any trigger worker.
     pub fn open(data_dir: &std::path::Path) -> Result<Self> {
         Ok(Self {
             store: Arc::new(Store::open(data_dir)?),
@@ -189,52 +195,100 @@ impl Runtime {
         })
     }
 
-    /// Recover and process a bounded batch. Each pass re-enters the live config
-    /// and authorization gates. Unknown writes are only read/reconciled.
+    /// Run up to eight deliveries concurrently, continuously refilling free
+    /// slots so a slow review does not delay commands arriving after it.
     pub async fn pump(&self, cfg: &Config) -> Result<usize> {
+        self.pump_with(
+            |context| async move {
+                let gh = Client::installation_resolved(cfg, context.installation_id).await?;
+                self.process(&gh, cfg, &RepositoryConfigCache::shared(), &context)
+                    .await
+            },
+            std::time::Duration::from_secs(900),
+            std::time::Duration::from_secs(1),
+        )
+        .await
+    }
+
+    /// Production scheduling with an injectable processor/clock duration for
+    /// concurrency tests. Futures stay owned here; cancellation drops them.
+    pub(super) async fn pump_with<F, Fut>(
+        &self,
+        run: F,
+        timeout: std::time::Duration,
+        poll: std::time::Duration,
+    ) -> Result<usize>
+    where
+        F: Fn(EventContext) -> Fut,
+        Fut: Future<Output = Result<()>>,
+    {
         let Ok(_guard) = self.pump.try_lock() else {
             return Ok(0);
         };
-        self.store.recover_running(now() - 900, now())?;
+        // No workers from this pump can be active while the guard is available.
+        self.store.recover_running(i64::MAX, now())?;
         self.store.resume_inbox(now())?;
+        self.store.cleanup_inbox(now())?;
+        let mut cleanup_at = tokio::time::Instant::now();
+        let mut workers = FuturesUnordered::new();
         let mut count = 0;
-        for _ in 0..32 {
-            let Some(item) = self.store.claim_inbox(now())? else {
-                break;
-            };
-            let result = tokio::time::timeout(
-                std::time::Duration::from_secs(900),
-                std::panic::AssertUnwindSafe(async {
-                    let gh =
-                        Client::installation_resolved(cfg, item.context.installation_id).await?;
-                    self.process(&gh, cfg, &RepositoryConfigCache::shared(), &item.context)
-                        .await
-                })
-                .catch_unwind(),
-            )
-            .await;
-            let problem = match result {
-                Ok(Ok(Ok(()))) => None,
-                Ok(Ok(Err(e))) => Some(crate::redact::scrub(&e.to_string())),
-                Err(_) | Ok(Err(_)) => {
-                    self.store.recover_running(i64::MAX, now())?;
-                    self.store.defer_interrupted_inbox(&item, now())?;
-                    tracing::error!(delivery=%item.context.delivery,"trigger worker interrupted; writes require reconciliation");
-                    continue;
-                }
-            };
-            if let Some(problem) = &problem {
-                tracing::warn!(delivery=%item.context.delivery,"trigger deferred: {problem}");
+        loop {
+            while workers.len() < 8 {
+                let Some(item) = self.store.claim_inbox(now())? else {
+                    break;
+                };
+                let work = run(item.context.clone());
+                workers.push(self.process_item(item, work, timeout));
             }
-            self.store.finish_inbox(&item, problem.as_deref(), now())?;
-            count += 1;
+            if workers.is_empty() {
+                return Ok(count);
+            }
+            tokio::select! {
+                result = workers.next() => {
+                    result.expect("worker set is nonempty")?;
+                    count += 1;
+                }
+                _ = tokio::time::sleep(poll) => {}
+            }
+            if cleanup_at.elapsed() >= std::time::Duration::from_secs(60) {
+                self.store.cleanup_inbox(now())?;
+                cleanup_at = tokio::time::Instant::now();
+            }
         }
-        Ok(count)
+    }
+
+    /// Timeout/panic handling is local to this delivery, including writes first
+    /// created by a different delivery and reclaimed by this worker.
+    async fn process_item<F: Future<Output = Result<()>>>(
+        &self,
+        item: super::InboxItem,
+        work: F,
+        timeout: std::time::Duration,
+    ) -> Result<()> {
+        let result =
+            tokio::time::timeout(timeout, std::panic::AssertUnwindSafe(work).catch_unwind()).await;
+        let mut problem = match result {
+            Ok(Ok(Ok(()))) => None,
+            Ok(Ok(Err(e))) => Some(crate::redact::scrub(&e.to_string())),
+            Err(_) | Ok(Err(_)) => {
+                Some("trigger worker interrupted; writes require reconciliation".into())
+            }
+        };
+        // All local request futures have ended. A missing receipt is unknown,
+        // even after an otherwise normal return, and only its owner is fenced.
+        if self.store.recover_delivery(&item.context.delivery, now())? > 0 {
+            problem.get_or_insert_with(|| "trigger writes awaiting reconciliation".into());
+        }
+        if let Some(problem) = &problem {
+            tracing::warn!(delivery=%item.context.delivery,"trigger deferred: {problem}");
+        }
+        self.store.finish_inbox(&item, problem.as_deref(), now())?;
+        Ok(())
     }
 
     /// Injectable client/cache for acceptance tests. This is also the consumer
     /// seam for #15–#17: no generic command-string automatic executor exists.
-    pub async fn process(
+    pub(super) async fn process(
         &self,
         gh: &Client,
         cfg: &Config,
@@ -301,6 +355,7 @@ pub(crate) async fn command<F: Future<Output = String>>(
     }
 }
 
+/// Recover and claim one canonical command, then checkpoint its independent writes.
 async fn run_command<F: Future<Output = String>>(
     gh: &Client,
     outer: Arc<Frame>,
@@ -344,7 +399,7 @@ async fn run_command<F: Future<Output = String>>(
                 return Ok("unknown: operator attention required".into());
             }
             outer.store.resolve_unknown(
-                &key,
+                &old,
                 "not_sent",
                 None,
                 "command planner has no uncertain children",
@@ -438,6 +493,7 @@ pub(crate) async fn write(
     }
 }
 
+/// Persist intent before sending, reuse confirmed receipts, and pause ambiguous writes.
 async fn durable_write(
     gh: &Client,
     frame: &Frame,
@@ -546,6 +602,24 @@ async fn durable_write(
             Ok(value)
         }
         Err(e) => {
+            // The command handlers already treat an absent label as removed.
+            // Preserve that idempotent result in its receipt as well.
+            if method == "DELETE"
+                && route.contains("/labels/")
+                && matches!(&e, GhError::Api { status: 404, .. })
+            {
+                frame
+                    .store
+                    .finish(
+                        &claim,
+                        State::Succeeded,
+                        Some(&Value::Null),
+                        "label already absent",
+                        now(),
+                    )
+                    .map_err(error)?;
+                return Ok(Value::Null);
+            }
             let state = if matches!(
                 &e,
                 GhError::Api {
