@@ -162,7 +162,9 @@ pub async fn handle_comment(
     }
 
     for cmd in commands {
-        let r = handle_one(gh, cfg, ctx, cmd).await;
+        let r =
+            crate::trigger_state::runtime::command(gh, &cmd, handle_one(gh, cfg, ctx, cmd.clone()))
+                .await;
         results.push(r);
     }
     results

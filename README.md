@@ -2,7 +2,7 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-Org-wide GitHub App bot for the Xero-Team. Written in Rust — a single self-hosted binary (Docker / VPS).
+Org-wide GitHub App bot for the Xero-Team. Written in Rust — a self-hosted server with an offline state administration CLI (Docker / VPS).
 
 Features:
 - **triagebot-style comment commands** — `r?`, `?r cc`, label management, assign/claim, `r+` approval on behalf, and more
@@ -11,7 +11,7 @@ Features:
 - **CodeQL quality reports** — reads the repo's existing code scanning alerts and maps them to files changed in the PR
 - **Bilingual replies** — answers in English or Chinese, chosen from the PR's own commit messages; no configuration
 
-Repository TOML loading, disabled-command vetoes and configuration failure handling are available independently of the idle scheduler. See the [configuration contract and current delivery scope](docs/repository-config.md); strict parsing and per-candidate mention gates are available; durable session lifecycle follows in #13–#14.
+Repository TOML loading, disabled-command vetoes and configuration failure handling are available independently of the idle scheduler. See the [configuration contract and current delivery scope](docs/repository-config.md); strict parsing and per-candidate mention gates are available; durable trigger storage is available in [#13](docs/issue-13-acceptance.md); session lifecycle policy follows in #14.
 
 
 ## Command reference
@@ -39,7 +39,7 @@ By default, `claim`, `unclaim`, `cc`, `r?` and `ready` need no mention. `r+` and
 are equivalent approval forms, and invalid/missing targets never become ordinary
 approvals. Other commands use `mention_once`. Session evidence still comes from
 the same user's explicit, enabled commands in the thread's history; durable TTL,
-source ordering and authorization preflight remain #13/#14. See the
+source-order policy and authorization preflight remain #14; #13 provides their persistent storage primitives. See the
 [parser acceptance record](docs/issue-12-acceptance.md) for the delivered boundaries.
 
 | Command | Description |
@@ -257,6 +257,7 @@ What you get in the container:
   | Path | Contents | Safe to delete? |
   |---|---|---|
   | `repos/{owner}__{repo}/pr-{n}` | One shallow checkout per PR (depth `CHECKOUT_DEPTH`, default 100) | Yes — a merged PR's directory can go |
+  | `command-triggers.sqlite` and WAL | Trigger inbox, action receipts, session records and permanent notification budget | No |
   | `sessions/{owner}__{repo}` | `pi` sessions, **shared per repository** = the incremental project understanding | No |
   | `codex/{owner}__{repo}-pr{n}-{sha}.md` | One `codex` run's output, deleted once read | Nothing to manage |
 
@@ -323,7 +324,13 @@ src/
 └── main.rs            self-hosted axum server
 ```
 
-State persistence: labels, PR review history and merge queue state live in GitHub.
+State persistence: trigger inbox, command/write receipts, session primitives and notification
+budgets always use `XERO_DATA_DIR/command-triggers.sqlite`, independently of the idle
+switch. Use one process with a persistent volume. Unknown non-idempotent writes pause
+for reconciliation; [operations and recovery](docs/trigger-state.md),
+[#13 acceptance](docs/issue-13-acceptance.md). Session policy integration remains #14.
+
+Labels, PR review history and merge queue state live in GitHub.
 The optional idle workflow scheduler also keeps activity timestamps, dispatch
 intent and retry history in SQLite under `XERO_DATA_DIR`; no external database
 service is required.

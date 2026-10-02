@@ -26,8 +26,10 @@ use xero_bot::webhook::verify_signature;
 struct AppState {
     cfg: Config,
     idle_workflows: Option<Arc<xero_bot::idle_workflows::Scheduler>>,
+    triggers: Arc<xero_bot::trigger_state::Runtime>,
 }
 
+/// Validate deployment settings, acquire state ownership, then start workers and HTTP ingress.
 #[tokio::main]
 async fn main() {
     // initialize tracing so background-work errors actually show in logs
@@ -45,6 +47,15 @@ async fn main() {
         eprintln!("ERROR: {e}");
         std::process::exit(2);
     }
+
+    let triggers = match xero_bot::trigger_state::Runtime::open(std::path::Path::new(&cfg.data_dir))
+    {
+        Ok(runtime) => Arc::new(runtime),
+        Err(e) => {
+            eprintln!("ERROR: cannot own trigger state in XERO_DATA_DIR (storage unavailable or another instance owns it): {e}");
+            std::process::exit(2);
+        }
+    };
 
     let idle_workflows = if cfg.idle_workflows_enabled {
         match xero_bot::idle_workflows::Scheduler::open(
@@ -152,11 +163,23 @@ async fn main() {
         });
     }
 
+    let trigger_worker = Arc::clone(&triggers);
+    let trigger_cfg = cfg.clone();
+    tokio::spawn(async move {
+        loop {
+            if let Err(error) = trigger_worker.pump(&trigger_cfg).await {
+                tracing::error!("trigger recovery unavailable: {error}");
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        }
+    });
+
     let port = cfg.port;
     let bot_name = cfg.bot_name.clone();
     let state = AppState {
         cfg,
         idle_workflows,
+        triggers,
     };
 
     let app = Router::new()
@@ -191,6 +214,7 @@ async fn health() -> Json<Value> {
     Json(json!({"status": "ok"}))
 }
 
+/// Verify signatures, reject irrelevant comments, and persist work before acknowledging it.
 async fn webhook(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -221,6 +245,41 @@ async fn webhook(
     xero_bot::config::cache::RepositoryConfigCache::shared()
         .observe_webhook(&event_header, &payload);
 
+    // Reject irrelevant/self comments before retaining user text. Routing is
+    // pure; execution still reparses and checks current policy in the worker.
+    if event_header == "issue_comment" {
+        if let Routing::Respond(response) = route_event(&state.cfg, &event_header, &payload) {
+            return (StatusCode::OK, Json(response));
+        }
+    }
+
+    let delivery = headers
+        .get("x-github-delivery")
+        .and_then(|v| v.to_str().ok());
+    let durable =
+        match xero_bot::trigger_state::EventContext::capture(&event_header, &payload, delivery) {
+            Ok(context) => context,
+            Err(error) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error":error.to_string()})),
+                )
+            }
+        };
+    if let Some(context) = &durable {
+        if let Err(error) = state
+            .triggers
+            .store
+            .enqueue(context, xero_bot::github::chrono_now_secs())
+        {
+            tracing::error!("trigger inbox persistence failed: {error}");
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error":"trigger persistence unavailable"})),
+            );
+        }
+    }
+
     if let Some(scheduler) = &state.idle_workflows {
         let delivery = headers
             .get("x-github-delivery")
@@ -232,6 +291,13 @@ async fn webhook(
                 Json(json!({"error": "activity persistence unavailable"})),
             );
         }
+    }
+
+    if durable.is_some() && event_header == "issue_comment" {
+        return (
+            StatusCode::OK,
+            Json(json!({"accepted":true,"persisted":true})),
+        );
     }
 
     match route_event(&state.cfg, &event_header, &payload) {
@@ -282,4 +348,134 @@ async fn cron_sweep(
             json!({"ok": true, "summary": summary, "merge_queue": merge_queue_summary, "idle_workflows": idle_workflows_summary}),
         ),
     )
+}
+
+#[cfg(test)]
+mod trigger_ingress_tests {
+    use super::*;
+    use hmac::Mac;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    struct Dir(PathBuf);
+    impl Dir {
+        /// Allocate an isolated state directory for ingress tests.
+        fn new() -> Self {
+            static N: AtomicU64 = AtomicU64::new(0);
+            let p = std::env::temp_dir().join(format!(
+                "xero-trigger-ingress-{}-{}",
+                std::process::id(),
+                N.fetch_add(1, Ordering::SeqCst)
+            ));
+            std::fs::create_dir_all(&p).unwrap();
+            Self(p)
+        }
+    }
+    impl Drop for Dir {
+        /// Remove only the temporary state directory owned by this test.
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    /// Build a signed-command fixture with complete recovery identity.
+    fn payload() -> Value {
+        json!({"action":"created","repository":{"id":1,"full_name":"test/repo"},"installation":{"id":2},"issue":{"id":3,"number":1,"user":{"login":"alice"}},"comment":{"id":4,"body":"@bot ping","created_at":"2026-10-02T00:00:00Z","user":{"id":5,"login":"alice","type":"User"}}})
+    }
+    /// Create ingress state with durable storage and the idle scheduler disabled.
+    fn state(dir: &Dir) -> AppState {
+        let mut cfg = Config::from_env();
+        cfg.webhook_secret = "secret".into();
+        cfg.bot_name = "bot".into();
+        cfg.idle_workflows_enabled = false;
+        AppState {
+            cfg,
+            idle_workflows: None,
+            triggers: Arc::new(xero_bot::trigger_state::Runtime::open(&dir.0).unwrap()),
+        }
+    }
+    /// Sign the exact fixture bytes and attach GitHub event and delivery headers.
+    fn signed(body: &[u8]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        let mut mac = xero_bot::webhook::HmacSha256::new_from_slice(b"secret").unwrap();
+        mac.update(body);
+        h.insert(
+            "x-hub-signature-256",
+            format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
+                .parse()
+                .unwrap(),
+        );
+        h.insert("x-github-delivery", "delivery".parse().unwrap());
+        h.insert("x-github-event", "issue_comment".parse().unwrap());
+        h
+    }
+    /// Assert that accepted command events are already durable with idle scheduling disabled.
+    #[tokio::test]
+    async fn verified_inbox_is_committed_before_acceptance_without_idle() {
+        let dir = Dir::new();
+        let s = state(&dir);
+        let body = serde_json::to_vec(&payload()).unwrap();
+        let headers = signed(&body);
+        let (status, result) = webhook(State(s.clone()), headers, body.into()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(result.0["persisted"], true);
+        assert_eq!(
+            s.triggers.store.inbox_status().unwrap()[0]["state"],
+            "pending"
+        );
+    }
+    /// Reject untrusted or incomplete command envelopes before inserting inbox rows.
+    #[tokio::test]
+    async fn invalid_signature_and_missing_recovery_metadata_cannot_enter_inbox() {
+        let dir = Dir::new();
+        let s = state(&dir);
+        let body = serde_json::to_vec(&payload()).unwrap();
+        assert_eq!(
+            webhook(State(s.clone()), HeaderMap::new(), body.clone().into())
+                .await
+                .0,
+            StatusCode::UNAUTHORIZED
+        );
+        let mut h = signed(&body);
+        h.remove("x-github-delivery");
+        assert_eq!(
+            webhook(State(s.clone()), h, body.into()).await.0,
+            StatusCode::BAD_REQUEST
+        );
+        assert!(s.triggers.store.inbox_status().unwrap().is_empty());
+    }
+    /// Inject an inbox failure and verify a retryable response with no action execution.
+    #[tokio::test]
+    async fn injected_disk_failure_returns_retryable_failure_before_any_execution() {
+        let dir = Dir::new();
+        drop(state(&dir));
+        let db = rusqlite::Connection::open(dir.0.join("command-triggers.sqlite")).unwrap();
+        db.execute_batch("CREATE TRIGGER inject_disk_failure BEFORE INSERT ON inbox BEGIN SELECT RAISE(ABORT,'injected disk failure'); END;").unwrap();
+        drop(db);
+        let s = state(&dir);
+        let body = serde_json::to_vec(&payload()).unwrap();
+        let headers = signed(&body);
+        let (status, result) = webhook(State(s.clone()), headers, body.into()).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_ne!(result.0["accepted"], true);
+        assert!(s.triggers.store.list(None).unwrap().is_empty());
+    }
+    /// Ordinary discussion and self replies must never consume durable inbox space.
+    #[tokio::test]
+    async fn irrelevant_and_self_comments_are_filtered_before_persistence() {
+        let dir = Dir::new();
+        let s = state(&dir);
+        for self_reply in [false, true] {
+            let mut event = payload();
+            if self_reply {
+                event["comment"]["user"] = json!({"id":9,"login":"bot[bot]","type":"Bot"});
+            } else {
+                event["comment"]["body"] = json!("claim 是什么意思？");
+            }
+            let body = serde_json::to_vec(&event).unwrap();
+            let (status, result) = webhook(State(s.clone()), signed(&body), body.into()).await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(result.0["ignored"].is_string());
+            assert_ne!(result.0["persisted"], true);
+        }
+        assert!(s.triggers.store.inbox_status().unwrap().is_empty());
+    }
 }

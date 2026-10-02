@@ -7,7 +7,7 @@ WORKDIR /build
 # cache deps
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
-RUN cargo build --release --bin server
+RUN cargo build --release --bin server --bin trigger-state
 
 # ---- runtime stage ----
 FROM debian:bookworm-slim
@@ -21,6 +21,7 @@ RUN npm install -g @mariozechner/pi-coding-agent @openai/codex \
     || echo "WARN: engine CLI install failed; auto engine falls back to agent/builtin"
 
 COPY --from=builder /build/target/release/server /usr/local/bin/server
+COPY --from=builder /build/target/release/trigger-state /usr/local/bin/trigger-state
 
 ENV XERO_DATA_DIR=/data
 VOLUME /data

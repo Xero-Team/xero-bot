@@ -320,8 +320,8 @@ async fn session_open(
 }
 
 /// Gate source-bearing candidates, then resolve the permitted execution set.
-/// Session storage, TTL and source-comment ordering remain the work of #13/#14.
-async fn execute_comment_with_client(
+/// #13 supplies durable execution; session lifecycle policy is connected in #14.
+pub(crate) async fn execute_comment_with_client(
     gh: &Client,
     cfg: &Config,
     cache: &RepositoryConfigCache,
@@ -370,9 +370,34 @@ async fn execute_comment_with_client(
                 .diagnostic(lang)
                 .unwrap_or_else(|| problem.message(lang));
             report_config_problem(gh, cache, key, &repo, pr_number, problem, &message).await;
+            if crate::trigger_state::runtime::active() {
+                return Err(format!("configuration unavailable: {problem}"));
+            }
             return Ok(());
         }
     };
+    if crate::trigger_state::runtime::active() {
+        let pr = if is_pr {
+            Some(
+                gh.get_pr(&repo, pr_number)
+                    .await
+                    .map_err(|e| e.to_string())?,
+            )
+        } else {
+            None
+        };
+        let head = pr.as_ref().and_then(|p| p["head"]["sha"].as_str());
+        let base = pr.as_ref().and_then(|p| p["base"]["sha"].as_str());
+        if is_pr && (head.is_none() || base.is_none()) {
+            return Err("PR snapshot unavailable".into());
+        }
+        crate::trigger_state::runtime::snapshot(
+            &state.snapshot().expect("checked above").commit_sha,
+            head,
+            base,
+        )
+        .map_err(|e| e.to_string())?;
+    }
     // Show failures in other domains on an explicit status/help request while
     // keeping independently valid comment commands usable. Dynamic help is #18.
     if commands.iter().any(|c| {
