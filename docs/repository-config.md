@@ -55,6 +55,10 @@ open (including drafts); references to disabled commands are invalid. Up to 32
 rules with nonempty unique IDs are allowed. Identical canonical actions/parameters
 are coalesced, preserving all matched IDs. Labels must already exist; the deployed
 queue control labels and nonempty `CODEQL_LABEL` are rejected before planning.
+The veto uses the same Unicode lowercase normalization as label matching.
+For opened events, a verified invalid TOML document/events domain records a
+permanent refusal for that thread; later policy repairs cannot backfill it.
+Transient configuration reads retain retryable inbox work.
 See [opened-event behavior and acceptance](issue-15-acceptance.md). Path rules
 still return `Unsupported` until #16–#17 implement them. Failures are available
 through `RepositoryConfig::problems()`, logged on load and shown by help/ping.

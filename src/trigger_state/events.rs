@@ -1,7 +1,7 @@
 //! Opened-event plans are trusted repository policy, never synthetic comments.
 use super::*;
-use crate::config::cache::RepositoryKey;
-use crate::config::repository::{Event, EventAction, EventRule};
+use crate::config::cache::{ConfigState, RepositoryKey};
+use crate::config::repository::{Event, EventAction, EventRule, ReasonCode, Rule};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -9,6 +9,32 @@ struct Plan {
     rules: Vec<String>,
     action: EventAction,
     config_sha: String,
+}
+
+/// A fetched invalid document/domain is a durable refusal, not an outage.
+/// Freeze no subscription (or revoke an existing plan) so repairs cannot
+/// backfill old threads. Only unavailable reads retain the inbox for retry.
+fn event_policy<'a>(
+    state: &'a ConfigState,
+    repo: &str,
+) -> Result<(Option<&'a str>, &'a [Rule<EventRule>])> {
+    match state {
+        ConfigState::Ready(snapshot) => {
+            let rules = match &snapshot.config.events {
+                Ok(rules) => rules.as_slice(),
+                Err(problem) => {
+                    tracing::warn!(repo, "opened policy refused: {problem}");
+                    &[]
+                }
+            };
+            Ok((Some(&snapshot.commit_sha), rules))
+        }
+        ConfigState::Unavailable { problem, .. } if problem.code == ReasonCode::InvalidDocument => {
+            tracing::warn!(repo, "opened policy refused: {problem}");
+            Ok((None, &[]))
+        }
+        ConfigState::Unavailable { problem, .. } => Err(problem.clone().into()),
+    }
 }
 
 /// Verify App provenance; a copied marker or a human with a similar login
@@ -61,8 +87,7 @@ pub(super) async fn process(
         repository_id: ctx.repository_id,
     };
     let state = cache.load(gh, key, &ctx.repo).await;
-    let snapshot = state.snapshot().map_err(Clone::clone)?;
-    let rules = snapshot.config.events.as_ref().map_err(Clone::clone)?;
+    let (config_sha, rules) = event_policy(&state, &ctx.repo)?;
     let current: Vec<&EventRule> = rules
         .iter()
         .filter_map(|r| {
@@ -88,7 +113,7 @@ pub(super) async fn process(
             proposed.push(Plan {
                 rules: vec![rule.id.clone()],
                 action: rule.action.clone(),
-                config_sha: snapshot.commit_sha.clone(),
+                config_sha: config_sha.unwrap_or_default().into(),
             });
         }
     }
@@ -106,8 +131,7 @@ pub(super) async fn process(
         // A preceding review may take longer than the cache TTL. Revalidate
         // before each action instead of lending it the old sibling's policy.
         let state = cache.load(gh, key, &ctx.repo).await;
-        let snapshot = state.snapshot().map_err(Clone::clone)?;
-        let rules = snapshot.config.events.as_ref().map_err(Clone::clone)?;
+        let (config_sha, rules) = event_policy(&state, &ctx.repo)?;
         // A merged action retains authority while at least one of its original
         // rules still grants exactly that action. Added rules never backfill.
         let compatible = rules.iter().filter_map(|r| r.value.as_ref().ok()).any(|r| {
@@ -116,17 +140,7 @@ pub(super) async fn process(
                 && plan.action == r.action
                 && r.action.validate_deployment(cfg).is_ok()
         });
-        if let Err(error) = execute(
-            runtime,
-            gh,
-            cfg,
-            ctx,
-            &snapshot.commit_sha,
-            &plan,
-            compatible,
-        )
-        .await
-        {
+        if let Err(error) = execute(runtime, gh, cfg, ctx, config_sha, &plan, compatible).await {
             tracing::error!(repo=%ctx.repo, thread=ctx.number, rules=?plan.rules, "opened action deferred: {error}");
             deferred = true;
         }
@@ -144,7 +158,7 @@ async fn execute(
     gh: &Client,
     cfg: &Config,
     ctx: &EventContext,
-    config_sha: &str,
+    config_sha: Option<&str>,
     plan: &Plan,
     compatible: bool,
 ) -> Result<()> {
@@ -154,12 +168,19 @@ async fn execute(
         if old.state == State::Running {
             return Err("opened action is owned by another worker".into());
         }
+        let revoked = !compatible || old.state == State::Superseded;
+        if revoked {
+            // Persist the veto before any fallible network reconciliation.
+            store.revoke_opened(&key, now())?;
+        }
         for child in store.children(&key)? {
             if child.state == State::Unknown {
                 reconcile(store, gh, cfg.app_id.parse()?, &child, now()).await?;
             }
         }
-        if !compatible {
+        if revoked {
+            // Reconciliation may have proved a child safe to retry. A revoked
+            // parent must discard that child even if the rule was restored.
             store.revoke_opened(&key, now())?;
         }
         let children = store.children(&key)?;
@@ -171,7 +192,7 @@ async fn execute(
                 "automatic report publication uncertain; no recomputation or resend".into(),
             );
         }
-        if !compatible
+        if revoked
             || matches!(
                 old.state,
                 State::Succeeded | State::Failed | State::Superseded
@@ -180,7 +201,15 @@ async fn execute(
             return Ok(());
         }
         if old.state == State::Unknown {
-            if children.iter().any(|c| c.state == State::Succeeded) {
+            if !children.iter().any(|c| c.state == State::Pending)
+                && children.iter().any(|c| {
+                    c.state == State::Succeeded
+                        && (c.spec.kind == "ensure_labels"
+                            || c.spec.kind == "review"
+                            || (c.spec.kind == "comment"
+                                && c.spec.request["automatic_report"] == true))
+                })
+            {
                 store.resolve_unknown(
                     &old,
                     "succeeded",
@@ -210,7 +239,7 @@ async fn execute(
             parent: None,
             kind: "opened".into(),
             context: ctx.clone(),
-            config_sha: Some(config_sha.into()),
+            config_sha: config_sha.map(str::to_owned),
             request: json!({"action":plan.action,"rules":plan.rules,"planned_config_sha":plan.config_sha}),
         };
         if let Some(claim) = store.claim(&spec, now())? {
@@ -249,7 +278,7 @@ async fn execute(
         parent: None,
         kind: "opened".into(),
         context: context.clone(),
-        config_sha: Some(config_sha.into()),
+        config_sha: config_sha.map(str::to_owned),
         request: json!({"action":plan.action,"rules":plan.rules,"planned_config_sha":plan.config_sha}),
     };
     let Some(claim) = store.claim(&spec, now())? else {
@@ -264,7 +293,7 @@ async fn execute(
         app_id: cfg.app_id.parse()?,
         parent: key.clone(),
         snapshot: Mutex::new((
-            Some(config_sha.into()),
+            config_sha.map(str::to_owned),
             spec.context.head_sha.clone(),
             spec.context.base_sha.clone(),
         )),

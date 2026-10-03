@@ -541,7 +541,7 @@ pub async fn run_pi(
     lang: Lang,
 ) -> String {
     let _ = gh
-        .post_issue_comment(
+        .post_progress_comment(
             repo,
             pr_number,
             lang.pick(
@@ -667,7 +667,7 @@ pub async fn run_codex(
     lang: Lang,
 ) -> String {
     let _ = gh
-        .post_issue_comment(
+        .post_progress_comment(
             repo,
             pr_number,
             lang.pick(
@@ -805,7 +805,7 @@ pub async fn run_review(
 ) -> String {
     let Some(_in_flight) = InFlight::claim(format!("{repo}#{pr_number}")) else {
         let _ = gh
-            .post_issue_comment(
+            .post_progress_comment(
                 repo,
                 pr_number,
                 lang.pick(

@@ -494,6 +494,20 @@ impl Client {
         Ok(())
     }
 
+    /// Progress and fallback announcements are useful for manual commands but
+    /// are not final receipts. Automatic work omits them before durable writes.
+    pub(crate) async fn post_progress_comment(
+        &self,
+        repo: &str,
+        issue: i64,
+        body: &str,
+    ) -> Result<(), GhError> {
+        if crate::trigger_state::runtime::automatic() {
+            return Ok(());
+        }
+        self.post_issue_comment(repo, issue, body).await
+    }
+
     /// Labels on an issue or PR.
     ///
     /// `per_page` was absent, so GitHub applied its default of 30 — a repo with
@@ -678,9 +692,15 @@ impl Client {
                     "PR changed while reading automatic report files".into(),
                 ));
             }
-            if pr["changed_files"].as_u64() != Some(files.len() as u64) {
+            let names: std::collections::HashSet<_> = files
+                .iter()
+                .filter_map(|file| file["filename"].as_str().filter(|name| !name.is_empty()))
+                .collect();
+            if names.len() != files.len()
+                || pr["changed_files"].as_u64() != Some(files.len() as u64)
+            {
                 return Err(GhError::BadShape(
-                    "automatic report file list is incomplete".into(),
+                    "automatic report file list is malformed or incomplete".into(),
                 ));
             }
         }

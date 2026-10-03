@@ -596,15 +596,6 @@ async fn durable_write(
     if automatic() && matches!(kind, "comment" | "review") {
         if let Some(object) = body.as_mut() {
             let text = object["body"].as_str().unwrap_or("");
-            // Courtesy placeholders carry no result. Omitting them makes a
-            // confirmed automatic child receipt evidence of the actual report.
-            if text.starts_with("🔄")
-                || text.starts_with("🔍 Building")
-                || text.starts_with("🔍 正在生成")
-                || text.starts_with("⏳")
-            {
-                return Ok(json!({}));
-            }
             let config = frame
                 .snapshot
                 .lock()
@@ -638,7 +629,7 @@ async fn durable_write(
         }
     }
     let request: Value = serde_json::from_str(&crate::redact::scrub(
-        &json!({"method":method,"route":route,"body":body}).to_string(),
+        &json!({"method":method,"route":route,"body":body,"automatic_report":automatic() && matches!(kind,"comment"|"review")}).to_string(),
     ))
     .map_err(error)?;
     let spec = OperationSpec {

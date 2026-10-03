@@ -679,7 +679,7 @@ pub async fn run_agent_review(
     lang: Lang,
 ) -> String {
     let _ = gh
-        .post_issue_comment(
+        .post_progress_comment(
             repo,
             pr_number,
             lang.pick(
@@ -742,14 +742,14 @@ pub async fn run_agent_review(
                     "⚠️ The agent's exploration timed out; falling back to the basic review.",
                     "⚠️ agent 探索超时,回退到基础审查。",
                 );
-                let _ = gh.post_issue_comment(repo, pr_number, note).await;
+                let _ = gh.post_progress_comment(repo, pr_number, note).await;
                 crate::review::run_builtin(gh, cfg, repo, pr_number, lang).await
             } else {
                 let note = lang.pick(
                     "⚠️ The agent submitted no review; falling back to the basic review.",
                     "⚠️ agent 未提交审查结果,回退到基础审查。",
                 );
-                let _ = gh.post_issue_comment(repo, pr_number, note).await;
+                let _ = gh.post_progress_comment(repo, pr_number, note).await;
                 crate::review::run_builtin(gh, cfg, repo, pr_number, lang).await
             }
         }
@@ -759,7 +759,7 @@ pub async fn run_agent_review(
                 "⚠️ The agent failed (`{e}`); falling back to the basic review.",
                 "⚠️ agent 出错(`{e}`),回退到基础审查。"
             );
-            let _ = gh.post_issue_comment(repo, pr_number, &note).await;
+            let _ = gh.post_progress_comment(repo, pr_number, &note).await;
             crate::review::run_builtin(gh, cfg, repo, pr_number, lang).await
         }
     }

@@ -335,7 +335,9 @@ impl EventAction {
                     &cfg.codeql_label,
                 ]
                 .iter()
-                .any(|reserved| !reserved.is_empty() && label.eq_ignore_ascii_case(reserved))
+                .any(|reserved| {
+                    !reserved.is_empty() && label.to_lowercase() == reserved.to_lowercase()
+                })
             }) {
                 return Err(Problem::new(
                     ReasonCode::InvalidRule,
