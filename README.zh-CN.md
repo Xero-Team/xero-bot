@@ -11,7 +11,7 @@ Xero-Team 的组织级 GitHub App 机器人。Rust 实现,主服务与离线状�
 - **CodeQL 质量报告** — 读取仓库存量 code scanning 告警,映射到 PR 变更文件
 - **中英双语回复** — 依 PR 自身的 commit 信息决定用中文还是英文,无需配置
 
-仓库 TOML 读取、指令禁用及配置故障拦截已独立于 idle 开关接入。详见[配置契约与当前交付范围](docs/repository-config.md)及 [#11 验收记录](docs/issue-11-acceptance.md)；严格解析与逐候选模式检查已接入；[#13 持久化状态存储](docs/issue-13-acceptance.md)已接入，会话生命周期策略由 #14 完成。
+仓库 TOML 读取、指令禁用及配置故障拦截已独立于 idle 开关接入。详见[配置契约与当前交付范围](docs/repository-config.md)、[#13 持久化状态存储](docs/issue-13-acceptance.md)和 [#14 会话验收](docs/issue-14-acceptance.md)；严格解析、逐候选模式检查与会话生命周期均已接入。
 
 
 ## 命令参考
@@ -33,8 +33,8 @@ Xero-Team 的组织级 GitHub App 机器人。Rust 实现,主服务与离线状�
 
 默认 `claim`、`unclaim`、`cc`、`r?`、`ready` 无需 @；`r+`、`r-` **每次都须 @**。
 `r= @user`、`r+ as @user`、`r+ @user` 语义一致，缺失、非法或多余参数不会降级为普通批准。
-其他命令使用 `mention_once`。目前会话证据仍读取同一用户在同一线程中的显式、未禁用历史指令；
-持久化存储及源时间/TTL 查询接口已由 #13 提供；会话策略与授权预检接入留给 #14。完整边界见[解析器验收记录](docs/issue-12-acceptance.md)。
+其他命令使用 `mention_once`。会话证据来自同一用户的显式、未禁用持久化唤醒记录，不再扫描历史评论；
+持久化存储及源时间/TTL 查询接口由 #13 提供；#14 已接入会话策略与授权预检。完整边界见[解析器验收记录](docs/issue-12-acceptance.md)和[#14 会话验收](docs/issue-14-acceptance.md)。
 
 | 命令 | 说明 |
 |---|---|
@@ -299,7 +299,7 @@ src/
 状态持久化:触发 inbox、指令/写入回执、会话存储原语和通知预算始终保存于
 `XERO_DATA_DIR/command-triggers.sqlite`,不依赖 idle 开关。须单实例使用持久卷;
 未知非幂等写入暂停核对。详见[运维与恢复](docs/trigger-state.md)及
-[#13 验收记录](docs/issue-13-acceptance.md)。会话生命周期策略接入仍由 #14 完成。
+[#13 验收记录](docs/issue-13-acceptance.md)及[#14 会话验收](docs/issue-14-acceptance.md)。
 
 标签、PR 审查记忆和合并队列状态存于 GitHub。可选的空闲 workflow
 调度器额外在 `XERO_DATA_DIR` 下使用 SQLite 保存活动时间、触发记录和重试历史,

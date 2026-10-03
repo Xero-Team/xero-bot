@@ -327,6 +327,39 @@ async fn relayed_approval_is_posted_when_everyone_qualifies() {
     assert_eq!(status, "ok");
 }
 
+/// `r-` has the same write-level preflight as `r+`; an unavailable permission
+/// response must leave the approval standing and must not dismiss or dequeue.
+#[tokio::test]
+async fn reject_unknown_permission_does_not_dismiss() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "/repos/{REPO}/collaborators/alice/permission"
+        )))
+        .respond_with(ResponseTemplate::new(503).set_body_string("unavailable"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/repos/{REPO}/pulls/7/reviews")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .expect(0)
+        .mount(&server)
+        .await;
+    allow_comments(&server).await;
+
+    let gh = client_for(&server);
+    let results = handle_comment(
+        &gh,
+        &test_cfg(false),
+        &ctx("alice"),
+        vec![Command::Reject],
+        vec![],
+    )
+    .await;
+    assert_eq!(results, vec!["permission-error"]);
+}
+
 // ---------------------------------------------------------------------------
 // The help table has to describe the deployment it is running in
 // ---------------------------------------------------------------------------

@@ -4,11 +4,33 @@ use serde_json::Value;
 
 use crate::commands::{parse_commands, resolve_commands, ParsedCommand};
 use crate::config::cache::{RepositoryConfigCache, RepositoryKey};
-use crate::config::repository::{Comments, Problem, ReasonCode};
+use crate::config::repository::{ManualMode, Problem, ReasonCode};
 use crate::config::Config;
 use crate::github::{normalize_login, Client};
 use crate::handlers::{handle_comment, CommentContext};
 use crate::webhook::{classify, WebhookEvent};
+
+/// GitHub source time in the same millisecond unit used by the durable session
+/// table. Webhook delivery time is deliberately never used for this value.
+fn source_at_ms(value: &Value) -> Option<i64> {
+    let text = value.as_str()?;
+    chrono::DateTime::parse_from_rfc3339(text)
+        .ok()
+        .map(|time| time.timestamp_millis())
+}
+
+/// A candidate that semantic resolution will discard must not establish a
+/// session. In particular, self-assignment/self-review requests are invalid
+/// even though their syntax, applicability, and trigger mode are otherwise
+/// valid.
+fn can_open_session(candidate: &ParsedCommand, bot_name: &str) -> bool {
+    !matches!(
+        &candidate.command,
+        crate::commands::Command::RequestReview { user }
+            | crate::commands::Command::Assign { user }
+            if normalize_login(user) == normalize_login(bot_name)
+    )
+}
 
 /// Route a verified webhook payload. Returns the JSON body to answer GitHub
 /// with. Long work must be spawned by the caller (wait_until / tokio::spawn).
@@ -76,22 +98,21 @@ pub fn route_event(cfg: &Config, event_header: &str, payload: &Value) -> Routing
             if parsed.commands.is_empty() && diagnostics.is_empty() {
                 return Routing::Respond(serde_json::json!({"ignored": "no command"}));
             }
-            // Issues used to be rejected wholesale, which is how `@bot claim`
-            // in an issue came back as `{"ignored":"not a PR"}` — the comment
-            // right here said labels and assignees work on issues too, and
-            // they do: GitHub serves both from the issues API. Only turn the
-            // delivery away when there is nothing on it that an issue can do;
-            // otherwise dispatch, and let each command answer for itself.
-            if !is_pr && diagnostics.is_empty() && parsed.commands.iter().all(|c| c.requires_pr()) {
-                return Routing::Respond(serde_json::json!({"ignored": "not a PR"}));
-            }
+            // PR-only commands also need a diagnostic when posted on an Issue.
+            let issue = &payload["issue"];
+            let comment = &payload["comment"];
 
             Routing::Act(Work::Comment {
                 repository_id: payload["repository"]["id"].as_i64().unwrap_or(0),
                 repo,
                 pr_number,
                 installation_id,
+                thread_number: issue["number"].as_i64(),
+                comment_id: comment["id"].as_i64(),
+                user_id: comment["user"]["id"].as_i64(),
+                source_at: source_at_ms(&comment["created_at"]),
                 commenter,
+                commenter_is_bot,
                 pr_author,
                 is_pr,
                 commands: parsed.commands,
@@ -227,7 +248,12 @@ pub enum Work {
         repo: String,
         pr_number: i64,
         installation_id: i64,
+        thread_number: Option<i64>,
+        comment_id: Option<i64>,
+        user_id: Option<i64>,
+        source_at: Option<i64>,
         commenter: String,
+        commenter_is_bot: bool,
         pr_author: String,
         /// False for an issue. `pr_number` is the issue number either way —
         /// GitHub numbers them from one sequence and serves both from the
@@ -282,45 +308,57 @@ pub enum Work {
     },
 }
 
-/// Legacy read-only history check. Only an explicit, enabled candidate can be
-/// evidence; newly recognized bare words must not create a session. Durable
-/// expiry, authorization preflight and source ordering are deferred to #14.
-async fn session_open(
-    gh: &Client,
-    cfg: &Config,
-    repo: &str,
-    issue: i64,
-    commenter: &str,
-    policy: &Comments,
+/// Missing durable evidence is never replaced by inferred comment history.
+fn session_valid(
+    call: Option<&crate::trigger_state::SessionWake>,
+    ttl_days: u16,
 ) -> Result<bool, String> {
-    let comments = gh
-        .list_issue_comments(repo, issue)
-        .await
-        .map_err(|e| e.to_string())?;
-    for c in &comments {
-        let author = c
-            .pointer("/user/login")
-            .and_then(|l| l.as_str())
-            .unwrap_or("");
-        if !author.eq_ignore_ascii_case(commenter) {
-            continue;
-        }
-        let Some(body) = c.get("body").and_then(|b| b.as_str()) else {
-            continue;
-        };
-        if parse_commands(&cfg.bot_name, body)
-            .commands
-            .iter()
-            .any(|c| c.is_explicit() && policy.enabled(c.id()).is_ok())
-        {
-            return Ok(true);
-        }
+    let Some(call) = call else {
+        return Ok(false);
+    };
+    if !crate::trigger_state::runtime::active() {
+        return Ok(false);
     }
-    Ok(false)
+    crate::trigger_state::runtime::session_before(call, ttl_days)
+        .map(|wake| wake.is_some())
+        .map_err(|error| error.to_string())
+}
+
+/// Explain trigger failures as actionable command refusals, separately from
+/// configuration loading errors. The reason key is shared with the limiter.
+fn trigger_message(problem: &Problem, command: &str, bot: &str, lang: crate::lang::Lang) -> String {
+    let reason = match problem.code {
+        ReasonCode::MentionRequired => crate::t!(
+            lang,
+            "use `@{bot} {command}` for every invocation",
+            "每次调用请使用 `@{bot} {command}`"
+        ),
+        ReasonCode::SessionRequired => crate::t!(
+            lang,
+            "no earlier unexpired session; post a new valid `@{bot} help` first",
+            "没有早于此评论且仍有效的会话，请先新发一条有效的 `@{bot} help`"
+        ),
+        ReasonCode::SessionUnavailable => crate::t!(
+            lang,
+            "session storage is unavailable; this command did not run, try again later",
+            "会话存储不可用，本指令未执行，请稍后重试"
+        ),
+        ReasonCode::RequiresPr => lang
+            .pick(
+                "this command only works on a pull request",
+                "此指令只适用于 PR",
+            )
+            .into(),
+        _ => return format!("`{command}`: {}", problem.message(lang)),
+    };
+    format!(
+        "Repository configuration blocked `{command}` ({:?}): {reason}.",
+        problem.code
+    )
 }
 
 /// Gate source-bearing candidates, then resolve the permitted execution set.
-/// #13 supplies durable execution; session lifecycle policy is connected in #14.
+/// Durable execution and session evidence share the same trigger scope.
 pub(crate) async fn execute_comment_with_client(
     gh: &Client,
     cfg: &Config,
@@ -332,7 +370,12 @@ pub(crate) async fn execute_comment_with_client(
         repo,
         pr_number,
         installation_id,
+        thread_number,
+        comment_id,
+        user_id,
+        source_at,
         commenter,
+        commenter_is_bot,
         pr_author,
         is_pr,
         commands,
@@ -376,28 +419,6 @@ pub(crate) async fn execute_comment_with_client(
             return Ok(());
         }
     };
-    if crate::trigger_state::runtime::active() {
-        let pr = if is_pr {
-            Some(
-                gh.get_pr(&repo, pr_number)
-                    .await
-                    .map_err(|e| e.to_string())?,
-            )
-        } else {
-            None
-        };
-        let head = pr.as_ref().and_then(|p| p["head"]["sha"].as_str());
-        let base = pr.as_ref().and_then(|p| p["base"]["sha"].as_str());
-        if is_pr && (head.is_none() || base.is_none()) {
-            return Err("PR snapshot unavailable".into());
-        }
-        crate::trigger_state::runtime::snapshot(
-            &state.snapshot().expect("checked above").commit_sha,
-            head,
-            base,
-        )
-        .map_err(|e| e.to_string())?;
-    }
     // Show failures in other domains on an explicit status/help request while
     // keeping independently valid comment commands usable. Dynamic help is #18.
     if commands.iter().any(|c| {
@@ -420,47 +441,132 @@ pub(crate) async fn execute_comment_with_client(
             .await;
         }
     }
-    // Gate candidates independently BEFORE dropping duplicates or conflicting
-    // status commands. In particular a denied bare approval cannot swallow an
-    // explicit approval, and a disabled status cannot cancel an allowed one.
+    let mut ctx = CommentContext {
+        repo: repo.clone(),
+        pr_number,
+        installation_id,
+        commenter,
+        pr_author,
+        is_pr,
+        lang: comment_lang.unwrap_or_default(),
+    };
+    let call = match (thread_number, comment_id, user_id, source_at) {
+        (Some(thread_number), Some(comment_id), Some(user_id), Some(source_at)) => {
+            Some(crate::trigger_state::SessionWake {
+                installation_id,
+                repository_id,
+                thread_number,
+                user_id,
+                comment_id,
+                source_at,
+            })
+        }
+        _ => None,
+    };
+    // No wake is written until every candidate has been checked, so an explicit
+    // line can never authorize a bare line in this same source comment.
     let mut permitted = Vec::new();
     let mut blocked = Vec::new();
     let mut session = None;
+    let mut wake = false;
     for candidate in commands {
         let mut decision = policy.gate(candidate.id(), is_pr, candidate.is_explicit(), false);
         if matches!(&decision, Err(e) if e.code == ReasonCode::SessionRequired) {
-            if session.is_none() {
-                session = Some(session_open(gh, cfg, &repo, pr_number, &commenter, policy).await);
-            }
-            match session.as_ref().expect("session checked") {
-                Ok(open) => {
-                    decision = policy.gate(candidate.id(), is_pr, candidate.is_explicit(), *open)
+            let evidence =
+                session.get_or_insert_with(|| session_valid(call.as_ref(), policy.ttl_days));
+            decision = match evidence {
+                Ok(open) => policy.gate(candidate.id(), is_pr, candidate.is_explicit(), *open),
+                Err(error) => {
+                    tracing::warn!("session lookup failed: {error}");
+                    Err(Problem::new(
+                        ReasonCode::SessionUnavailable,
+                        "session storage unavailable",
+                    ))
                 }
-                Err(e) => {
-                    tracing::warn!("session check for @{commenter} on {repo}#{pr_number}: {e}");
-                }
+            };
+        }
+        if let Err(problem) = decision {
+            let message = trigger_message(&problem, candidate.id().name(), &cfg.bot_name, ctx.lang);
+            if crate::trigger_state::runtime::active() {
+                crate::trigger_state::runtime::reject_command(&candidate.command, &message)
+                    .map_err(|error| error.to_string())?;
             }
+            blocked.push((problem, message));
+            continue;
         }
-        match decision {
-            Ok(()) => permitted.push(candidate),
-            Err(e) => blocked.push(e),
+        // Authorization is a candidate gate, not merely a session-wake hint.
+        // Refused candidates must not participate in duplicate or status
+        // resolution, while the handler still rechecks privileged commands at
+        // the actual write boundary.
+        let authorization = crate::handlers::authorize(gh, cfg, &ctx, &candidate.command).await;
+        if let Err(refusal) = authorization {
+            if crate::trigger_state::runtime::active() {
+                crate::trigger_state::runtime::reject_command(&candidate.command, &refusal.message)
+                    .map_err(|error| error.to_string())?;
+            }
+            blocked.push((
+                Problem::new(refusal.code, "command authorization refused"),
+                format!("`{}`: {}", candidate.id().name(), refusal.message),
+            ));
+            continue;
         }
+        if !commenter_is_bot
+            && candidate.is_explicit()
+            && policy.mode(candidate.id()) != ManualMode::AlwaysMention
+        {
+            // Always-mention approvals are explicitly authorized but never
+            // establish a reusable session.
+            wake |= can_open_session(&candidate, &cfg.bot_name);
+        }
+        permitted.push(candidate);
     }
-    for problem in &blocked {
-        report_config_problem(
-            gh,
-            cache,
-            key,
-            &repo,
-            pr_number,
-            problem,
-            &problem.message(comment_lang.unwrap_or_default()),
-        )
-        .await;
+    if wake && crate::trigger_state::runtime::active() {
+        let call = call
+            .as_ref()
+            .ok_or("missing source identity for session wake")?;
+        // Save before any downstream API writes; temporary action failures do
+        // not erase the authorized explicit interaction.
+        crate::trigger_state::runtime::record_wake(call).map_err(|e| e.to_string())?;
     }
+    for (problem, message) in &blocked {
+        report_config_problem(gh, cache, key, &repo, pr_number, problem, message).await;
+    }
+    let session_commands: Vec<_> = permitted
+        .iter()
+        .filter(|candidate| {
+            policy.mode(candidate.id()) == ManualMode::MentionOnce
+                && !candidate.is_explicit()
+                && !permitted
+                    .iter()
+                    .any(|other| other.command == candidate.command && other.is_explicit())
+        })
+        .map(|candidate| candidate.command.clone())
+        .collect();
     let commands = resolve_commands(&cfg.bot_name, permitted, &mut diagnostics);
     if commands.is_empty() && diagnostics.is_empty() {
         return Ok(());
+    }
+    if crate::trigger_state::runtime::active() {
+        let pr = if is_pr {
+            Some(
+                gh.get_pr(&repo, pr_number)
+                    .await
+                    .map_err(|e| e.to_string())?,
+            )
+        } else {
+            None
+        };
+        let head = pr.as_ref().and_then(|p| p["head"]["sha"].as_str());
+        let base = pr.as_ref().and_then(|p| p["base"]["sha"].as_str());
+        if is_pr && (head.is_none() || base.is_none()) {
+            return Err("PR snapshot unavailable".into());
+        }
+        crate::trigger_state::runtime::snapshot(
+            &state.snapshot().expect("checked above").commit_sha,
+            head,
+            base,
+        )
+        .map_err(|e| e.to_string())?;
     }
     let lang = if is_pr && !commands.is_empty() {
         crate::lang::for_pr(gh, &repo, pr_number, comment_lang).await
@@ -468,20 +574,40 @@ pub(crate) async fn execute_comment_with_client(
         comment_lang.unwrap_or_default()
     };
 
-    let ctx = CommentContext {
-        repo: repo.clone(),
-        pr_number,
-        commenter,
-        pr_author,
-        installation_id,
-        is_pr,
-        lang,
-    };
+    ctx.lang = lang;
     // Rendered here, not at routing time: `handle_comment` takes plain
     // strings so it needn't know the parser's types, and the wording
     // needs the language that only this side of the queue knows.
     let diagnostics: Vec<String> = diagnostics.iter().map(|d| d.message(lang)).collect();
-    let results = handle_comment(gh, cfg, &ctx, commands, diagnostics).await;
+    let mut results = handle_comment(gh, cfg, &ctx, vec![], diagnostics).await;
+    for command in commands {
+        // A preceding review may have run for minutes. Recheck TTL and rights
+        // at execution rather than carrying a cached grant into later commands.
+        if session_commands.contains(&command) {
+            let problem = match session_valid(call.as_ref(), policy.ttl_days) {
+                Ok(true) => None,
+                Ok(false) => Some(Problem::new(ReasonCode::SessionRequired, "session expired")),
+                Err(_) => Some(Problem::new(
+                    ReasonCode::SessionUnavailable,
+                    "session storage unavailable",
+                )),
+            };
+            if let Some(problem) = problem {
+                report_config_problem(
+                    gh,
+                    cache,
+                    key,
+                    &repo,
+                    pr_number,
+                    &problem,
+                    &trigger_message(&problem, command.id().name(), &cfg.bot_name, lang),
+                )
+                .await;
+                continue;
+            }
+        }
+        results.extend(handle_comment(gh, cfg, &ctx, vec![command], vec![]).await);
+    }
     tracing::info!("comment commands on {repo}#{pr_number}: {results:?}");
     Ok(())
 }
@@ -897,6 +1023,19 @@ mod tests {
         }
     }
 
+    #[test]
+    fn semantically_discarded_self_requests_cannot_open_a_session() {
+        for text in [
+            "@xero-team-bot assign @xero-team-bot",
+            "@xero-team-bot r? @xero-team-bot",
+        ] {
+            let parsed = parse_commands("xero-team-bot", text);
+            assert!(parsed.commands.is_empty(), "{text:?}");
+        }
+        let parsed = parse_commands("xero-team-bot", "@xero-team-bot assign @alice");
+        assert!(can_open_session(&parsed.commands[0], "xero-team-bot"));
+    }
+
     /// A comment with nothing to run but something to say must still be
     /// dispatched, or the diagnostic never reaches the PR.
     #[test]
@@ -970,10 +1109,9 @@ mod tests {
         }
     }
 
-    /// A comment with nothing an issue can do is still turned away at the door,
-    /// so no installation token is minted to say so.
+    /// PR-only candidates reach applicability diagnostics on an Issue.
     #[test]
-    fn pr_only_commands_on_an_issue_are_still_refused() {
+    fn pr_only_commands_on_an_issue_route_for_explanation() {
         for body in [
             "@xero-team-bot review",
             "@xero-team-bot codeql",
@@ -982,10 +1120,9 @@ mod tests {
             "@xero-team-bot review; codeql",
         ] {
             let r = route_event(&cfg(), "issue_comment", &issue_payload(body));
-            assert_eq!(
-                ignored_reason(&r).as_deref(),
-                Some("not a PR"),
-                "for {body:?}"
+            assert!(
+                matches!(r, Routing::Act(Work::Comment { is_pr: false, .. })),
+                "{body:?}"
             );
         }
     }

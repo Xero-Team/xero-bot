@@ -7,7 +7,7 @@ use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-use super::{EventContext, Operation, OperationSpec, Result, State, Store};
+use super::{EventContext, Operation, OperationSpec, Result, SessionWake, State, Store};
 use crate::commands::Command;
 use crate::config::cache::RepositoryConfigCache;
 use crate::config::Config;
@@ -166,6 +166,36 @@ tokio::task_local! { static ACTIVE: Arc<Frame>; }
 /// Report whether this task is inside a durable trigger execution scope.
 pub(crate) fn active() -> bool {
     ACTIVE.try_with(|_| ()).is_ok()
+}
+
+/// Query durable session evidence for the current webhook delivery. A caller
+/// outside the durable ingress has no session authority and must not fall back
+/// to a history scan.
+pub(crate) fn session_before(call: &SessionWake, ttl_days: u16) -> Result<Option<SessionWake>> {
+    ACTIVE.try_with(|frame| {
+        frame
+            .store
+            .session_before_at(call, ttl_days, chrono::Utc::now().timestamp_millis())
+    })?
+}
+
+/// Record a wake only inside the durable ingress scope. The caller has already
+/// checked syntax, applicability and any command-specific authorization.
+pub(crate) fn record_wake(wake: &SessionWake) -> Result<()> {
+    ACTIVE.try_with(|frame| frame.store.record_wake(wake))?
+}
+
+/// Mark an existing unsent command as refused before candidate resolution.
+/// First-time refusals have no operation row and are intentionally a no-op.
+pub(crate) fn reject_command(command: &Command, detail: &str) -> Result<()> {
+    ACTIVE.try_with(|frame| {
+        let comment = frame
+            .context
+            .comment_id
+            .ok_or("missing source comment for command refusal")?;
+        let key = super::manual_key(frame.context.repository_id, comment, command);
+        frame.store.fail_unsent(&key, detail, now())
+    })?
 }
 /// Capture the configuration and PR snapshot used by subsequent command claims.
 pub(crate) fn snapshot(config: &str, head: Option<&str>, base: Option<&str>) -> Result<()> {

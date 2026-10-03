@@ -124,8 +124,10 @@ impl EventContext {
 /// applicability and authorization checks. No historical scan is performed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionWake {
+    pub installation_id: i64,
     pub repository_id: i64,
-    pub thread_id: i64,
+    /// Issue/PR number, scoped by installation and repository.
+    pub thread_number: i64,
     pub user_id: i64,
     pub comment_id: i64,
     /// GitHub time in milliseconds, not webhook arrival time.

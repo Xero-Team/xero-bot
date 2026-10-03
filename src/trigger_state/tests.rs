@@ -300,8 +300,9 @@ fn sessions_are_scoped_persistent_and_ordered_by_source_not_arrival() {
     let dir = Dir::new();
     let store = Store::open(&dir.0).unwrap();
     let wake = SessionWake {
+        installation_id: 7,
         repository_id: 9,
-        thread_id: 88,
+        thread_number: 88,
         user_id: 5,
         comment_id: 20,
         source_at: 1_000_000,
@@ -321,14 +322,19 @@ fn sessions_are_scoped_persistent_and_ordered_by_source_not_arrival() {
     call.user_id = 6;
     assert!(store.session_before(&call, 30).unwrap().is_none());
     call.user_id = 5;
-    call.thread_id = 89;
+    call.thread_number = 89;
     assert!(store.session_before(&call, 30).unwrap().is_none());
-    call.thread_id = 88;
+    call.thread_number = 88;
     call.repository_id = 10;
     assert!(store.session_before(&call, 30).unwrap().is_none());
     call.repository_id = 9;
     call.source_at = wake.source_at + 30 * 86_400_000;
     assert!(store.session_before(&call, 30).unwrap().is_none());
+    call.source_at = wake.source_at + 1;
+    call.installation_id = 8;
+    assert!(store.session_before(&call, 30).unwrap().is_none());
+    call.installation_id = 7;
+    call.source_at = wake.source_at + 30 * 86_400_000;
     let edited = SessionWake {
         source_at: call.source_at,
         ..wake.clone()
@@ -339,6 +345,36 @@ fn sessions_are_scoped_persistent_and_ordered_by_source_not_arrival() {
     let store = Store::open(&dir.0).unwrap();
     call.source_at = wake.source_at + 1;
     assert!(store.session_before(&call, 30).unwrap().is_some());
+}
+
+/// A wake can be before the current source comment yet already be expired at
+/// execution time; delayed delivery must fail closed in that case.
+#[test]
+fn session_expiry_is_checked_against_execution_time() {
+    let dir = Dir::new();
+    let store = Store::open(&dir.0).unwrap();
+    let wake = SessionWake {
+        installation_id: 7,
+        repository_id: 9,
+        thread_number: 88,
+        user_id: 5,
+        comment_id: 20,
+        source_at: 1_000_000,
+    };
+    store.record_wake(&wake).unwrap();
+    let call = SessionWake {
+        comment_id: 21,
+        source_at: wake.source_at + 1,
+        ..wake.clone()
+    };
+    assert!(store
+        .session_before_at(&call, 30, wake.source_at + 10 * 86_400_000)
+        .unwrap()
+        .is_some());
+    assert!(store
+        .session_before_at(&call, 30, wake.source_at + 30 * 86_400_000)
+        .unwrap()
+        .is_none());
 }
 
 /// Build an installation-like client against the local mock server.
@@ -566,6 +602,63 @@ async fn production_commands_survive_duplicate_delivery_and_restart_without_idle
     assert_eq!(posts.len(), 1);
     assert!(String::from_utf8_lossy(&posts[0].body).contains("xero-trigger:"));
     assert_eq!(runtime.store.list(Some(State::Succeeded)).unwrap().len(), 2);
+}
+
+/// A real explicit mention opens a durable session that a later bare command
+/// can use after restart; the consumer never reads the GitHub comment history.
+#[tokio::test]
+async fn explicit_wake_authorizes_later_bare_command_without_history_scan() {
+    let dir = Dir::new();
+    let server = MockServer::start().await;
+    policy(&server, "").await;
+    response(
+        &server,
+        "POST",
+        "/repos/example/project/issues/3/comments",
+        201,
+        json!({"id": 44}),
+    )
+    .await;
+    let first = context();
+    let runtime = Runtime::open(&dir.0).unwrap();
+    runtime
+        .process(
+            &client(&server),
+            &cfg(),
+            &RepositoryConfigCache::default(),
+            &first,
+        )
+        .await
+        .unwrap();
+    drop(runtime);
+
+    let mut later = first.clone();
+    later.delivery = "delivery-2".into();
+    later.comment_id = Some(21);
+    later.source_time = "2026-10-02T02:00:00Z".into();
+    later.body = Some("ping".into());
+    let runtime = Runtime::open(&dir.0).unwrap();
+    runtime
+        .process(
+            &client(&server),
+            &cfg(),
+            &RepositoryConfigCache::default(),
+            &later,
+        )
+        .await
+        .unwrap();
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.method == "POST")
+            .count(),
+        2
+    );
+    assert!(requests
+        .iter()
+        .filter(|request| request.method == "GET")
+        .all(|request| { !request.url.path().ends_with("/issues/3/comments") }));
 }
 
 /// Verify that partial comment failure never repeats successful command or unknown write.

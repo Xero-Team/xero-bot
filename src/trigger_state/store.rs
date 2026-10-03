@@ -118,18 +118,18 @@ impl Store {
                 PRIMARY KEY(repository,pr,login)
             );
             CREATE TABLE IF NOT EXISTS sessions(
-                repository INTEGER NOT NULL, thread INTEGER NOT NULL, user INTEGER NOT NULL,
+                installation INTEGER NOT NULL DEFAULT 0, repository INTEGER NOT NULL,
+                thread INTEGER NOT NULL, user INTEGER NOT NULL,
                 comment INTEGER NOT NULL, source_at INTEGER NOT NULL,
-                PRIMARY KEY(repository,thread,user,comment)
+                PRIMARY KEY(installation,repository,thread,user,comment)
             );
-            CREATE INDEX IF NOT EXISTS session_source ON sessions(repository,thread,user,source_at,comment);
             CREATE TABLE IF NOT EXISTS admin_audit(
                 id INTEGER PRIMARY KEY, operation TEXT NOT NULL, decision TEXT NOT NULL,
                 evidence TEXT NOT NULL, created_at INTEGER NOT NULL
             );
             COMMIT;")?;
         let version: i64 = db.query_row("SELECT version FROM trigger_meta", [], |r| r.get(0))?;
-        if !matches!(version, 1 | 2) {
+        if !(1..=3).contains(&version) {
             return Err("unsupported trigger database version".into());
         }
         if version == 1 {
@@ -147,6 +147,39 @@ impl Store {
             }
             db.execute_batch("UPDATE operations SET lease_delivery=delivery WHERE lease_delivery=''; UPDATE trigger_meta SET version=2; COMMIT;")?;
         }
+        // #13 stored sessions without installation scope. Preserve the rows as
+        // inert historical evidence (installation 0) and require a fresh @
+        // after upgrading, rather than allowing one installation to inherit
+        // another's wake.
+        let has_installation = db
+            .prepare("PRAGMA table_info(sessions)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .iter()
+            .any(|name| name == "installation");
+        if !has_installation {
+            db.execute_batch(
+                "BEGIN IMMEDIATE;
+                 ALTER TABLE sessions RENAME TO sessions_v2;
+                 CREATE TABLE sessions(
+                    installation INTEGER NOT NULL DEFAULT 0, repository INTEGER NOT NULL,
+                    thread INTEGER NOT NULL, user INTEGER NOT NULL,
+                    comment INTEGER NOT NULL, source_at INTEGER NOT NULL,
+                    PRIMARY KEY(installation,repository,thread,user,comment)
+                 );
+                 INSERT INTO sessions(installation,repository,thread,user,comment,source_at)
+                    SELECT 0,repository,thread,user,comment,source_at FROM sessions_v2;
+                 DROP TABLE sessions_v2;
+                 DROP INDEX IF EXISTS session_source;
+                 CREATE INDEX session_source ON sessions(installation,repository,thread,user,source_at,comment);
+                 UPDATE trigger_meta SET version=3;
+                 COMMIT;",
+            )?;
+        }
+        db.execute("UPDATE trigger_meta SET version=3 WHERE version<3", [])?;
+        db.execute_batch(
+            "CREATE INDEX IF NOT EXISTS session_source ON sessions(installation,repository,thread,user,source_at,comment);",
+        )?;
         db.execute_batch(
             "CREATE INDEX IF NOT EXISTS operation_lease ON operations(lease_delivery,state);",
         )?;
@@ -312,6 +345,25 @@ impl Store {
     /// Look up one business operation without changing its state.
     pub fn get(&self, key: &str) -> Result<Option<Operation>> {
         Self::operation(&*self.db()?, key)
+    }
+
+    /// Permanently reject an unsent command after current policy or
+    /// authorization refused it. Unknown sent writes remain untouched and
+    /// still require reconciliation; an absent operation is a no-op because
+    /// the command never reached the durable planner.
+    pub fn fail_unsent(&self, key: &str, detail: &str, now: i64) -> Result<()> {
+        let mut db = self.db()?;
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "UPDATE operations SET state='failed',detail=?2,next_at=0,updated_at=?3 WHERE key=?1 AND state IN ('pending','unknown') AND sent=0",
+            params![key, crate::redact::scrub(detail), now],
+        )?;
+        tx.execute(
+            "DELETE FROM recipients WHERE operation=?1 AND committed=0",
+            [key],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     /// Return operation audit records, optionally restricted to one state.
@@ -613,8 +665,9 @@ impl Store {
     /// Insert an authorized mention source once, so edits cannot renew its source time.
     pub fn record_wake(&self, wake: &SessionWake) -> Result<()> {
         if [
+            wake.installation_id,
             wake.repository_id,
-            wake.thread_id,
+            wake.thread_number,
             wake.user_id,
             wake.comment_id,
         ]
@@ -623,18 +676,41 @@ impl Store {
         {
             return Err("session IDs must be positive".into());
         }
-        self.db()?.execute("INSERT OR IGNORE INTO sessions(repository,thread,user,comment,source_at) VALUES(?1,?2,?3,?4,?5)",params![wake.repository_id,wake.thread_id,wake.user_id,wake.comment_id,wake.source_at])?;
+        self.db()?.execute("INSERT OR IGNORE INTO sessions(installation,repository,thread,user,comment,source_at) VALUES(?1,?2,?3,?4,?5,?6)",params![wake.installation_id,wake.repository_id,wake.thread_number,wake.user_id,wake.comment_id,wake.source_at])?;
         Ok(())
     }
 
-    /// Find an earlier wake in this user/thread scope within the supplied TTL.
-    pub fn session_before(&self, call: &SessionWake, ttl_days: u16) -> Result<Option<SessionWake>> {
-        if ttl_days == 0 {
+    /// Find source-ordered evidence, using an explicit execution clock for
+    /// deterministic acceptance checks. Both source and execution must be live.
+    pub fn session_before_at(
+        &self,
+        call: &SessionWake,
+        ttl_days: u16,
+        executed_at: i64,
+    ) -> Result<Option<SessionWake>> {
+        if !(1..=365).contains(&ttl_days)
+            || [
+                call.installation_id,
+                call.repository_id,
+                call.thread_number,
+                call.user_id,
+                call.comment_id,
+            ]
+            .iter()
+            .any(|id| *id <= 0)
+        {
             return Ok(None);
         }
         let oldest = call
             .source_at
+            .max(executed_at)
             .saturating_sub(i64::from(ttl_days) * 86_400_000);
-        Ok(self.db()?.query_row("SELECT comment,source_at FROM sessions WHERE repository=?1 AND thread=?2 AND user=?3 AND source_at>?4 AND (source_at<?5 OR (source_at=?5 AND comment<?6)) ORDER BY source_at DESC,comment DESC LIMIT 1",params![call.repository_id,call.thread_id,call.user_id,oldest,call.source_at,call.comment_id],|r| Ok(SessionWake{comment_id:r.get(0)?,source_at:r.get(1)?,..call.clone()})).optional()?)
+        Ok(self.db()?.query_row("SELECT comment,source_at FROM sessions WHERE installation=?1 AND repository=?2 AND thread=?3 AND user=?4 AND source_at>?5 AND (source_at<?6 OR (source_at=?6 AND comment<?7)) ORDER BY source_at DESC,comment DESC LIMIT 1",params![call.installation_id,call.repository_id,call.thread_number,call.user_id,oldest,call.source_at,call.comment_id],|r| Ok(SessionWake{comment_id:r.get(0)?,source_at:r.get(1)?,..call.clone()})).optional()?)
+    }
+
+    /// Source-time-only primitive retained for offline inspection. Execution
+    /// must use session_before_at with the actual execution time as well.
+    pub fn session_before(&self, call: &SessionWake, ttl_days: u16) -> Result<Option<SessionWake>> {
+        self.session_before_at(call, ttl_days, call.source_at)
     }
 }

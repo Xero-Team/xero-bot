@@ -201,7 +201,7 @@ async fn disabled_bare_command_cannot_use_even_an_existing_session() {
     assert_eq!(f.assert_only_config_and_diagnostics().await, 1);
 }
 
-/// A currently disabled historical command cannot qualify as a legacy session opener.
+/// A currently disabled historical command cannot qualify as a historical session evidence.
 #[tokio::test]
 async fn disabled_history_does_not_open_a_legacy_session_for_another_command() {
     let f = Fixture::new("[command_triggers]\nhelp={mode='disabled'}").await;
@@ -213,21 +213,8 @@ async fn disabled_history_does_not_open_a_legacy_session_for_another_command() {
         )
         .mount(&f.server)
         .await;
-    let state = f
-        .cache
-        .load(
-            &f.gh,
-            RepositoryKey {
-                installation_id: 7,
-                repository_id: 9,
-            },
-            REPO,
-        )
-        .await;
-    let policy = state.snapshot().unwrap().config.comments.as_ref().unwrap();
-    assert!(!session_open(&f.gh, &f.cfg, REPO, 1, "alice", policy)
-        .await
-        .unwrap());
+    f.comment("ping", 1).await;
+    assert_eq!(f.assert_only_config_and_diagnostics().await, 1);
 }
 
 /// Configuration failures permit bounded status replies while suppressing every bundled command.
@@ -388,7 +375,7 @@ async fn denied_bare_duplicate_does_not_erase_explicit_approval() {
             "/repos/{REPO}/collaborators/alice/permission"
         )))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({"permission":"write"})))
-        .expect(1)
+        .expect(2)
         .mount(&f.server)
         .await;
     Mock::given(method("POST"))
@@ -419,6 +406,52 @@ async fn denied_bare_duplicate_does_not_erase_explicit_approval() {
         serde_json::from_slice::<Value>(&approvals[0].body).unwrap()["event"],
         "APPROVE"
     );
+}
+
+/// Authorization runs on every applicable candidate before duplicate
+/// resolution. A denied always-mention approval cannot survive as the single
+/// deduplicated command or reach the review endpoint.
+#[tokio::test]
+async fn refused_always_mention_candidate_is_removed_before_resolution() {
+    let f = Fixture::new("").await;
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "/repos/{REPO}/collaborators/alice/permission"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"permission": "read"})))
+        .expect(2)
+        .mount(&f.server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!("/repos/{REPO}/pulls/1/reviews")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": 1})))
+        .expect(0)
+        .mount(&f.server)
+        .await;
+
+    let Routing::Act(mut work) = f.route("@bot r+; @bot r+", 1) else {
+        panic!("not routed")
+    };
+    if let Work::Comment { pr_author, .. } = &mut work {
+        *pr_author = "bob".into();
+    }
+    execute_comment_with_client(&f.gh, &f.cfg, &f.cache, work)
+        .await
+        .unwrap();
+    let comments: Vec<_> = f
+        .server
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|request| request.method == "POST" && request.url.path().ends_with("/comments"))
+        .collect();
+    assert_eq!(
+        comments.len(),
+        1,
+        "diagnostic budget should collapse duplicate refusals"
+    );
+    assert!(String::from_utf8_lossy(&comments[0].body).contains("write access"));
 }
 
 /// A disabled conflicting status must be removed before status resolution.
@@ -456,8 +489,7 @@ async fn disabled_blocked_does_not_cancel_permitted_ready() {
     );
 }
 
-/// History queries are shared by candidates, and bare history cannot establish
-/// a session merely because the new parser now recognizes it.
+/// An upgrade never scans history to infer a session, even for parsed candidates.
 #[tokio::test]
 async fn bare_history_cannot_self_authorize_a_block_of_session_commands() {
     let f = Fixture::new("").await;
@@ -468,7 +500,7 @@ async fn bare_history_cannot_self_authorize_a_block_of_session_commands() {
             {"user":{"login":"alice"}, "body":"r? @bob"},
             {"user":{"login":"bob"}, "body":"@bot help"}
         ])))
-        .expect(1)
+        .expect(0)
         .mount(&f.server)
         .await;
     f.comment("ping\nhelp", 1).await;

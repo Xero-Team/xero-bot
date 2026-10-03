@@ -13,9 +13,8 @@ The shared configuration reader provides configuration failure and `disabled`
 vetoes in comment/CodeQL-label entry points. #12 adds strict command-block parsing,
 source-bearing candidates and per-candidate mention gates before deduplication or
 status resolution. It does not add automatic actions or persistent sessions.
-Session evidence still uses history reads of the same user's explicit, enabled
-commands. `ttl_days` is validated but does not expire those legacy sessions;
-durable lifetime, source ordering and authorization preflight remain #13/#14.
+Session evidence uses the durable wake ledger for the same user's explicit, enabled
+commands. `ttl_days`, source ordering and authorization preflight are enforced at runtime by #13/#14.
 See the [#12 acceptance record](issue-12-acceptance.md).
 
 `r= @user`, `r+ as @user` and `r+ @user` normalize to the same on-behalf approval,

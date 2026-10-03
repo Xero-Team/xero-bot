@@ -8,7 +8,7 @@
 
 use crate::commands::Command;
 use crate::config::Config;
-use crate::github::{normalize_login, Client, GhError};
+use crate::github::{Client, GhError};
 use crate::lang::Lang;
 use crate::t;
 
@@ -25,6 +25,9 @@ pub struct CommentContext {
     /// Which language to answer in, decided from the PR's commits.
     pub lang: Lang,
 }
+
+mod authorization;
+pub(crate) use authorization::authorize;
 
 /// The trailing note under the command table. With the merge queue on, it
 /// documents r+'s second effect; without it, only the needs-rebase note —
@@ -811,165 +814,22 @@ async fn handle_approve(
     on_behalf_of: Option<String>,
 ) -> String {
     let lang = ctx.lang;
-
-    // 1. Crediting someone else is off unless the deployment turned it on.
-    //
-    // The review is posted by the App, so branch protection counts it as a
-    // genuine approval. Left open, any holder of write access could satisfy a
-    // required-review rule in a colleague's name without that colleague ever
-    // seeing the PR — the approval would carry their login and nothing would
-    // record that they hadn't given it. Plain `r+` is unaffected: it credits
-    // the commenter, who needs write access anyway.
-    if let Some(other) = &on_behalf_of {
-        if !cfg.r_plus_allow_on_behalf {
-            let _ = gh
-                .post_issue_comment(
-                    &ctx.repo,
-                    ctx.pr_number,
-                    &t!(
-                        lang,
-                        "⚠️ Approving on behalf of @{other} is disabled here. A relayed \
-approval counts toward branch protection under someone else's name, so it has to be \
-switched on deliberately: set `R_PLUS_ALLOW_ON_BEHALF=true` in the deployment. \
-Plain `r+` (crediting you) still works.",
-                        "⚠️ 本部署未开启代 @{other} 审批。代审批会以他人名义计入分支保护,\
-因此需要显式开启:在部署中设置 `R_PLUS_ALLOW_ON_BEHALF=true`。\
-普通 `r+`(归功于你自己)不受影响。"
-                    ),
-                )
-                .await;
-            return "on-behalf-disabled".into();
-        }
-    }
-
-    // 2. The author never gets to have the bot approve their own PR.
-    //
-    // GitHub blocks a real self-approval, but here the *App* is the review
-    // author, so the rule has to be enforced by hand. Checked on the commenter
-    // and not only on the credited login: `r+ as @teammate` from the author is
-    // the same act with an extra step. `normalize_login` because a `[bot]`
-    // suffix or stray case must not be a way around it.
-    if normalize_login(&ctx.commenter) == normalize_login(&ctx.pr_author) {
-        let commenter = &ctx.commenter;
+    if let Err(refusal) = authorize(
+        gh,
+        cfg,
+        ctx,
+        &Command::Approve {
+            on_behalf_of: on_behalf_of.clone(),
+        },
+    )
+    .await
+    {
         let _ = gh
-            .post_issue_comment(
-                &ctx.repo,
-                ctx.pr_number,
-                &t!(
-                    lang,
-                    "⚠️ @{commenter} authored this PR, so `r+` here would be a \
-self-approval — including on behalf of someone else. Ask a reviewer to run it.",
-                    "⚠️ @{commenter} 是本 PR 作者,`r+` 属于自我审批(代他人审批同理)。\
-请由其他审查者执行。"
-                ),
-            )
+            .post_issue_comment(&ctx.repo, ctx.pr_number, &refusal.message)
             .await;
-        return "self-approve".into();
+        return refusal.status.into();
     }
-
-    // 3. commenter must have write/maintain/admin
-    let perm = match gh.collaborator_permission(&ctx.repo, &ctx.commenter).await {
-        Ok(p) => p,
-        Err(e) => {
-            let _ = gh
-                .post_issue_comment(
-                    &ctx.repo,
-                    ctx.pr_number,
-                    &t!(
-                        lang,
-                        "⚠️ Could not check permissions: `{e}`",
-                        "⚠️ 无法校验权限: `{e}`"
-                    ),
-                )
-                .await;
-            return format!("error: {e}");
-        }
-    };
-    if !matches!(perm.as_str(), "admin" | "maintain" | "write") {
-        let commenter = &ctx.commenter;
-        let _ = gh
-            .post_issue_comment(
-                &ctx.repo,
-                ctx.pr_number,
-                &t!(
-                    lang,
-                    "⚠️ `r+` from @{commenter} refused: write access or above is required (currently: {perm}).",
-                    "⚠️ @{commenter} 的 `r+` 被拒绝:需要仓库 write 及以上权限(当前: {perm})。"
-                ),
-            )
-            .await;
-        return "denied".into();
-    }
-
-    // 4. The credited login must be someone who could have approved this PR
-    //    themselves — a name we put on an approval has to be able to carry it.
     let credited = on_behalf_of.unwrap_or_else(|| ctx.commenter.clone());
-    if normalize_login(&credited) == normalize_login(&ctx.pr_author) {
-        let _ = gh
-            .post_issue_comment(
-                &ctx.repo,
-                ctx.pr_number,
-                &t!(
-                    lang,
-                    "⚠️ Cannot approve your own PR (`{credited}` authored it).",
-                    "⚠️ 不能审批自己的 PR(`{credited}` 是本 PR 作者)。"
-                ),
-            )
-            .await;
-        return "self-approve".into();
-    }
-    if credited != ctx.commenter {
-        // Shape first, so a typo or an injected string never becomes a path
-        // segment. The permission check was missing entirely: an approval could
-        // be credited to a login with read-only access, or to no account at all.
-        if !crate::commands::is_valid_login(&credited) {
-            let _ = gh
-                .post_issue_comment(
-                    &ctx.repo,
-                    ctx.pr_number,
-                    &t!(
-                        lang,
-                        "⚠️ `{credited}` isn't a valid GitHub login, so there's nobody to credit.",
-                        "⚠️ `{credited}` 不是合法的 GitHub 用户名,无法归功。"
-                    ),
-                )
-                .await;
-            return "invalid-credited".into();
-        }
-        let their_perm = match gh.collaborator_permission(&ctx.repo, &credited).await {
-            Ok(p) => p,
-            Err(e) => {
-                let _ = gh
-                    .post_issue_comment(
-                        &ctx.repo,
-                        ctx.pr_number,
-                        &t!(
-                            lang,
-                            "⚠️ Could not check @{credited}'s permissions: `{e}`",
-                            "⚠️ 无法校验 @{credited} 的权限: `{e}`"
-                        ),
-                    )
-                    .await;
-                return format!("error: {e}");
-            }
-        };
-        if !matches!(their_perm.as_str(), "admin" | "maintain" | "write") {
-            let _ = gh
-                .post_issue_comment(
-                    &ctx.repo,
-                    ctx.pr_number,
-                    &t!(
-                        lang,
-                        "⚠️ Cannot credit the approval to @{credited}: they need write access \
-or above to approve this PR (currently: {their_perm}).",
-                        "⚠️ 无法将审批归功于 @{credited}:该用户需要 write 及以上权限才能审批本 PR\
-(当前: {their_perm})。"
-                    ),
-                )
-                .await;
-            return "credited-denied".into();
-        }
-    }
 
     // 5. post APPROVE review, crediting the human. Kept in English in both
     //    cases: this line is the audit trail for who approved what, and it is
@@ -1025,6 +885,12 @@ or above to approve this PR (currently: {their_perm}).",
 /// r-: withdraw — dismiss our own previous APPROVE reviews.
 async fn handle_reject(gh: &Client, cfg: &Config, ctx: &CommentContext) -> String {
     let lang = ctx.lang;
+    if let Err(refusal) = authorize(gh, cfg, ctx, &Command::Reject).await {
+        let _ = gh
+            .post_issue_comment(&ctx.repo, ctx.pr_number, &refusal.message)
+            .await;
+        return refusal.status.into();
+    }
     let reviews = match gh.list_pr_reviews(&ctx.repo, ctx.pr_number).await {
         Ok(r) => r,
         Err(e) => {
