@@ -19,6 +19,19 @@ fn source_at_ms(value: &Value) -> Option<i64> {
         .map(|time| time.timestamp_millis())
 }
 
+/// A candidate that semantic resolution will discard must not establish a
+/// session. In particular, self-assignment/self-review requests are invalid
+/// even though their syntax, applicability, and trigger mode are otherwise
+/// valid.
+fn can_open_session(candidate: &ParsedCommand, bot_name: &str) -> bool {
+    !matches!(
+        &candidate.command,
+        crate::commands::Command::RequestReview { user }
+            | crate::commands::Command::Assign { user }
+            if normalize_login(user) == normalize_login(bot_name)
+    )
+}
+
 /// Route a verified webhook payload. Returns the JSON body to answer GitHub
 /// with. Long work must be spawned by the caller (wait_until / tokio::spawn).
 pub fn route_event(cfg: &Config, event_header: &str, payload: &Value) -> Routing {
@@ -485,9 +498,10 @@ pub(crate) async fn execute_comment_with_client(
             // a session as authority; their handler performs the fresh check.
             // Other explicit candidates may open a session only after their
             // command-specific preflight succeeds.
-            wake |= crate::handlers::authorize(gh, cfg, &ctx, &candidate.command)
-                .await
-                .is_ok();
+            wake |= can_open_session(&candidate, &cfg.bot_name)
+                && crate::handlers::authorize(gh, cfg, &ctx, &candidate.command)
+                    .await
+                    .is_ok();
         }
         permitted.push(candidate);
     }
@@ -992,6 +1006,19 @@ mod tests {
                 "{login} must not be treated as the bot itself, got {r:?}"
             );
         }
+    }
+
+    #[test]
+    fn semantically_discarded_self_requests_cannot_open_a_session() {
+        for text in [
+            "@xero-team-bot assign @xero-team-bot",
+            "@xero-team-bot r? @xero-team-bot",
+        ] {
+            let parsed = parse_commands("xero-team-bot", text);
+            assert!(parsed.commands.is_empty(), "{text:?}");
+        }
+        let parsed = parse_commands("xero-team-bot", "@xero-team-bot assign @alice");
+        assert!(can_open_session(&parsed.commands[0], "xero-team-bot"));
     }
 
     /// A comment with nothing to run but something to say must still be

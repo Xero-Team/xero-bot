@@ -347,6 +347,36 @@ fn sessions_are_scoped_persistent_and_ordered_by_source_not_arrival() {
     assert!(store.session_before(&call, 30).unwrap().is_some());
 }
 
+/// A wake can be before the current source comment yet already be expired at
+/// execution time; delayed delivery must fail closed in that case.
+#[test]
+fn session_expiry_is_checked_against_execution_time() {
+    let dir = Dir::new();
+    let store = Store::open(&dir.0).unwrap();
+    let wake = SessionWake {
+        installation_id: 7,
+        repository_id: 9,
+        thread_number: 88,
+        user_id: 5,
+        comment_id: 20,
+        source_at: 1_000_000,
+    };
+    store.record_wake(&wake).unwrap();
+    let call = SessionWake {
+        comment_id: 21,
+        source_at: wake.source_at + 1,
+        ..wake.clone()
+    };
+    assert!(store
+        .session_before_at(&call, 30, wake.source_at + 10 * 86_400_000)
+        .unwrap()
+        .is_some());
+    assert!(store
+        .session_before_at(&call, 30, wake.source_at + 30 * 86_400_000)
+        .unwrap()
+        .is_none());
+}
+
 /// Build an installation-like client against the local mock server.
 fn client(server: &MockServer) -> Client {
     Client {
