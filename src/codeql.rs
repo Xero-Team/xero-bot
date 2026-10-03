@@ -22,7 +22,7 @@ pub async fn run_codeql_report(
     // The placeholder is courtesy, not the deliverable: if it fails the report
     // itself may still land, so log and carry on rather than aborting.
     if let Err(e) = gh
-        .post_issue_comment(
+        .post_progress_comment(
             repo,
             pr_number,
             lang.pick(

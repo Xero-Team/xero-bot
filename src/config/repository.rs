@@ -317,11 +317,36 @@ impl Event {
         }
     }
 }
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum EventAction {
     Review,
     Codeql,
     AddLabels(Vec<String>),
+}
+impl EventAction {
+    /// Deployment control labels are never automatic data labels, even when
+    /// the corresponding legacy feature is temporarily switched off.
+    pub fn validate_deployment(&self, cfg: &crate::config::Config) -> Domain<()> {
+        if let Self::AddLabels(labels) = self {
+            if labels.iter().any(|label| {
+                [
+                    &cfg.label_merge_queue_queued,
+                    &cfg.label_merge_queue_testing,
+                    &cfg.codeql_label,
+                ]
+                .iter()
+                .any(|reserved| {
+                    !reserved.is_empty() && label.to_lowercase() == reserved.to_lowercase()
+                })
+            }) {
+                return Err(Problem::new(
+                    ReasonCode::InvalidRule,
+                    "automatic labels contain a deployment control label",
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 #[derive(Debug, Clone)]
 pub struct EventRule {
@@ -518,6 +543,12 @@ fn unique_ids<'a>(ids: impl Iterator<Item = &'a str>) -> Domain<()> {
 }
 /// Validate IDs at domain scope and preserve each event rule's independent result.
 fn events(raw: Vec<RawEventRule>, comments: &Domain<Comments>) -> Domain<Vec<Rule<EventRule>>> {
+    if raw.len() > 32 {
+        return Err(Problem::new(
+            ReasonCode::InvalidRule,
+            "at most 32 event rules are allowed",
+        ));
+    }
     unique_ids(raw.iter().map(|r| r.id.as_str()))?;
     Ok(raw
         .into_iter()
@@ -528,7 +559,7 @@ fn events(raw: Vec<RawEventRule>, comments: &Domain<Comments>) -> Domain<Vec<Rul
         })
         .collect())
 }
-/// Check the referenced command and automatic-action whitelist before returning Unsupported.
+/// Check the canonical command and construct only a whitelisted automatic action.
 /// A disabled command cannot be enabled through an automatic subscription.
 fn event_rule(r: RawEventRule, comments: &Domain<Comments>) -> Domain<EventRule> {
     let bad = || {
@@ -543,17 +574,24 @@ fn event_rule(r: RawEventRule, comments: &Domain<Comments>) -> Domain<EventRule>
     let id = CommandId::from_name(&r.command).ok_or_else(bad)?;
     comments.as_ref().map_err(Clone::clone)?.enabled(id)?;
     let event = Event::parse(&r.event).ok_or_else(bad)?;
-    match (id, event) {
-        (CommandId::Review | CommandId::Codeql, Event::PullRequestOpened) if r.add.is_empty() => {}
+    let action = match (id, event) {
+        (CommandId::Review, Event::PullRequestOpened) if r.add.is_empty() => EventAction::Review,
+        (CommandId::Codeql, Event::PullRequestOpened) if r.add.is_empty() => EventAction::Codeql,
         (CommandId::Label, Event::PullRequestOpened | Event::IssueOpened)
-            if !r.add.is_empty() && r.add.iter().all(|s| !s.trim().is_empty()) => {}
+            if !r.add.is_empty() && r.add.iter().all(|s| !s.trim().is_empty()) =>
+        {
+            let mut labels: Vec<_> = r.add.into_iter().map(|s| s.to_lowercase()).collect();
+            labels.sort();
+            labels.dedup();
+            EventAction::AddLabels(labels)
+        }
         _ => return Err(bad()),
-    }
-    // #15 will enable only implemented actions here, without changing manual modes.
-    Err(Problem::new(
-        ReasonCode::Unsupported,
-        "automatic event actions are not implemented yet (#15)",
-    ))
+    };
+    Ok(EventRule {
+        id: r.id,
+        event,
+        action,
+    })
 }
 /// Validate shared path settings, then retain independent rule diagnostics.
 /// Static path actions do not inherit the similarly named comment command modes.

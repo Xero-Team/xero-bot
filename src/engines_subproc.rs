@@ -541,7 +541,7 @@ pub async fn run_pi(
     lang: Lang,
 ) -> String {
     let _ = gh
-        .post_issue_comment(
+        .post_progress_comment(
             repo,
             pr_number,
             lang.pick(
@@ -594,6 +594,7 @@ async fn run_pi_inner(
 
     let token = installation_token(gh, cfg, installation_id).await?;
     let dir = ensure_checkout(cfg, repo, pr_number, &base_ref, &token).await?;
+    verify_automatic_checkout(&dir, &meta, &token).await?;
 
     let (previous_review, new_commits) =
         crate::review::fetch_incremental_context(gh, repo, pr_number, cfg.max_diff_chars).await;
@@ -666,7 +667,7 @@ pub async fn run_codex(
     lang: Lang,
 ) -> String {
     let _ = gh
-        .post_issue_comment(
+        .post_progress_comment(
             repo,
             pr_number,
             lang.pick(
@@ -716,6 +717,7 @@ async fn run_codex_inner(
     // a second review of the same PR never reaches this function.
     let token = installation_token(gh, cfg, installation_id).await?;
     let dir = ensure_checkout(cfg, repo, pr_number, &base_ref, &token).await?;
+    verify_automatic_checkout(&dir, &meta, &token).await?;
 
     let (previous_review, new_commits) =
         crate::review::fetch_incremental_context(gh, repo, pr_number, cfg.max_diff_chars).await;
@@ -803,7 +805,7 @@ pub async fn run_review(
 ) -> String {
     let Some(_in_flight) = InFlight::claim(format!("{repo}#{pr_number}")) else {
         let _ = gh
-            .post_issue_comment(
+            .post_progress_comment(
                 repo,
                 pr_number,
                 lang.pick(
@@ -846,6 +848,27 @@ missing), and neither pi nor codex is available.",
             }
         }
     }
+}
+
+/// A PR ref/base branch may move between API snapshot and git fetch. Refuse
+/// that checkout before invoking an engine with incorrectly attributed code.
+async fn verify_automatic_checkout(dir: &Path, meta: &Value, token: &str) -> Result<(), String> {
+    if !crate::trigger_state::runtime::automatic() {
+        return Ok(());
+    }
+    let head = git(Some(dir), &["rev-parse", "HEAD"], token).await?;
+    let base = git(
+        Some(dir),
+        &["rev-parse", &format!("origin/{}", base_ref(meta))],
+        token,
+    )
+    .await?;
+    if Some(head.trim()) != meta["head"]["sha"].as_str()
+        || Some(base.trim()) != meta["base"]["sha"].as_str()
+    {
+        return Err("PR head/base moved before automatic review checkout".into());
+    }
+    Ok(())
 }
 
 #[cfg(test)]

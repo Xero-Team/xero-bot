@@ -175,20 +175,45 @@ fn idle_semantics_are_isolated_but_legacy_validation_stays_strict() {
 /// Automatic subscriptions must honor disabled policies and the explicit action whitelist.
 #[test]
 fn event_rules_never_enable_unsupported_or_unsafe_actions() {
+    for (command, event, extra) in [
+        ("review", "pull_request.opened", ""),
+        ("codeql", "pull_request.opened", ""),
+        ("relabel", "issues.opened", "add=['triage']"),
+    ] {
+        let cfg = parse(&format!(
+            "[[event_triggers]]\nid='one'\nevent='{event}'\ncommand='{command}'\n{extra}"
+        ));
+        assert!(cfg.events.unwrap()[0].value.is_ok());
+    }
     for (command, event, extra, reason) in [
-        ("review", "pull_request.opened", "", ReasonCode::Unsupported),
-        ("codeql", "pull_request.opened", "", ReasonCode::Unsupported),
-        (
-            "relabel",
-            "issues.opened",
-            "add=['triage']",
-            ReasonCode::Unsupported,
-        ),
         ("r+", "pull_request.opened", "", ReasonCode::InvalidRule),
         ("r=", "pull_request.opened", "", ReasonCode::InvalidRule),
         ("r-", "pull_request.opened", "", ReasonCode::InvalidRule),
         ("claim", "pull_request.opened", "", ReasonCode::InvalidRule),
         ("assign", "pull_request.opened", "", ReasonCode::InvalidRule),
+        ("take", "pull_request.opened", "", ReasonCode::InvalidRule),
+        ("r+ as", "pull_request.opened", "", ReasonCode::InvalidRule),
+        (
+            "r+ @alice",
+            "pull_request.opened",
+            "",
+            ReasonCode::InvalidRule,
+        ),
+        (
+            "r= @alice",
+            "pull_request.opened",
+            "",
+            ReasonCode::InvalidRule,
+        ),
+        ("cc", "pull_request.opened", "", ReasonCode::InvalidRule),
+        ("ban", "pull_request.opened", "", ReasonCode::InvalidRule),
+        ("codeql", "issues.opened", "", ReasonCode::InvalidRule),
+        (
+            "review",
+            "pull_request.opened",
+            "add=['triage']",
+            ReasonCode::InvalidRule,
+        ),
         ("review", "issues.opened", "", ReasonCode::InvalidRule),
         (
             "review",
@@ -214,6 +239,49 @@ fn event_rules_never_enable_unsupported_or_unsafe_actions() {
     );
 }
 
+#[test]
+fn event_limits_disabled_aliases_and_deployment_labels_are_validated() {
+    let rule = |id: usize| {
+        format!("[[event_triggers]]\nid='rule-{id}'\nevent='issues.opened'\ncommand='label'\nadd=['triage']\n")
+    };
+    assert!(parse(&(0..32).map(rule).collect::<String>()).events.is_ok());
+    assert!(parse(&(0..33).map(rule).collect::<String>())
+        .events
+        .is_err());
+    assert!(parse(&rule(0).replace("rule-0", " ")).events.unwrap()[0]
+        .value
+        .is_err());
+    for (disabled, command) in [
+        ("label", "relabel"),
+        ("relabel", "label"),
+        ("review", "review"),
+        ("codeql", "codeql"),
+    ] {
+        let config = parse(&format!("[command_triggers]\n{disabled}={{mode='disabled'}}\n[[event_triggers]]\nid='x'\nevent='pull_request.opened'\ncommand='{command}'\n{}",if command=="label" || command=="relabel" {"add=['triage']"}else{""}));
+        assert_eq!(
+            config.events.unwrap()[0].value.as_ref().unwrap_err().code,
+            ReasonCode::Disabled
+        );
+    }
+    let mut deployment = xero_bot::config::Config::from_env();
+    deployment.label_merge_queue_queued = "queue/custom".into();
+    deployment.label_merge_queue_testing = "test/custom".into();
+    deployment.codeql_label = "scan/custom".into();
+    for label in ["QUEUE/custom", "test/custom", "scan/custom"] {
+        assert!(EventAction::AddLabels(vec![label.into()])
+            .validate_deployment(&deployment)
+            .is_err());
+    }
+    assert!(EventAction::AddLabels(vec!["triage".into()])
+        .validate_deployment(&deployment)
+        .is_ok());
+    assert!(RepositoryConfig::parse(
+        "[[event_triggers]]\nid='x'\nevent='issues.opened'\ncommand='label'\nremove=['triage']",
+        REPO
+    )
+    .is_err());
+}
+
 /// One invalid rule stays isolated; duplicate IDs make the entire owning domain unavailable.
 #[test]
 fn rule_failures_stay_per_rule_and_duplicate_ids_disable_only_the_domain() {
@@ -223,10 +291,7 @@ fn rule_failures_stay_per_rule_and_duplicate_ids_disable_only_the_domain() {
     ));
     let e = cfg.events.unwrap();
     assert_eq!(e.len(), 2);
-    assert_eq!(
-        e[0].value.as_ref().unwrap_err().code,
-        ReasonCode::Unsupported
-    );
+    assert!(e[0].value.is_ok());
     assert_eq!(
         e[1].value.as_ref().unwrap_err().code,
         ReasonCode::InvalidRule

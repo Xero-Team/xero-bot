@@ -288,11 +288,9 @@ async fn disabled_codeql_label_event_cannot_bypass_configuration() {
 
 /// Help must expose unsupported automatic rules while valid comment commands remain usable.
 #[tokio::test]
-async fn unsupported_event_rules_are_reported_by_help_without_disabling_comments() {
-    let f = Fixture::new(
-        "[[event_triggers]]\nid='review-on-open'\nevent='pull_request.opened'\ncommand='review'",
-    )
-    .await;
+async fn unsupported_path_rules_are_reported_by_help_without_disabling_comments() {
+    let f = Fixture::new("[[path_triggers.rules]]\nid='rust'\ninclude=['src/**']\nlabels=['rust']")
+        .await;
     Mock::given(method("GET"))
         .and(path(format!("/repos/{REPO}/pulls/1/commits")))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))

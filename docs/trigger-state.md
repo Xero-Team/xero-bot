@@ -26,8 +26,9 @@ delivery keeps its own timeout and recovery ownership. A local bookkeeping,
 claim, or periodic cleanup error stops new claims and maintenance. The pump keeps
 polling already claimed workers until they finish or reach their own deadlines,
 then returns the first error. It does not cancel healthy in-flight writes because
-another delivery failed to save its state. The opened/path envelopes currently record
-inputs only: automatic action planning belongs to #15–#17. Rebase, CodeQL label,
+another delivery failed to save its state. Opened envelopes execute the explicit
+whitelist from `event_triggers`; path envelopes remain inputs only for #16–#17.
+Rebase, CodeQL label,
 native review/merge queue, and idle workflow routing keep their existing switches
 and are not dispatched a second time by this worker.
 
@@ -36,6 +37,42 @@ canonical command/arguments, independent of delivery ID. Aliases and normalized
 login lists share a key. Opened actions have a repository/thread/stable rule ID
 key; notification recipients have a repository/PR/lowercase-login key. Configuration
 and head SHAs are audit/snapshot data, never part of a lifetime recipient key.
+
+The first successfully loaded opened-event plan is frozen in `opened_plans`,
+including an empty plan. It survives inbox cleanup and prevents configuration
+changes or redelivery from backfilling old threads. Equivalent actions share an
+operation keyed by the first sorted stable rule ID, with all matched IDs retained
+in its intent. Before each action/recovery, current default-branch policy must
+still contain at least one original rule with the same canonical action and
+parameters. Removed/changed/disabled plans are superseded. Independent actions
+can finish even when a sibling is paused.
+
+A verified invalid TOML document or invalid events domain (including duplicate
+IDs and the 32-rule limit) is a definite refusal. It logs its reason and freezes
+an empty plan, allowing the envelope to finish and age out normally. Repairing
+that configuration cannot backfill the refused thread. Existing frozen plans are
+revoked under an invalid policy. Transport, permission, rate-limit and incomplete
+response errors remain retryable because they do not establish repository intent.
+Revocation and cancellation of unsent children commit together **before** remote
+reconciliation; failed lookups cannot erase that veto. Sent unknown children keep
+their evidence, and a subsequently proven-unsent child is superseded too.
+
+Policy is checked before starting or recovering an action. Disabling a rule does
+not cancel a computation already running under its verified snapshot. For an
+emergency stop, stop the service/worker and inspect the resulting unknown writes
+before resuming; the stopped computation is not automatically repeated.
+
+Automatic review/report computation is marked started before invoking its engine.
+After interruption it can adopt a confirmed result receipt, but never recomputes
+AI output automatically. A started computation with no confirmable output stays
+unknown for operator inspection. Progress and engine-fallback announcements use
+a separate API and are omitted for automatic work. Final automatic comment
+intents carry an explicit report flag; legacy unclassified comment receipts do
+not prove completion. Any pending child also prevents completion. Labels remain an
+idempotent ensure: reconcile first, then retry only under compatible current policy.
+Report bodies include event, matched rule IDs, configuration commit and actual PR
+head; API review diffs use immutable base/head comparisons, and COMMENT reviews
+include the actual commit ID. Subprocess checkouts must match that snapshot.
 
 Each command and each of its external writes have separate rows. An immediate
 SQLite transaction claims a unique key before a GitHub call. Attempt numbers

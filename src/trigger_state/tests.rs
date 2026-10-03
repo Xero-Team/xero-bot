@@ -1259,3 +1259,6 @@ mod review;
 
 #[path = "drain_tests.rs"]
 mod drain;
+
+#[path = "event_tests.rs"]
+mod events;

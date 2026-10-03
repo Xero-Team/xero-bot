@@ -13,6 +13,9 @@ use crate::config::cache::RepositoryConfigCache;
 use crate::config::Config;
 use crate::github::{Client, GhError};
 
+#[path = "events.rs"]
+mod events;
+
 /// Use epoch seconds for restart-safe scheduling and audit timestamps.
 fn now() -> i64 {
     crate::github::chrono_now_secs()
@@ -160,12 +163,33 @@ struct Frame {
     snapshot: Mutex<(Option<String>, Option<String>, Option<String>)>,
     counts: Mutex<HashMap<(String, String), usize>>,
     blocked: AtomicBool,
+    /// Present only for automatic PR actions; every engine sees one snapshot.
+    pr: Option<Value>,
 }
 tokio::task_local! { static ACTIVE: Arc<Frame>; }
 
 /// Report whether this task is inside a durable trigger execution scope.
 pub(crate) fn active() -> bool {
     ACTIVE.try_with(|_| ()).is_ok()
+}
+
+/// Keep automatic publication constraints separate from comment command policy.
+pub(crate) fn automatic() -> bool {
+    ACTIVE
+        .try_with(|f| f.context.event != "issue_comment")
+        .unwrap_or(false)
+}
+
+/// Return only the PR snapshot owned by this automatic operation's scope.
+pub(crate) fn automatic_pr(repo: &str, number: i64) -> Option<Value> {
+    ACTIVE
+        .try_with(|f| {
+            (f.context.repo == repo && f.context.number == number)
+                .then(|| f.pr.clone())
+                .flatten()
+        })
+        .ok()
+        .flatten()
 }
 
 /// Query durable session evidence for the current webhook delivery. A caller
@@ -343,10 +367,7 @@ impl Runtime {
         context: &EventContext,
     ) -> Result<()> {
         if context.event != "issue_comment" {
-            // #13 stores these envelopes but introduces no automatic actions.
-            // Later consumers plan stable rule operations here, independently
-            // of rebase, CodeQL-label and native-review routes.
-            return Ok(());
+            return events::process(self, gh, cfg, cache, context).await;
         }
         let frame = Arc::new(Frame {
             store: self.store.clone(),
@@ -356,6 +377,7 @@ impl Runtime {
             snapshot: Mutex::new((None, context.head_sha.clone(), context.base_sha.clone())),
             counts: Mutex::new(HashMap::new()),
             blocked: AtomicBool::new(false),
+            pr: None,
         });
         ACTIVE
             .scope(Arc::clone(&frame), async {
@@ -479,6 +501,7 @@ async fn run_command<F: Future<Output = String>>(
         snapshot: Mutex::new((config_sha, spec.context.head_sha, spec.context.base_sha)),
         counts: Mutex::new(HashMap::new()),
         blocked: AtomicBool::new(false),
+        pr: None,
     });
     let status = ACTIVE.scope(frame, future).await;
     let children = outer.store.children(&key)?;
@@ -570,6 +593,35 @@ async fn durable_write(
         "other"
     };
     let mut body = body;
+    if automatic() && matches!(kind, "comment" | "review") {
+        if let Some(object) = body.as_mut() {
+            let text = object["body"].as_str().unwrap_or("");
+            let config = frame
+                .snapshot
+                .lock()
+                .map_err(error)?
+                .0
+                .clone()
+                .unwrap_or_default();
+            let plan = frame.store.get(&frame.parent).map_err(error)?;
+            let rules = plan
+                .as_ref()
+                .map(|p| p.spec.request["rules"].to_string())
+                .unwrap_or_default();
+            object["body"] = json!(format!(
+                "{text}\n\nAutomatic {}.{} · rules: `{rules}` · config: `{config}` · head: `{}`",
+                frame.context.event,
+                frame.context.action,
+                frame.context.head_sha.as_deref().unwrap_or("n/a")
+            ));
+            if kind == "review" {
+                if object["event"] != "COMMENT" {
+                    return Err(error("automatic reviews must use COMMENT"));
+                }
+                object["commit_id"] = json!(frame.context.head_sha);
+            }
+        }
+    }
     if matches!(kind, "comment" | "review") {
         if let Some(object) = body.as_mut() {
             let text = object["body"].as_str().unwrap_or("");
@@ -577,7 +629,7 @@ async fn durable_write(
         }
     }
     let request: Value = serde_json::from_str(&crate::redact::scrub(
-        &json!({"method":method,"route":route,"body":body}).to_string(),
+        &json!({"method":method,"route":route,"body":body,"automatic_report":automatic() && matches!(kind,"comment"|"review")}).to_string(),
     ))
     .map_err(error)?;
     let spec = OperationSpec {

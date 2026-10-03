@@ -904,7 +904,7 @@ async fn run_builtin_inner(
 ) -> Result<String, String> {
     // processing indicator (best-effort)
     let _ = gh
-        .post_issue_comment(
+        .post_progress_comment(
             repo,
             pr_number,
             lang.pick("🔄 Reviewing, one moment…", "🔄 正在审查,稍候…"),

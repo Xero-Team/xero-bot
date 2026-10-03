@@ -301,13 +301,20 @@ async fn webhook(
     }
 
     match route_event(&state.cfg, &event_header, &payload) {
+        Routing::Respond(_) if durable.is_some() => (
+            StatusCode::OK,
+            Json(json!({"accepted":true,"persisted":true})),
+        ),
         Routing::Respond(body) => (StatusCode::OK, Json(body)),
         Routing::Act(work) => {
             let cfg = state.cfg.clone();
             tokio::spawn(async move {
                 execute_work(&cfg, work).await;
             });
-            (StatusCode::OK, Json(json!({"accepted": true})))
+            (
+                StatusCode::OK,
+                Json(json!({"accepted": true, "persisted": durable.is_some()})),
+            )
         }
     }
 }
@@ -477,5 +484,51 @@ mod trigger_ingress_tests {
             assert_ne!(result.0["persisted"], true);
         }
         assert!(s.triggers.store.inbox_status().unwrap().is_empty());
+    }
+
+    /// Opened Issue acknowledgements reflect durable admission; edited and
+    /// reopened Issues do not create work or re-run opened subscriptions.
+    #[tokio::test]
+    async fn opened_issue_is_persisted_while_other_issue_actions_are_ignored() {
+        let dir = Dir::new();
+        let s = state(&dir);
+        for action in ["opened", "edited", "reopened"] {
+            let event = json!({"action":action,"repository":{"id":1,"full_name":"test/repo"},"installation":{"id":2},"issue":{"id":3,"number":1,"created_at":"2026-10-03T00:00:00Z","user":{"id":5,"login":"alice","type":"User"}}});
+            let body = serde_json::to_vec(&event).unwrap();
+            let mut headers = signed(&body);
+            headers.insert("x-github-event", "issues".parse().unwrap());
+            headers.insert("x-github-delivery", action.parse().unwrap());
+            let (status, result) = webhook(State(s.clone()), headers, body.into()).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(result.0["persisted"] == true, action == "opened");
+        }
+        assert_eq!(s.triggers.store.inbox_status().unwrap().len(), 1);
+    }
+
+    /// Persisting automatic PR work must compose with the legacy dispatcher.
+    #[test]
+    fn opened_pr_keeps_rebase_and_other_legacy_routes() {
+        let mut cfg = Config::from_env();
+        cfg.codeql_label = "scan".into();
+        cfg.merge_queue_enabled = true;
+        let mut p = json!({"action":"opened","repository":{"full_name":"test/repo"},"installation":{"id":2},"pull_request":{"number":1}});
+        for action in ["opened", "reopened", "synchronize"] {
+            p["action"] = json!(action);
+            assert!(matches!(
+                route_event(&cfg, "pull_request", &p),
+                Routing::Act(xero_bot::dispatch::Work::RebaseCheck { .. })
+            ));
+        }
+        p["action"] = json!("labeled");
+        p["label"] = json!({"name":"scan"});
+        assert!(matches!(
+            route_event(&cfg, "pull_request", &p),
+            Routing::Act(xero_bot::dispatch::Work::Codeql { .. })
+        ));
+        p["action"] = json!("closed");
+        assert!(matches!(
+            route_event(&cfg, "pull_request", &p),
+            Routing::Act(xero_bot::dispatch::Work::QueuePrClosed { .. })
+        ));
     }
 }

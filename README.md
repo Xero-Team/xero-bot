@@ -61,6 +61,8 @@ approvals. Other commands use `mention_once`. Session evidence comes from the du
 | `@xero-review queue` | Show the merge queue: batch under test + waiting PRs |
 
 Automatic behavior (no command needed):
+
+- Optional `event_triggers` in the default branch's `.github/xero-bot.toml`: Issue/PR opened can add existing labels; PR opened (including drafts) can run AI review or CodeQL. Defaults are empty. AI output is COMMENT only; queue labels and `CODEQL_LABEL` cannot be added by these rules. Rules do not open command sessions or change manual modes. See [configuration example](examples/repository-config.toml) and [acceptance/recovery details](docs/issue-15-acceptance.md).
 - After a PR push/reopen, checks for conflicts → adds `needs-rebase` + a reminder comment; once resolved → removes the label
 - Periodic sweep (built-in loop, default 6h) as a fallback check
 - Adding the `CODEQL_LABEL` label to a PR (if configured) → auto-generates a CodeQL report
