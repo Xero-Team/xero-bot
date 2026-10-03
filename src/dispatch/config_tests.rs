@@ -375,7 +375,7 @@ async fn denied_bare_duplicate_does_not_erase_explicit_approval() {
             "/repos/{REPO}/collaborators/alice/permission"
         )))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({"permission":"write"})))
-        .expect(1)
+        .expect(2)
         .mount(&f.server)
         .await;
     Mock::given(method("POST"))
@@ -406,6 +406,52 @@ async fn denied_bare_duplicate_does_not_erase_explicit_approval() {
         serde_json::from_slice::<Value>(&approvals[0].body).unwrap()["event"],
         "APPROVE"
     );
+}
+
+/// Authorization runs on every applicable candidate before duplicate
+/// resolution. A denied always-mention approval cannot survive as the single
+/// deduplicated command or reach the review endpoint.
+#[tokio::test]
+async fn refused_always_mention_candidate_is_removed_before_resolution() {
+    let f = Fixture::new("").await;
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "/repos/{REPO}/collaborators/alice/permission"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"permission": "read"})))
+        .expect(2)
+        .mount(&f.server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!("/repos/{REPO}/pulls/1/reviews")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": 1})))
+        .expect(0)
+        .mount(&f.server)
+        .await;
+
+    let Routing::Act(mut work) = f.route("@bot r+; @bot r+", 1) else {
+        panic!("not routed")
+    };
+    if let Work::Comment { pr_author, .. } = &mut work {
+        *pr_author = "bob".into();
+    }
+    execute_comment_with_client(&f.gh, &f.cfg, &f.cache, work)
+        .await
+        .unwrap();
+    let comments: Vec<_> = f
+        .server
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|request| request.method == "POST" && request.url.path().ends_with("/comments"))
+        .collect();
+    assert_eq!(
+        comments.len(),
+        1,
+        "diagnostic budget should collapse duplicate refusals"
+    );
+    assert!(String::from_utf8_lossy(&comments[0].body).contains("write access"));
 }
 
 /// A disabled conflicting status must be removed before status resolution.

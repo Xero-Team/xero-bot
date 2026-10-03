@@ -347,6 +347,25 @@ impl Store {
         Self::operation(&*self.db()?, key)
     }
 
+    /// Permanently reject an unsent command after current policy or
+    /// authorization refused it. Unknown sent writes remain untouched and
+    /// still require reconciliation; an absent operation is a no-op because
+    /// the command never reached the durable planner.
+    pub fn fail_unsent(&self, key: &str, detail: &str, now: i64) -> Result<()> {
+        let mut db = self.db()?;
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "UPDATE operations SET state='failed',detail=?2,next_at=0,updated_at=?3 WHERE key=?1 AND state IN ('pending','unknown') AND sent=0",
+            params![key, crate::redact::scrub(detail), now],
+        )?;
+        tx.execute(
+            "DELETE FROM recipients WHERE operation=?1 AND committed=0",
+            [key],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Return operation audit records, optionally restricted to one state.
     pub fn list(&self, state: Option<State>) -> Result<Vec<Operation>> {
         let db = self.db()?;

@@ -8,7 +8,7 @@ comment policy from Issue 10.
   lookup or command actions; PR-only commands reach the handler on an Issue so
   the user receives an explicit explanation.
 - Production webhook deliveries use the source comment ID, GitHub user ID,
-  issue/PR ID, installation ID, and GitHub `created_at` timestamp. A genuine
+  issue/PR number, installation ID, and GitHub `created_at` timestamp. A genuine
   explicit bot mention for a session-capable mode records a wake only after applicability
   and authorization preflight. Bare commands and always-mention approvals never open
   or renew a session.
@@ -20,6 +20,8 @@ comment policy from Issue 10.
 - `always_mention` approvals remain explicit-only authority and do not become a
   session grant; `r+`, `r=`, and `r-` are rechecked by their handlers immediately
   before the privileged review or dismissal write.
+- Authorization preflight runs before duplicate and status resolution. Refused
+  candidates are excluded from execution while their diagnostic is retained.
 - `r+`, `r=`, and `r+ as` retain the existing write/maintain/admin, self-
   approval, credited-user, and feature-switch checks. `r-` now performs the
   same write-level preflight and refuses when GitHub cannot confirm permission;

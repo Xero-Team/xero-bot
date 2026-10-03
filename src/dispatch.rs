@@ -487,21 +487,36 @@ pub(crate) async fn execute_comment_with_client(
         }
         if let Err(problem) = decision {
             let message = trigger_message(&problem, candidate.id().name(), &cfg.bot_name, ctx.lang);
+            if crate::trigger_state::runtime::active() {
+                crate::trigger_state::runtime::reject_command(&candidate.command, &message)
+                    .map_err(|error| error.to_string())?;
+            }
             blocked.push((problem, message));
+            continue;
+        }
+        // Authorization is a candidate gate, not merely a session-wake hint.
+        // Refused candidates must not participate in duplicate or status
+        // resolution, while the handler still rechecks privileged commands at
+        // the actual write boundary.
+        let authorization = crate::handlers::authorize(gh, cfg, &ctx, &candidate.command).await;
+        if let Err(refusal) = authorization {
+            if crate::trigger_state::runtime::active() {
+                crate::trigger_state::runtime::reject_command(&candidate.command, &refusal.message)
+                    .map_err(|error| error.to_string())?;
+            }
+            blocked.push((
+                Problem::new(refusal.code, "command authorization refused"),
+                format!("`{}`: {}", candidate.id().name(), refusal.message),
+            ));
             continue;
         }
         if !commenter_is_bot
             && candidate.is_explicit()
             && policy.mode(candidate.id()) != ManualMode::AlwaysMention
         {
-            // Approval commands are always-mention by default and never use
-            // a session as authority; their handler performs the fresh check.
-            // Other explicit candidates may open a session only after their
-            // command-specific preflight succeeds.
-            wake |= can_open_session(&candidate, &cfg.bot_name)
-                && crate::handlers::authorize(gh, cfg, &ctx, &candidate.command)
-                    .await
-                    .is_ok();
+            // Always-mention approvals are explicitly authorized but never
+            // establish a reusable session.
+            wake |= can_open_session(&candidate, &cfg.bot_name);
         }
         permitted.push(candidate);
     }

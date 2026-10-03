@@ -184,6 +184,19 @@ pub(crate) fn session_before(call: &SessionWake, ttl_days: u16) -> Result<Option
 pub(crate) fn record_wake(wake: &SessionWake) -> Result<()> {
     ACTIVE.try_with(|frame| frame.store.record_wake(wake))?
 }
+
+/// Mark an existing unsent command as refused before candidate resolution.
+/// First-time refusals have no operation row and are intentionally a no-op.
+pub(crate) fn reject_command(command: &Command, detail: &str) -> Result<()> {
+    ACTIVE.try_with(|frame| {
+        let comment = frame
+            .context
+            .comment_id
+            .ok_or("missing source comment for command refusal")?;
+        let key = super::manual_key(frame.context.repository_id, comment, command);
+        frame.store.fail_unsent(&key, detail, now())
+    })?
+}
 /// Capture the configuration and PR snapshot used by subsequent command claims.
 pub(crate) fn snapshot(config: &str, head: Option<&str>, base: Option<&str>) -> Result<()> {
     if let Ok(frame) = ACTIVE.try_with(Arc::clone) {
