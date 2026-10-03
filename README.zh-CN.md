@@ -57,6 +57,8 @@ Xero-Team 的组织级 GitHub App 机器人。Rust 实现,主服务与离线状�
 | `@xero-review queue` | 查看合并队列(在测批次 + 排队 PR) |
 
 自动行为(无需命令):
+
+- 默认分支 `.github/xero-bot.toml` 中可显式配置 `event_triggers`：Issue/PR 创建时添加已有标签，PR 创建时（含草稿）执行 AI review 或 CodeQL。默认规则为空；AI 只发布 COMMENT，禁止添加合并队列控制标签和 `CODEQL_LABEL`。自动规则不建立评论会话，也不放宽手动模式。参见[配置示例](examples/repository-config.toml)与[验收及恢复说明](docs/issue-15-acceptance.md)。
 - PR push/reopen 后检测冲突 → 打 `needs-rebase` + 提醒评论;冲突解决 → 摘标签
 - 周期 sweep(内置循环,默认 6h)兜底检测
 - 给 PR 打 `codeql` 标签(若配置了 `CODEQL_LABEL`)→ 自动生成 CodeQL 报告

@@ -634,11 +634,26 @@ impl Client {
     // -------------------------------------------------------------------
 
     pub async fn get_pr(&self, repo: &str, number: i64) -> Result<Value, GhError> {
+        if let Some(pr) = crate::trigger_state::runtime::automatic_pr(repo, number) {
+            return Ok(pr);
+        }
         self.get(&format!("/repos/{repo}/pulls/{number}")).await
     }
 
     /// unified diff text
     pub async fn get_pr_diff(&self, repo: &str, number: i64) -> Result<String, GhError> {
+        if let Some(pr) = crate::trigger_state::runtime::automatic_pr(repo, number) {
+            return self
+                .get_raw(
+                    &format!(
+                        "/repos/{repo}/compare/{}...{}",
+                        enc_seg(pr["base"]["sha"].as_str().unwrap_or("")),
+                        enc_seg(pr["head"]["sha"].as_str().unwrap_or(""))
+                    ),
+                    "application/vnd.github.v3.diff",
+                )
+                .await;
+        }
         self.get_raw(
             &format!("/repos/{repo}/pulls/{number}"),
             "application/vnd.github.v3.diff",
@@ -651,8 +666,25 @@ impl Client {
     /// GitHub caps this endpoint at 3000 files regardless of pagination, so a
     /// enormous PR is still truncated — that ceiling is theirs, not ours.
     pub async fn list_pr_files(&self, repo: &str, number: i64) -> Result<Vec<Value>, GhError> {
-        self.get_all(&format!("/repos/{repo}/pulls/{number}/files?per_page=100"))
-            .await
+        let files = self
+            .get_all(&format!("/repos/{repo}/pulls/{number}/files?per_page=100"))
+            .await?;
+        if let Some(pr) = crate::trigger_state::runtime::automatic_pr(repo, number) {
+            let current = self.get(&format!("/repos/{repo}/pulls/{number}")).await?;
+            if current["head"]["sha"] != pr["head"]["sha"]
+                || current["base"]["sha"] != pr["base"]["sha"]
+            {
+                return Err(GhError::BadShape(
+                    "PR changed while reading automatic report files".into(),
+                ));
+            }
+            if pr["changed_files"].as_u64() != Some(files.len() as u64) {
+                return Err(GhError::BadShape(
+                    "automatic report file list is incomplete".into(),
+                ));
+            }
+        }
+        Ok(files)
     }
 
     /// reviews on a PR

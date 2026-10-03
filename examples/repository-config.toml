@@ -31,5 +31,18 @@ queue   = { mode = "mention_once" }
 ttl_days = 30 # 1..365; the durable session implementation is #13/#14
 
 # event_triggers and path_triggers.rules default to empty.
-# Explicit rules currently produce Unsupported diagnostics; their executors
-# arrive in #15–#17. mode = "auto" is invalid, never an execution shortcut.
+# Event rules support opened only (including draft PRs), up to 32 unique IDs.
+# They neither change manual modes nor open sessions. mode = "auto" is invalid.
+# Uncomment to opt in; create labels in the repository beforehand.
+# [[event_triggers]]
+# id = "review-on-open"
+# event = "pull_request.opened"
+# command = "review" # COMMENT only, never APPROVE or queue
+#
+# [[event_triggers]]
+# id = "issue-triage-on-open"
+# event = "issues.opened"
+# command = "label"
+# add = ["needs-triage"] # no queue control labels or CODEQL_LABEL
+#
+# Path rules remain Unsupported until #16–#17.

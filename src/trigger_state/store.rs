@@ -108,6 +108,7 @@ impl Store {
                 next_at INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS operation_parent ON operations(parent);
+            CREATE TABLE IF NOT EXISTS opened_plans(key TEXT PRIMARY KEY, plan TEXT NOT NULL);
             CREATE INDEX IF NOT EXISTS operation_delivery_state ON operations(delivery,state);
             CREATE INDEX IF NOT EXISTS inbox_due ON inbox(state,next_at);
             CREATE INDEX IF NOT EXISTS inbox_retention ON inbox(state,updated_at);
@@ -411,6 +412,45 @@ impl Store {
     /// Atomically acquire a pending operation and bind the attempt to this delivery.
     pub fn claim(&self, spec: &OperationSpec, now: i64) -> Result<Option<Claim>> {
         self.claim_with_recipients(spec, &[], None, now)
+    }
+
+    /// Freeze the first opened-event plan, including an empty subscription.
+    /// This ledger outlives inbox retention; redelivery cannot backfill new rules.
+    pub(super) fn opened_plan(&self, key: &str, proposed: &Value) -> Result<Value> {
+        let mut db = self.db()?;
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "INSERT OR IGNORE INTO opened_plans(key,plan) VALUES(?1,?2)",
+            params![key, serde_json::to_string(proposed)?],
+        )?;
+        let saved: String =
+            tx.query_row("SELECT plan FROM opened_plans WHERE key=?1", [key], |r| {
+                r.get(0)
+            })?;
+        tx.commit()?;
+        Ok(serde_json::from_str(&saved)?)
+    }
+
+    /// Revoke a planner without hiding any uncertain GitHub child writes.
+    /// `sent` on an opened planner means computation started, not a GitHub write.
+    pub(super) fn revoke_opened(&self, key: &str, now: i64) -> Result<()> {
+        self.db()?.execute("UPDATE operations SET state='superseded',detail='opened rule removed, disabled or changed',updated_at=?2 WHERE key=?1 AND state IN ('pending','unknown') AND json_extract(spec,'$.kind')='opened'", params![key,now])?;
+        self.supersede_unsent_children(key, now)
+    }
+
+    /// Bind a newly claimed, not-yet-started planner to the verified execution
+    /// snapshot; independently checkpointed child writes keep their own evidence.
+    pub(super) fn refresh_opened_snapshot(
+        &self,
+        claim: &Claim,
+        spec: &OperationSpec,
+        now: i64,
+    ) -> Result<()> {
+        let n = self.db()?.execute("UPDATE operations SET spec=?3,updated_at=?4 WHERE key=?1 AND attempts=?2 AND state='running' AND sent=0 AND json_extract(spec,'$.kind')='opened'", params![spec.key,claim.attempt,serde_json::to_string(spec)?,now])?;
+        if n != 1 {
+            return Err("stale opened snapshot lease".into());
+        }
+        Ok(())
     }
 
     /// Claim and PR-wide budget reservation are one transaction. All rules and
