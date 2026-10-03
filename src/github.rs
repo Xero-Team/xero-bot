@@ -692,19 +692,62 @@ impl Client {
                     "PR changed while reading automatic report files".into(),
                 ));
             }
-            let names: std::collections::HashSet<_> = files
-                .iter()
-                .filter_map(|file| file["filename"].as_str().filter(|name| !name.is_empty()))
-                .collect();
-            if names.len() != files.len()
-                || pr["changed_files"].as_u64() != Some(files.len() as u64)
-            {
+            Self::validate_pr_files(&files, &pr, false)?;
+        }
+        Ok(files)
+    }
+
+    /// Fetch and validate the complete current PR file list for a path trigger.
+    /// The metadata read before and after pagination fences the list to one
+    /// base/head snapshot; a changed PR is retried by the caller on a later
+    /// webhook rather than executing against a partial or stale diff.
+    pub async fn list_pr_files_complete(
+        &self,
+        repo: &str,
+        number: i64,
+        snapshot: &Value,
+    ) -> Result<Vec<Value>, GhError> {
+        let files = self
+            .get_all(&format!("/repos/{repo}/pulls/{number}/files?per_page=100"))
+            .await?;
+        let current = self.get(&format!("/repos/{repo}/pulls/{number}")).await?;
+        if current["head"]["sha"] != snapshot["head"]["sha"]
+            || current["base"]["sha"] != snapshot["base"]["sha"]
+        {
+            return Err(GhError::BadShape(
+                "PR changed while reading path trigger files".into(),
+            ));
+        }
+        Self::validate_pr_files(&files, snapshot, true)?;
+        Ok(files)
+    }
+
+    fn validate_pr_files(files: &[Value], pr: &Value, require_status: bool) -> Result<(), GhError> {
+        let names: std::collections::HashSet<_> = files
+            .iter()
+            .filter_map(|file| file["filename"].as_str().filter(|name| !name.is_empty()))
+            .collect();
+        if names.len() != files.len() || pr["changed_files"].as_u64() != Some(files.len() as u64) {
+            return Err(GhError::BadShape(
+                "automatic report file list is malformed or incomplete".into(),
+            ));
+        }
+        for file in files {
+            let Some(status) = file["status"].as_str() else {
+                if require_status {
+                    return Err(GhError::BadShape(
+                        "PR file list is missing file status".into(),
+                    ));
+                }
+                continue;
+            };
+            if status == "renamed" && file["previous_filename"].as_str().is_none_or(str::is_empty) {
                 return Err(GhError::BadShape(
-                    "automatic report file list is malformed or incomplete".into(),
+                    "renamed PR file is missing previous_filename".into(),
                 ));
             }
         }
-        Ok(files)
+        Ok(())
     }
 
     /// reviews on a PR

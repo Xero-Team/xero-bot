@@ -349,6 +349,51 @@ fn paths_have_independent_static_actions_and_shared_domain_limits() {
     );
 }
 
+#[test]
+fn path_label_rules_validate_globs_and_limits_but_keep_cc_for_issue17() {
+    let cfg = parse(
+        "[path_triggers]\nevents=['pull_request.opened','pull_request.synchronize']\n[[path_triggers.rules]]\nid='rust'\ninclude=['src/**/*.rs']\nexclude=['src/generated/**']\nlabels=['area/rust']",
+    );
+    let paths = cfg.paths.unwrap();
+    let rule = paths.rules[0].value.as_ref().unwrap();
+    assert_eq!(rule.labels, ["area/rust"]);
+    assert!(rule.cc.is_empty());
+    for pattern in [
+        "/src/**",
+        "src\\x.rs",
+        "src/../x.rs",
+        "src/[a].rs",
+        "src/{a,b}.rs",
+    ] {
+        let cfg = parse(&format!(
+            "[[path_triggers.rules]]\nid='bad'\ninclude=['{pattern}']\nlabels=['x']"
+        ));
+        assert_eq!(
+            cfg.paths.unwrap().rules[0].value.as_ref().unwrap_err().code,
+            ReasonCode::InvalidRule,
+            "{pattern}"
+        );
+    }
+    let rules: String = (0..33)
+        .map(|i| format!("[[path_triggers.rules]]\nid='r{i}'\ninclude=['src/**']\nlabels=['x']\n"))
+        .collect();
+    assert_eq!(
+        parse(&rules).paths.unwrap_err().code,
+        ReasonCode::InvalidPathSettings
+    );
+    let too_many_globs: String = (0..65)
+        .map(|i| format!("'src/{i}'"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let cfg = parse(&format!(
+        "[path_triggers]\n[[path_triggers.rules]]\nid='many'\ninclude=[{too_many_globs}]\nlabels=['x']"
+    ));
+    assert_eq!(
+        cfg.paths.unwrap().rules[0].value.as_ref().unwrap_err().code,
+        ReasonCode::InvalidRule
+    );
+}
+
 /// The pure gate must order disabled, applicability and mention checks before caller permissions.
 #[test]
 fn gates_preserve_priority_and_never_grant_execution_authority() {

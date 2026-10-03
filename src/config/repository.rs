@@ -308,7 +308,7 @@ pub enum Event {
 }
 impl Event {
     /// Recognize supported event names without guessing a default for unknown events.
-    fn parse(s: &str) -> Option<Self> {
+    pub(crate) fn parse(s: &str) -> Option<Self> {
         match s {
             "pull_request.opened" => Some(Self::PullRequestOpened),
             "pull_request.synchronize" => Some(Self::PullRequestSynchronize),
@@ -354,7 +354,7 @@ pub struct EventRule {
     pub event: Event,
     pub action: EventAction,
 }
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PathRule {
     pub id: String,
     pub include: Vec<String>,
@@ -372,6 +372,27 @@ pub struct Paths {
     pub events: Vec<Event>,
     pub max_cc_users_per_pr: u8,
     pub rules: Vec<Rule<PathRule>>,
+}
+
+impl PathRule {
+    /// Deployment control labels are never safe as path-derived labels.
+    pub fn validate_deployment(&self, cfg: &crate::config::Config) -> Domain<()> {
+        if self.labels.iter().any(|label| {
+            [
+                &cfg.label_merge_queue_queued,
+                &cfg.label_merge_queue_testing,
+                &cfg.codeql_label,
+            ]
+            .iter()
+            .any(|reserved| !reserved.is_empty() && label.to_lowercase() == reserved.to_lowercase())
+        }) {
+            return Err(Problem::new(
+                ReasonCode::InvalidRule,
+                "path labels contain a deployment control label",
+            ));
+        }
+        Ok(())
+    }
 }
 #[derive(Debug, Clone)]
 pub struct RepositoryConfig {
@@ -596,6 +617,12 @@ fn event_rule(r: RawEventRule, comments: &Domain<Comments>) -> Domain<EventRule>
 /// Validate shared path settings, then retain independent rule diagnostics.
 /// Static path actions do not inherit the similarly named comment command modes.
 fn paths(raw: RawPaths) -> Domain<Paths> {
+    if raw.rules.len() > 32 {
+        return Err(Problem::new(
+            ReasonCode::InvalidPathSettings,
+            "at most 32 path rules are allowed",
+        ));
+    }
     unique_ids(raw.rules.iter().map(|r| r.id.as_str()))?;
     let bad = || {
         Problem::new(
@@ -621,28 +648,42 @@ fn paths(raw: RawPaths) -> Domain<Paths> {
         .rules
         .into_iter()
         .map(|r| {
+            let id = r.id.clone();
             let value = if r.id.trim().is_empty()
                 || r.include.is_empty()
+                || r.include.len().saturating_add(r.exclude.len()) > 64
                 || r.include
                     .iter()
                     .chain(&r.exclude)
                     .any(|s| s.trim().is_empty())
                 || (r.labels.is_empty() && r.cc.is_empty())
+                || r.labels.len() > 20
                 || r.labels.iter().any(|s| s.trim().is_empty())
                 || r.cc.iter().any(|s| !crate::commands::is_valid_login(s))
+                || r.include
+                    .iter()
+                    .chain(&r.exclude)
+                    .any(|s| !crate::path_triggers::valid_glob(s))
             {
                 Err(Problem::new(
                     ReasonCode::InvalidRule,
                     "invalid path rule, labels or explicit personal logins",
                 ))
-            } else {
-                // Static actions are independent of the label/cc *comment* modes.
+            } else if !r.cc.is_empty() {
                 Err(Problem::new(
                     ReasonCode::Unsupported,
-                    "path actions are not implemented yet (#16/#17)",
+                    "path notifications are not implemented yet (#17)",
                 ))
+            } else {
+                Ok(PathRule {
+                    id: r.id,
+                    include: r.include,
+                    exclude: r.exclude,
+                    labels: r.labels,
+                    cc: r.cc,
+                })
             };
-            Rule { id: r.id, value }
+            Rule { id, value }
         })
         .collect();
     Ok(Paths {

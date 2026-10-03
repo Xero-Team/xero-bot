@@ -27,7 +27,9 @@ claim, or periodic cleanup error stops new claims and maintenance. The pump keep
 polling already claimed workers until they finish or reach their own deadlines,
 then returns the first error. It does not cancel healthy in-flight writes because
 another delivery failed to save its state. Opened envelopes execute the explicit
-whitelist from `event_triggers`; path envelopes remain inputs only for #16–#17.
+whitelist from `event_triggers`; PR path envelopes execute the verified label
+subset from `path_triggers`. Path notification recipients remain the #17
+follow-up. Both use the same durable inbox and recovery boundary.
 Rebase, CodeQL label,
 native review/merge queue, and idle workflow routing keep their existing switches
 and are not dispatched a second time by this worker.

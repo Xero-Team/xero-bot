@@ -9,6 +9,7 @@ pub mod handlers;
 pub mod idle_workflows;
 pub mod lang;
 pub mod merge_queue;
+pub mod path_triggers;
 pub mod rebase;
 pub mod redact;
 pub mod review;

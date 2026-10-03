@@ -1,14 +1,48 @@
 //! Opened-event plans are trusted repository policy, never synthetic comments.
 use super::*;
 use crate::config::cache::{ConfigState, RepositoryKey};
-use crate::config::repository::{Event, EventAction, EventRule, ReasonCode, Rule};
+use crate::config::repository::{Event, EventAction, EventRule, PathRule, Paths, ReasonCode, Rule};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Plan {
     rules: Vec<String>,
     action: EventAction,
     config_sha: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct PathPlan {
+    rules: Vec<PathRule>,
+    labels: Vec<String>,
+    event: Event,
+    head_sha: String,
+    base_sha: String,
+    config_sha: String,
+}
+
+impl Serialize for Event {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(match self {
+            Self::PullRequestOpened => "pull_request.opened",
+            Self::PullRequestSynchronize => "pull_request.synchronize",
+            Self::IssueOpened => "issues.opened",
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for Event {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Event::parse(&value).ok_or_else(|| serde::de::Error::custom("invalid event"))
+    }
 }
 
 /// A fetched invalid document/domain is a durable refusal, not an outage.
@@ -34,6 +68,36 @@ fn event_policy<'a>(
             Ok((None, &[]))
         }
         ConfigState::Unavailable { problem, .. } => Err(problem.clone().into()),
+    }
+}
+
+/// Load path policy while preserving the distinction between a verified empty
+/// domain and a transient configuration outage.
+fn path_policy<'a>(
+    state: &'a ConfigState,
+    repo: &str,
+) -> Result<(Option<&'a str>, Option<&'a Paths>)> {
+    match state {
+        ConfigState::Ready(snapshot) => match &snapshot.config.paths {
+            Ok(paths) => Ok((Some(&snapshot.commit_sha), Some(paths))),
+            Err(problem) => {
+                tracing::warn!(repo, "path policy refused: {problem}");
+                Ok((Some(&snapshot.commit_sha), None))
+            }
+        },
+        ConfigState::Unavailable { problem, .. } if problem.code == ReasonCode::InvalidDocument => {
+            tracing::warn!(repo, "path policy refused: {problem}");
+            Ok((None, None))
+        }
+        ConfigState::Unavailable { problem, .. } => Err(problem.clone().into()),
+    }
+}
+
+fn event_name(event: Event) -> &'static str {
+    match event {
+        Event::PullRequestOpened => "pull_request.opened",
+        Event::PullRequestSynchronize => "pull_request.synchronize",
+        Event::IssueOpened => "issues.opened",
     }
 }
 
@@ -66,8 +130,39 @@ async fn own_source(gh: &Client, cfg: &Config, ctx: &EventContext) -> Result<boo
     Ok(ctx.user_id == Some(id))
 }
 
-/// Load trusted policy, atomically freeze a plan, and execute compatible actions.
+/// Route durable PR/Issue creation and PR path-trigger work through one inbox.
 pub(super) async fn process(
+    runtime: &Runtime,
+    gh: &Client,
+    cfg: &Config,
+    cache: &RepositoryConfigCache,
+    ctx: &EventContext,
+) -> Result<()> {
+    if own_source(gh, cfg, ctx).await? {
+        return Ok(());
+    }
+    let mut first_error = None;
+    if matches!(
+        (ctx.event.as_str(), ctx.action.as_str(), ctx.is_pr),
+        ("issues", "opened", false) | ("pull_request", "opened", true)
+    ) {
+        if let Err(error) = process_opened(runtime, gh, cfg, cache, ctx).await {
+            first_error = Some(error);
+        }
+    }
+    if matches!(
+        (ctx.event.as_str(), ctx.action.as_str(), ctx.is_pr),
+        ("pull_request", "opened" | "synchronize", true)
+    ) {
+        if let Err(error) = process_paths(runtime, gh, cfg, cache, ctx).await {
+            first_error.get_or_insert(error);
+        }
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
+/// Load trusted opened-event policy, atomically freeze a plan, and execute it.
+async fn process_opened(
     runtime: &Runtime,
     gh: &Client,
     cfg: &Config,
@@ -79,9 +174,6 @@ pub(super) async fn process(
         ("pull_request", "opened", true) => Event::PullRequestOpened,
         _ => return Ok(()),
     };
-    if own_source(gh, cfg, ctx).await? {
-        return Ok(());
-    }
     let key = RepositoryKey {
         installation_id: ctx.installation_id,
         repository_id: ctx.repository_id,
@@ -395,11 +487,307 @@ async fn add_existing_labels(gh: &Client, ctx: &EventContext, labels: &[String])
         .map(|wanted| {
             names
                 .iter()
-                .find(|name| name.to_lowercase() == *wanted)
+                .find(|name| name.to_lowercase() == wanted.to_lowercase())
                 .map(|name| name.to_string())
                 .ok_or("automatic label does not exist in repository")
         })
         .collect::<std::result::Result<Vec<_>, _>>()?;
     gh.add_labels(&ctx.repo, ctx.number, &selected).await?;
     Ok(())
+}
+
+/// Match one complete PR snapshot and freeze the result before any label write.
+/// A later configuration edit or redelivery cannot backfill a previously
+/// ignored head; the next opened/synchronize event gets its own snapshot key.
+async fn process_paths(
+    runtime: &Runtime,
+    gh: &Client,
+    cfg: &Config,
+    cache: &RepositoryConfigCache,
+    ctx: &EventContext,
+) -> Result<()> {
+    let event = match ctx.action.as_str() {
+        "opened" => Event::PullRequestOpened,
+        "synchronize" => Event::PullRequestSynchronize,
+        _ => return Ok(()),
+    };
+    let key = RepositoryKey {
+        installation_id: ctx.installation_id,
+        repository_id: ctx.repository_id,
+    };
+    let state = cache.load(gh, key, &ctx.repo).await;
+    let (config_sha, paths) = path_policy(&state, &ctx.repo)?;
+    let Some(paths) = paths else {
+        return Ok(());
+    };
+    if paths.rules.is_empty() || !paths.events.contains(&event) {
+        return Ok(());
+    }
+    let mut pr = gh.get_pr(&ctx.repo, ctx.number).await?;
+    let files = {
+        let mut snapshot = pr.clone();
+        let mut last = None;
+        for attempt in 0..=2 {
+            match gh
+                .list_pr_files_complete(&ctx.repo, ctx.number, &snapshot)
+                .await
+            {
+                Ok(files) => {
+                    pr = snapshot;
+                    last = Some(files);
+                    break;
+                }
+                Err(error)
+                    if error.to_string().contains("PR changed while reading") && attempt < 2 =>
+                {
+                    snapshot = gh.get_pr(&ctx.repo, ctx.number).await?;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        last.ok_or("path trigger file list was not obtained")?
+    };
+    let head_sha = pr["head"]["sha"]
+        .as_str()
+        .filter(|sha| !sha.is_empty())
+        .ok_or("PR snapshot missing head SHA")?;
+    let base_sha = pr["base"]["sha"]
+        .as_str()
+        .filter(|sha| !sha.is_empty())
+        .ok_or("PR snapshot missing base SHA")?;
+    let plan_key = serde_json::json!([
+        "path-plan",
+        ctx.repository_id,
+        ctx.thread_id,
+        event_name(event),
+        head_sha,
+        base_sha
+    ])
+    .to_string();
+    let proposed = {
+        let usable: Vec<PathRule> = paths
+            .rules
+            .iter()
+            .filter_map(|rule| {
+                let value = rule.value.as_ref().ok()?;
+                if let Err(problem) = value.validate_deployment(cfg) {
+                    tracing::warn!(rule=%rule.id, "path rule refused: {problem}");
+                    return None;
+                }
+                Some(value.clone())
+            })
+            .collect();
+        let matched = crate::path_triggers::matched_rules(&usable, &files)
+            .map_err(|problem| problem.to_string())?;
+        let mut labels = BTreeSet::new();
+        let mut matched_rules = Vec::new();
+        for (id, rule_labels) in matched {
+            if let Some(rule) = usable.iter().find(|rule| rule.id == id) {
+                labels.extend(rule_labels);
+                matched_rules.push(rule.clone());
+            }
+        }
+        if matched_rules.is_empty() {
+            Vec::new()
+        } else {
+            matched_rules.sort_by(|a, b| a.id.cmp(&b.id));
+            vec![PathPlan {
+                rules: matched_rules,
+                labels: labels.into_iter().collect(),
+                event,
+                head_sha: head_sha.into(),
+                base_sha: base_sha.into(),
+                config_sha: config_sha.unwrap_or_default().into(),
+            }]
+        }
+    };
+    let plans: Vec<PathPlan> = serde_json::from_value(
+        runtime
+            .store
+            .opened_plan(&plan_key, &serde_json::to_value(proposed)?)?,
+    )?;
+    for plan in plans {
+        let state = cache.load(gh, key, &ctx.repo).await;
+        let (_, current) = path_policy(&state, &ctx.repo)?;
+        let compatible = current.is_some_and(|paths| {
+            paths.events.contains(&plan.event)
+                && plan.rules.iter().all(|planned| {
+                    paths.rules.iter().any(|current| {
+                        current.value.as_ref().is_ok_and(|value| {
+                            value == planned && value.validate_deployment(cfg).is_ok()
+                        })
+                    })
+                })
+        });
+        execute_path(runtime, gh, cfg, ctx, &pr, &plan, compatible).await?;
+    }
+    Ok(())
+}
+
+/// Execute the one coalesced label action for a matched path snapshot.
+async fn execute_path(
+    runtime: &Runtime,
+    gh: &Client,
+    cfg: &Config,
+    ctx: &EventContext,
+    pr: &serde_json::Value,
+    plan: &PathPlan,
+    compatible: bool,
+) -> Result<()> {
+    let current = gh
+        .get(&format!("/repos/{}/pulls/{}", ctx.repo, ctx.number))
+        .await?;
+    if current["head"]["sha"].as_str() != Some(plan.head_sha.as_str())
+        || current["base"]["sha"].as_str() != Some(plan.base_sha.as_str())
+    {
+        return Err("PR changed before path label execution".into());
+    }
+    let parent = serde_json::json!([
+        "path",
+        ctx.repository_id,
+        ctx.thread_id,
+        event_name(plan.event),
+        plan.head_sha,
+        plan.base_sha,
+        plan.rules
+            .first()
+            .map(|rule| rule.id.as_str())
+            .unwrap_or("")
+    ])
+    .to_string();
+    let store = &runtime.store;
+    if let Some(old) = store.get(&parent)? {
+        if old.state == State::Running {
+            return Err("path action is owned by another worker".into());
+        }
+        if !compatible {
+            store.revoke_opened(&parent, now())?;
+        }
+        for child in store.children(&parent)? {
+            if child.state == State::Unknown {
+                reconcile(store, gh, cfg.app_id.parse()?, &child, now()).await?;
+            }
+        }
+        let children = store.children(&parent)?;
+        if children
+            .iter()
+            .any(|child| matches!(child.state, State::Unknown | State::Running))
+        {
+            return Err(
+                "path label publication uncertain; operator reconciliation required".into(),
+            );
+        }
+        if !compatible
+            || matches!(
+                old.state,
+                State::Succeeded | State::Failed | State::Superseded
+            )
+        {
+            return Ok(());
+        }
+        if old.state == State::Unknown {
+            if children
+                .iter()
+                .any(|child| child.state == State::Succeeded && child.spec.kind == "ensure_labels")
+            {
+                store.resolve_unknown(
+                    &old,
+                    "succeeded",
+                    None,
+                    "automatic label result confirmed from child receipt",
+                    now(),
+                )?;
+                return Ok(());
+            }
+            store.resolve_unknown(
+                &old,
+                "not_sent",
+                None,
+                "no uncertain path label write",
+                now(),
+            )?;
+        }
+    }
+    let mut context = ctx.clone();
+    context.head_sha = Some(plan.head_sha.clone());
+    context.base_sha = Some(plan.base_sha.clone());
+    let spec = OperationSpec {
+        key: parent.clone(),
+        parent: None,
+        kind: "path".into(),
+        context: context.clone(),
+        config_sha: (!plan.config_sha.is_empty()).then(|| plan.config_sha.clone()),
+        request: serde_json::json!({
+            "event": event_name(plan.event),
+            "rules": plan.rules.iter().map(|rule| rule.id.clone()).collect::<Vec<_>>(),
+            "labels": plan.labels,
+            "head_sha": plan.head_sha,
+            "base_sha": plan.base_sha,
+        }),
+    };
+    if !compatible {
+        if let Some(claim) = store.claim(&spec, now())? {
+            store.finish(
+                &claim,
+                State::Superseded,
+                None,
+                "path rule removed, disabled or changed",
+                now(),
+            )?;
+        }
+        return Ok(());
+    }
+    let Some(claim) = store.claim(&spec, now())? else {
+        return Ok(());
+    };
+    store.mark_sent(&claim, now())?;
+    let frame = Arc::new(Frame {
+        store: store.clone(),
+        context,
+        app_id: cfg.app_id.parse()?,
+        parent: parent.clone(),
+        snapshot: Mutex::new((
+            (!plan.config_sha.is_empty()).then(|| plan.config_sha.clone()),
+            Some(plan.head_sha.clone()),
+            Some(plan.base_sha.clone()),
+        )),
+        counts: Mutex::new(HashMap::new()),
+        blocked: AtomicBool::new(false),
+        pr: Some(pr.clone()),
+    });
+    let status = ACTIVE
+        .scope(frame.clone(), async {
+            match add_existing_labels(gh, ctx, &plan.labels).await {
+                Ok(()) => "ok".into(),
+                Err(error) => format!("error: {error}"),
+            }
+        })
+        .await;
+    let children = store.children(&parent)?;
+    let uncertain = frame.blocked.load(Ordering::SeqCst)
+        || children.iter().any(|child| {
+            matches!(
+                child.state,
+                State::Pending | State::Running | State::Unknown
+            )
+        });
+    let state = if uncertain {
+        State::Unknown
+    } else if status.contains("error") {
+        State::Failed
+    } else {
+        State::Succeeded
+    };
+    store.finish(
+        &claim,
+        state,
+        Some(&serde_json::json!({"status": status})),
+        &status,
+        now(),
+    )?;
+    if uncertain {
+        Err("automatic path label publication paused for reconciliation".into())
+    } else {
+        Ok(())
+    }
 }

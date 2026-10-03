@@ -436,8 +436,8 @@ impl Store {
     pub(super) fn revoke_opened(&self, key: &str, now: i64) -> Result<()> {
         let mut db = self.db()?;
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        tx.execute("UPDATE operations SET state='superseded',detail='opened rule removed, disabled or changed',updated_at=?2 WHERE key=?1 AND state IN ('pending','unknown') AND json_extract(spec,'$.kind')='opened'", params![key,now])?;
-        tx.execute("UPDATE operations SET state='superseded',detail='opened policy revoked',updated_at=?2 WHERE parent=?1 AND state IN ('pending','unknown') AND sent=0 AND EXISTS(SELECT 1 FROM operations p WHERE p.key=?1 AND p.state IN ('superseded','succeeded','failed') AND json_extract(p.spec,'$.kind')='opened')",params![key,now])?;
+        tx.execute("UPDATE operations SET state='superseded',detail='automatic rule removed, disabled or changed',updated_at=?2 WHERE key=?1 AND state IN ('pending','unknown') AND json_extract(spec,'$.kind') IN ('opened','path')", params![key,now])?;
+        tx.execute("UPDATE operations SET state='superseded',detail='automatic policy revoked',updated_at=?2 WHERE parent=?1 AND state IN ('pending','unknown') AND sent=0 AND EXISTS(SELECT 1 FROM operations p WHERE p.key=?1 AND p.state IN ('superseded','succeeded','failed') AND json_extract(p.spec,'$.kind') IN ('opened','path'))",params![key,now])?;
         tx.execute("DELETE FROM recipients WHERE committed=0 AND operation IN (SELECT key FROM operations WHERE parent=?1 AND state='superseded' AND sent=0)",[key])?;
         tx.commit()?;
         Ok(())
