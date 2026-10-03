@@ -3,7 +3,7 @@ use super::*;
 use crate::config::cache::{ConfigState, RepositoryKey};
 use crate::config::repository::{Event, EventAction, EventRule, PathRule, Paths, ReasonCode, Rule};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Plan {
@@ -93,6 +93,7 @@ fn path_policy<'a>(
     }
 }
 
+/// Return the stable configuration spelling used in durable plan metadata.
 fn event_name(event: Event) -> &'static str {
     match event {
         Event::PullRequestOpened => "pull_request.opened",
@@ -579,11 +580,13 @@ async fn process_paths(
             .collect();
         let matched = crate::path_triggers::matched_rules(&usable, &files)
             .map_err(|problem| problem.to_string())?;
-        let mut labels = BTreeSet::new();
+        let mut labels = BTreeMap::new();
         let mut matched_rules = Vec::new();
         for (id, rule_labels) in matched {
             if let Some(rule) = usable.iter().find(|rule| rule.id == id) {
-                labels.extend(rule_labels);
+                for label in rule_labels {
+                    labels.entry(label.to_lowercase()).or_insert(label);
+                }
                 matched_rules.push(rule.clone());
             }
         }
@@ -593,7 +596,7 @@ async fn process_paths(
             matched_rules.sort_by(|a, b| a.id.cmp(&b.id));
             vec![PathPlan {
                 rules: matched_rules,
-                labels: labels.into_iter().collect(),
+                labels: labels.into_values().collect(),
                 event,
                 head_sha: head_sha.into(),
                 base_sha: base_sha.into(),
@@ -757,7 +760,7 @@ async fn execute_path(
     });
     let status = ACTIVE
         .scope(frame.clone(), async {
-            match add_existing_labels(gh, ctx, &plan.labels).await {
+            match add_present_labels(gh, ctx, &plan.labels).await {
                 Ok(()) => "ok".into(),
                 Err(error) => format!("error: {error}"),
             }
@@ -790,4 +793,37 @@ async fn execute_path(
     } else {
         Ok(())
     }
+}
+
+/// Path-trigger labels are best effort across matching rules: a removed or
+/// misspelled label must not block valid labels from another rule.
+async fn add_present_labels(gh: &Client, ctx: &EventContext, labels: &[String]) -> Result<()> {
+    let available = gh
+        .get_all(&format!("/repos/{}/labels?per_page=100", ctx.repo))
+        .await?;
+    let names = available
+        .iter()
+        .map(|value| {
+            value["name"]
+                .as_str()
+                .ok_or("malformed repository label inventory")
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut selected: Vec<String> = Vec::new();
+    for wanted in labels {
+        if let Some(name) = names.iter().find(|name| name.eq_ignore_ascii_case(wanted)) {
+            if !selected
+                .iter()
+                .any(|current| current.eq_ignore_ascii_case(name))
+            {
+                selected.push((*name).to_string());
+            }
+        } else {
+            tracing::warn!(repo=%ctx.repo, label=%wanted, "path label does not exist; skipped");
+        }
+    }
+    if !selected.is_empty() {
+        gh.add_labels(&ctx.repo, ctx.number, &selected).await?;
+    }
+    Ok(())
 }

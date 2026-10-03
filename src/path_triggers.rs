@@ -9,6 +9,21 @@ use serde_json::Value;
 
 use crate::config::repository::{PathRule, Problem, ReasonCode};
 
+enum GlobSegment {
+    AnyDepth,
+    Pattern(glob::Pattern),
+}
+
+struct CompiledGlob {
+    segments: Vec<GlobSegment>,
+}
+
+struct CompiledRule<'a> {
+    rule: &'a PathRule,
+    include: Vec<CompiledGlob>,
+    exclude: Vec<CompiledGlob>,
+}
+
 /// Validate the path-glob subset accepted by the repository configuration.
 pub(crate) fn valid_glob(pattern: &str) -> bool {
     if pattern.is_empty()
@@ -29,24 +44,48 @@ pub(crate) fn valid_glob(pattern: &str) -> bool {
         .all(|segment| *segment == "**" || !segment.contains("**"))
 }
 
-fn path_matches(pattern: &str, path: &str) -> bool {
-    let patterns: Vec<_> = pattern.split('/').collect();
-    let paths: Vec<_> = path.split('/').collect();
-    fn recurse(patterns: &[&str], paths: &[&str]) -> bool {
-        if patterns.is_empty() {
-            return paths.is_empty();
+/// Compile each non-recursive segment once and collapse adjacent `**` segments.
+fn compile_glob(pattern: &str) -> Result<CompiledGlob, Problem> {
+    let mut segments = Vec::new();
+    for segment in pattern.split('/') {
+        if segment == "**" {
+            if !matches!(segments.last(), Some(GlobSegment::AnyDepth)) {
+                segments.push(GlobSegment::AnyDepth);
+            }
+        } else {
+            segments.push(GlobSegment::Pattern(glob::Pattern::new(segment).map_err(
+                |_| Problem::new(ReasonCode::InvalidRule, "invalid path glob pattern"),
+            )?));
         }
-        if patterns[0] == "**" {
-            return recurse(&patterns[1..], paths)
-                || (!paths.is_empty() && recurse(patterns, &paths[1..]));
-        }
-        !paths.is_empty()
-            && glob::Pattern::new(patterns[0]).is_ok_and(|glob| glob.matches(paths[0]))
-            && recurse(&patterns[1..], &paths[1..])
     }
-    recurse(&patterns, &paths)
+    Ok(CompiledGlob { segments })
 }
 
+/// Match repository path segments with a bounded dynamic-programming table.
+fn path_matches(pattern: &CompiledGlob, paths: &[&str]) -> bool {
+    let pattern_count = pattern.segments.len();
+    let path_count = paths.len();
+    let mut dp = vec![vec![false; path_count + 1]; pattern_count + 1];
+    dp[pattern_count][path_count] = true;
+    for pattern_index in (0..pattern_count).rev() {
+        for path_index in (0..=path_count).rev() {
+            dp[pattern_index][path_index] = match &pattern.segments[pattern_index] {
+                GlobSegment::AnyDepth => {
+                    dp[pattern_index + 1][path_index]
+                        || (path_index < path_count && dp[pattern_index][path_index + 1])
+                }
+                GlobSegment::Pattern(segment) => {
+                    path_index < path_count
+                        && segment.matches(paths[path_index])
+                        && dp[pattern_index + 1][path_index + 1]
+                }
+            };
+        }
+    }
+    dp[0][0]
+}
+
+/// Reject paths that are not safe repository-relative slash-separated names.
 fn valid_repo_path(path: &str) -> bool {
     !path.is_empty()
         && !path.starts_with('/')
@@ -56,7 +95,8 @@ fn valid_repo_path(path: &str) -> bool {
             .any(|segment| segment.is_empty() || segment == "..")
 }
 
-fn rule_matches_path(rule: &PathRule, path: &str) -> bool {
+/// Apply include and exclude patterns to one repository-relative path.
+fn rule_matches_path(rule: &CompiledRule<'_>, path: &[&str]) -> bool {
     rule.include
         .iter()
         .any(|pattern| path_matches(pattern, path))
@@ -74,6 +114,24 @@ pub fn matched_rules(
     rules: &[PathRule],
     files: &[Value],
 ) -> Result<Vec<(String, Vec<String>)>, Problem> {
+    let compiled: Vec<_> = rules
+        .iter()
+        .map(|rule| {
+            Ok(CompiledRule {
+                rule,
+                include: rule
+                    .include
+                    .iter()
+                    .map(|pattern| compile_glob(pattern))
+                    .collect::<Result<_, _>>()?,
+                exclude: rule
+                    .exclude
+                    .iter()
+                    .map(|pattern| compile_glob(pattern))
+                    .collect::<Result<_, _>>()?,
+            })
+        })
+        .collect::<Result<_, Problem>>()?;
     let mut matched: Vec<(String, Vec<String>)> = Vec::new();
     for file in files {
         let filename = file["filename"].as_str().ok_or_else(|| {
@@ -104,16 +162,24 @@ pub fn matched_rules(
             }
             paths.push(previous);
         }
-        for rule in rules {
-            if paths.iter().any(|path| rule_matches_path(rule, path)) {
-                if let Some((_, labels)) = matched.iter_mut().find(|(id, _)| id == &rule.id) {
-                    for label in &rule.labels {
-                        if !labels.iter().any(|current| current == label) {
+        let path_segments: Vec<Vec<_>> =
+            paths.iter().map(|path| path.split('/').collect()).collect();
+        for rule in &compiled {
+            if path_segments
+                .iter()
+                .any(|segments| rule_matches_path(rule, segments))
+            {
+                if let Some((_, labels)) = matched.iter_mut().find(|(id, _)| id == &rule.rule.id) {
+                    for label in &rule.rule.labels {
+                        if !labels
+                            .iter()
+                            .any(|current| current.eq_ignore_ascii_case(label))
+                        {
                             labels.push(label.clone());
                         }
                     }
                 } else {
-                    matched.push((rule.id.clone(), rule.labels.clone()));
+                    matched.push((rule.rule.id.clone(), rule.rule.labels.clone()));
                 }
             }
         }
@@ -143,11 +209,17 @@ mod tests {
 
     #[test]
     fn glob_subset_matches_root_nested_and_case_sensitively() {
-        assert!(path_matches("src/**/*.rs", "src/lib.rs"));
-        assert!(path_matches("src/**/*.rs", "src/a/b.rs"));
-        assert!(!path_matches("src/*.rs", "src/a/b.rs"));
-        assert!(!path_matches("src/main.rs", "src/MAIN.rs"));
-        assert!(path_matches("文档/**", "文档/说明.md"));
+        let matches = |pattern: &str, path: &str| {
+            path_matches(
+                &compile_glob(pattern).unwrap(),
+                &path.split('/').collect::<Vec<_>>(),
+            )
+        };
+        assert!(matches("src/**/*.rs", "src/lib.rs"));
+        assert!(matches("src/**/*.rs", "src/a/b.rs"));
+        assert!(!matches("src/*.rs", "src/a/b.rs"));
+        assert!(!matches("src/main.rs", "src/MAIN.rs"));
+        assert!(matches("文档/**", "文档/说明.md"));
     }
 
     #[test]

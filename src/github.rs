@@ -722,6 +722,7 @@ impl Client {
         Ok(files)
     }
 
+    /// Validate file identities, completeness and rename metadata for a PR snapshot.
     fn validate_pr_files(files: &[Value], pr: &Value, require_status: bool) -> Result<(), GhError> {
         let names: std::collections::HashSet<_> = files
             .iter()

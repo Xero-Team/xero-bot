@@ -674,6 +674,51 @@ async fn path_rules_match_complete_diff_and_coalesce_existing_labels() {
 }
 
 #[tokio::test]
+async fn path_rules_skip_missing_labels_without_blocking_existing_labels() {
+    let dir = Dir::new();
+    let runtime = Runtime::open(&dir.0).unwrap();
+    let server = MockServer::start().await;
+    let gh = client(&server);
+    policy(&server, path_rules()).await;
+    path_pr_meta(&server, 2).await;
+    response(
+        &server,
+        "GET",
+        "/repos/example/project/pulls/3/files",
+        200,
+        json!([
+            {"filename":"src/lib.rs","status":"modified"},
+            {"filename":"docs/guide.md","status":"added"}
+        ]),
+    )
+    .await;
+    response(
+        &server,
+        "GET",
+        "/repos/example/project/labels",
+        200,
+        json!([{"name":"area/rust"}]),
+    )
+    .await;
+    response(
+        &server,
+        "POST",
+        "/repos/example/project/issues/3/labels",
+        200,
+        json!([]),
+    )
+    .await;
+    runtime
+        .process(&gh, &cfg(), &RepositoryConfigCache::default(), &path_sync())
+        .await
+        .unwrap();
+    let requests = writes(&server).await;
+    assert_eq!(requests.len(), 1);
+    let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(body["labels"], json!(["area/rust"]));
+}
+
+#[tokio::test]
 async fn path_rules_reject_partial_or_malformed_file_lists_without_writes() {
     for files in [
         json!([{"filename":"src/lib.rs","status":"renamed"}]),
