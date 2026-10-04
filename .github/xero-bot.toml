@@ -3,6 +3,7 @@
 # its alias. The idle_workflows section can coexist with these sections.
 # This file lists the complete built-in manual defaults and enables no
 # automatic creation/path actions. Missing/empty files have the same defaults.
+# See example.toml at the repository root for the annotated full reference.
 
 [command_triggers]
 claim   = { mode = "no_mention" } # take

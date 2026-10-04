@@ -3,7 +3,7 @@
 The bot reads `.github/xero-bot.toml` from the **target repository's default branch**.
 It does not read policy from a PR head or fork. This reader is independent of
 `IDLE_WORKFLOWS_ENABLED`; that environment switch still controls the idle scheduler.
-See the [complete defaults](../examples/repository-config.toml),
+See the [annotated full example](../example.toml), [complete defaults](../examples/repository-config.toml),
 [existing idle configuration](idle-workflows.md), and
 [Chinese acceptance record](issue-11-acceptance.md).
 

@@ -12,7 +12,7 @@ Xero-Team 的组织级 GitHub App 机器人。Rust 实现,主服务与离线状�
 - **中英双语回复** — 依 PR 自身的 commit 信息决定用中文还是英文,无需配置
 
 仓库触发策略、持久化会话、显式创建动作和 PR 路径标签/CC 均独立于 idle scheduler。参见
-[触发与升级指南](docs/triggers.zh-CN.md)、[完整默认示例](.github/xero-bot.toml)、单独的
+[触发与升级指南](docs/triggers.zh-CN.md)、[完整配置参考 example.toml](example.toml)、[完整默认示例](.github/xero-bot.toml)、单独的
 [显式启用示例](examples/triggers-opt-in.toml)和[跨功能验收](docs/issue-18-acceptance.md)。
 
 ## 命令参考
@@ -34,8 +34,9 @@ Xero-Team 的组织级 GitHub App 机器人。Rust 实现,主服务与离线状�
 
 默认 `claim`、`unclaim`、`cc`、`r?`、`ready` 无需 @；`r+`、`r-` **每次都须 @**。
 `r= @user`、`r+ as @user`、`r+ @user` 语义一致，缺失、非法或多余参数不会降级为普通批准。
-其他命令使用 `mention_once`。有效显式 @ 为同一 installation/仓库/线程/用户建立默认 **30 天**
-会话，仅显式 @ 续期。升级不导入旧唤醒，需要重新 @；编辑不唤醒，删除不撤销，关闭/重开不续期。
+其他命令使用 `mention_once`。有效显式 @ 为同一 installation/仓库/线程/用户建立会话，
+**默认 30 天**，可通过 `command_sessions.ttl_days` 配置为 1–365 天，仅显式 @ 续期。
+升级不导入旧唤醒，需要重新 @；编辑不唤醒，删除不撤销，关闭/重开不续期。
 后发 @ 不能反向放行旧评论。`disabled` 在所有入口永久禁用指令及别名，自动规则也不例外。
 @ 不授予仓库权限，`r-` 同样实时检查 write+ 权限。
 

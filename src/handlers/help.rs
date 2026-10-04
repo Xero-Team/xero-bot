@@ -63,6 +63,7 @@ fn value(text: &str) -> String {
     escaped.push_str("</code>");
     escaped
 }
+/// Preview at most two escaped globs and count the remaining entries.
 fn patterns(items: &[String]) -> String {
     let mut shown = items
         .iter()
@@ -78,6 +79,7 @@ fn patterns(items: &[String]) -> String {
     }
     shown
 }
+/// Use the exact TOML event spelling so help can be compared with configuration.
 fn event_name(event: Event) -> &'static str {
     match event {
         Event::PullRequestOpened => "pull_request.opened",
@@ -85,6 +87,7 @@ fn event_name(event: Event) -> &'static str {
         Event::IssueOpened => "issues.opened",
     }
 }
+/// Keep policy names untranslated to match the accepted TOML values.
 fn mode_name(mode: ManualMode) -> &'static str {
     match mode {
         ManualMode::Disabled => "disabled",
@@ -93,6 +96,7 @@ fn mode_name(mode: ManualMode) -> &'static str {
         ManualMode::AlwaysMention => "always_mention",
     }
 }
+/// Describe the action and its key restrictions independently of its trigger mode.
 fn description(id: CommandId, lang: Lang) -> &'static str {
     let (en, zh) = match id {
         CommandId::Claim => ("Assign yourself", "认领，指派给自己"),
@@ -138,6 +142,7 @@ fn description(id: CommandId, lang: Lang) -> &'static str {
     };
     lang.pick(en, zh)
 }
+/// Render every command from the supplied policy and source-checked session evidence.
 fn manual(
     policy: &Comments,
     bot: &str,
@@ -254,6 +259,8 @@ pub(crate) fn repository_help(
     text.push_str(&super::queue_note(cfg.merge_queue_enabled, lang));
     text
 }
+/// Summarize independent subscriptions with deployment vetoes and bounded previews.
+/// Recipient counts describe configuration, never delivered notifications or free slots.
 fn automatic(config: &RepositoryConfig, cfg: &Config, lang: Lang) -> String {
     let mut text = format!(
         "#### {}\n\n",
@@ -345,6 +352,7 @@ fn automatic(config: &RepositoryConfig, cfg: &Config, lang: Lang) -> String {
 mod tests {
     use super::*;
 
+    /// Remaining validity follows current TTL without reviving expired or future evidence.
     #[test]
     fn session_remaining_uses_effective_ttl_and_does_not_revive_expired_or_future_wakes() {
         let wake = SessionWake {
@@ -377,6 +385,7 @@ mod tests {
         ));
     }
 
+    /// Both translations must describe the same effective policy and deployment restrictions.
     #[test]
     fn both_languages_share_all_aliases_modes_scopes_and_relay_switch() {
         let policy = RepositoryConfig::parse("[command_triggers]\ntake={mode='disabled'}\ncc={mode='always_mention'}\nhelp={mode='no_mention'}\n[command_sessions]\nttl_days=7", "example/project").unwrap().comments.unwrap();
@@ -402,6 +411,7 @@ mod tests {
         }
     }
 
+    /// Repository-controlled text cannot inject mentions, markup or an oversized help reply.
     #[test]
     fn automatic_help_never_echoes_private_inputs_or_mentions_recipients_and_bounds_display() {
         let mut cfg = Config::from_env();

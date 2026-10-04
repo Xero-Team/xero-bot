@@ -3,6 +3,7 @@
 use super::*;
 use crate::config::repository::{CommandId, ManualMode};
 
+/// Build distinct deliveries with controlled GitHub source identity and time.
 fn comment(id: i64, body: &str, source_at: i64) -> EventContext {
     let mut ctx = context();
     ctx.delivery = format!("acceptance-{id}");
@@ -13,6 +14,7 @@ fn comment(id: i64, body: &str, source_at: i64) -> EventContext {
         .to_rfc3339();
     ctx
 }
+/// Extract only posted comment bodies, excluding assignment and label writes.
 async fn replies(server: &MockServer) -> Vec<String> {
     server
         .received_requests()
@@ -29,6 +31,7 @@ async fn replies(server: &MockServer) -> Vec<String> {
         .collect()
 }
 
+/// Default-equivalent configurations must agree across command execution, help and events.
 #[tokio::test]
 async fn default_variants_run_issue_commands_show_effective_help_and_never_auto_act() {
     for config in [
@@ -165,6 +168,7 @@ async fn default_variants_run_issue_commands_show_effective_help_and_never_auto_
     }
 }
 
+/// Persisted help evidence must retain source order, user isolation and current TTL.
 #[tokio::test]
 async fn help_session_survives_restart_but_never_authorizes_older_comments_or_other_users() {
     let dir = Dir::new();

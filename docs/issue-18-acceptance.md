@@ -69,3 +69,12 @@ git diff --check
 2026-10-04 本地最终验收：**521 项测试通过，0 失败、0 忽略**；fmt、Clippy
 （warnings-as-errors）、Rustdoc（warnings-as-errors）、diff 和新增文档的本地链接检查通过。
 本次新增 11 项测试，并扩展原有通知预占恢复测试及示例默认测试。
+
+## PR #28 review 与示例补充
+
+- 修正英文 README 把 30 天写成固定会话时长的表述；中英文均说明默认 30 天，
+  通过 `command_sessions.ttl_days` 可配置为 1–365 天。补齐新增辅助函数及验收用例的文档注释。
+- 新增根目录 [example.toml](../example.toml)，集中说明 #10 已实现的手动策略、会话、
+  创建/路径触发和 idle 共存配置。复制此文件保留默认手动行为，自动规则为空且 idle 关闭。
+- 独立 opt-in 示例补全 PR CodeQL、PR 静态标签，覆盖所有创建事件白名单动作；
+  现有 fixture 测试校验完整参考不会启用自动动作，以及显式启用示例的解析与语义。

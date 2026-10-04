@@ -6,7 +6,8 @@
 它与 `idle_workflows` 共存，关闭 idle scheduler 仍会读取。仓库内的
 [完整默认示例](../.github/xero-bot.toml) 不启用创建/路径动作；
 [显式启用示例](../examples/triggers-opt-in.toml) 单独存放，**复制后会启用自动动作**。
-两份示例均作为 fixture 进行 TOML 解析和语义校验。
+[根目录 example.toml](../example.toml) 提供当前全部配置域的带注释参考，自动规则为空、idle 调度
+关闭，并指向显式启用的配置块。所有示例均作为 fixture 进行 TOML 解析和语义校验。
 
 ## 手动模式与升级变化
 

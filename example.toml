@@ -1,0 +1,91 @@
+# xero-bot 完整配置参考 / Annotated repository configuration
+# 对应 issue #10 及其 #11–#18 子任务已经实现的配置。
+# 复制到目标仓库默认分支的 .github/xero-bot.toml；PR head / fork 的配置不生效。
+# 本文件保持内置手动默认，自动创建/路径规则为空，idle 调度关闭。
+# 自动功能的可用启用示例：examples/triggers-opt-in.toml、examples/idle-workflows.toml。
+# 部署密钥与全局开关放在环境变量中，参见 .env.example；不要写 token 到此文件。
+#
+# 配置缓存 60 秒；默认分支 Push 会立即失效缓存。过期刷新失败阻断相关动作，
+# 显式 @bot help / @bot ping 可查看限频诊断，旧快照仅作参考。
+
+# 手动指令 / Manual commands
+# disabled       所有入口永久拒绝，包括别名、已有会话、组合及引用该指令的自动规则。
+# no_mention     完整裸指令无需 @，如 take 或 take; cc @alice。
+# mention_once   本次显式 @，或同 installation/仓库/线程/用户有更早且未过期的会话。
+# always_mention 每次调用均须显式 @，已有会话也不例外。
+# mode = "auto" 无效：创建与路径订阅必须单独配置。
+# 提及门槛不授予仓库权限；组合命令逐条检查，低门槛指令不放行高门槛子操作。
+# 裸 review 一下、claim 是什么意思？、cc @alice about this 等散文不触发。
+
+[command_triggers]
+claim   = { mode = "no_mention" } # take；指派自己，Issue/PR 均适用
+unclaim = { mode = "no_mention" } # untake / release / release-assignment
+cc      = { mode = "no_mention" } # cc @user；手动 CC 不消耗路径通知预算
+"r?"    = { mode = "no_mention" } # r? @user；Issue 指派，PR 请求审阅
+ready   = { mode = "no_mention" } # ?r / reviewer；PR 上还会通知已有审阅者
+
+"r+"    = { mode = "always_mention" } # 仅 PR；实时 write+ 检查，禁止自我审批
+"r-"    = { mode = "always_mention" } # 仅 PR；撤回 bot 审批/出队，同样需要 write+
+# r= @user / r+ as @user / r+ @user 共用 r+ 策略；归功目标同样需要 write+。
+# 代他人审批还须全局 R_PLUS_ALLOW_ON_BEHALF=true，默认关闭。
+
+review  = { mode = "mention_once" } # 仅 PR；AI 审查只发布 COMMENT，不批准/入队
+codeql  = { mode = "mention_once" } # 仅 PR；读取已有 code scanning 告警
+label   = { mode = "mention_once" } # relabel；label +bug -wip
+assign  = { mode = "mention_once" } # assign @user
+author  = { mode = "mention_once" } # 等待作者
+blocked = { mode = "mention_once" } # 标记受阻
+ping    = { mode = "mention_once" } # 健康检查
+help    = { mode = "mention_once" } # commands；显示有效策略和会话状态
+queue   = { mode = "mention_once" } # 查看合并队列
+
+# 只写需要覆盖的项即可；不要同时配置规范名和别名，如 claim 与 take。
+# 例如禁用 review：将上方 review 那一行替换为 review = { mode = "disabled" }。
+# 禁用 label/relabel 或 cc 后，引用它的路径规则无效；混合规则整体拒绝。
+
+# 会话 / Sessions
+[command_sessions]
+ttl_days = 30 # 默认 30，可配置 1–365 天；有效显式 @ 源评论时间起算
+# 仅通过适用性/授权预检的显式 @ 建立/续期；always_mention 模式不建立可复用会话。
+# 编辑不唤醒，删除不撤销，关闭/重开不续期；重启保留，升级不扫描导入旧评论。
+# 后发 @ 不能反向授权旧评论或同一评论中的裸指令。
+
+# 自动创建 / Creation subscriptions
+# 此处省略 event_triggers，默认空规则；需要时复制 examples/triggers-opt-in.toml
+# 中所需的完整 [[event_triggers]] 块到本文件。每个 id 唯一，最多 32 条。
+# 仅支持 issues.opened / pull_request.opened（含草稿），不回填旧线程。
+# 白名单：PR 的 review/codeql，以及 Issue/PR 的静态 label + add 标签名单。
+# 禁止自动 r+/r-/r=、claim、assign 等动作，不能用字符串执行任意指令。
+# 标签必须已存在，禁止 queued/testing 控制标签及非空 CODEQL_LABEL。
+# 自动规则不打开会话，不放宽手动提及门槛；引用 disabled 指令会被拒绝。
+
+# PR 路径 / PR path rules
+[path_triggers]
+events = ["pull_request.opened", "pull_request.synchronize"]
+max_cc_users_per_pr = 10 # 0–10；同 installation/仓库/PR 终身不同接收人总预算
+# 未配置 rules，因此以上设置不会自动添加标签或通知。显式规则示例见
+# examples/triggers-opt-in.toml 的 [[path_triggers.rules]]；不要复制重复表头。
+# 普通 Issue 不匹配路径；按 PR 当前完整 base/head diff，包含草稿。
+# glob 从仓库根开始，使用 /，区分大小写；* / ? 匹配段内，独立 ** 匹配任意层目录。
+# 任一 include 命中且该路径未被 exclude 命中才生效；改名分别匹配新旧名，删除匹配旧名。
+# 生成/二进制文件默认参与，可用 exclude 排除。不支持 !、[]、{}、绝对路径或 ..。
+# 文件列表不完整、超过 3000 文件或无法确认稳定 head/base 时，不执行部分路径动作。
+# labels 取并集，只添加已有普通标签；不删除、不创建，不修改队列/CodeQL 控制标签。
+# cc 仅显式个人 login，每规则最多 32 人，不带 @/团队，不推导 CODEOWNERS/组织成员。
+# 跨规则按 login 去重排序，聚合评论只 @ 新预占的人；超额只显示人数。
+# 重复 push、改配置、删评论、关闭/重开和重启不重置预算。0 仅关闭路径 CC。
+# 持久卷丢失/首次升级时，旧 PR 的 CC 须先恢复完整账本。unknown 发送保留名额并暂停核对。
+
+# 既有 idle workflow 调度 / Existing idle workflow scheduling
+[idle_workflows]
+enabled = false # 仅开启此项还不够，部署也须 IDLE_WORKFLOWS_ENABLED=true
+idle_minutes = 30
+# 没有配置自动调度任务。启用时先替换本节为 examples/idle-workflows.toml，
+# 按实际仓库填写 monitors、tasks、workflow/branch 和 workflow_dispatch inputs。
+# 默认 retry_interval_minutes=15、max_retries=2、run_events=["workflow_dispatch"]。
+# 不要仅改 enabled=true：开启的 idle 配置需要至少一条有效 task。
+
+# 部署 / Operations
+# 按需订阅 Issue comment、Issues、Pull request、Push；原生审查队列再加 Pull request review。
+# 使用单实例和持久 XERO_DATA_DIR；备份数据库及 WAL，unknown 写入用 trigger-state CLI 核对。
+# GitHub 和 SQLite 不共享事务，不承诺 exactly-once。详情：docs/triggers.zh-CN.md。

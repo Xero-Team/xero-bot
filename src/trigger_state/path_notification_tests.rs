@@ -604,6 +604,7 @@ async fn remote_success_local_receipt_failure_reconciles_exact_body_and_marker()
     assert_eq!(notifications(&runtime)[0].state, State::Succeeded);
 }
 
+/// A changed head or narrowed policy must revoke unsent reservations before publication.
 #[tokio::test]
 async fn final_head_check_and_current_policy_revoke_unsent_reservations() {
     for change in ["head", "rule", "budget", "disabled"] {

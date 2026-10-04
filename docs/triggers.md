@@ -7,7 +7,9 @@ Policy comes only from the **target repository's default branch** at
 and is read even when the idle scheduler is off. The checked-in
 [complete defaults](../.github/xero-bot.toml) enable no creation/path actions;
 [opt-in examples](../examples/triggers-opt-in.toml) are separate and **do enable
-those actions when copied**. Both are parsed and semantically validated in tests.
+those actions when copied**. The [annotated example.toml](../example.toml) covers all implemented configuration domains,
+keeps automatic rules empty and idle scheduling disabled, and links to the opt-in
+blocks. All shipped examples are parsed and semantically validated in tests.
 
 ## Manual modes and upgrade changes
 

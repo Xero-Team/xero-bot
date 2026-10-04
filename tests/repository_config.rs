@@ -17,6 +17,7 @@ fn defaults_empty_partial_and_idle_only() {
         include_str!("../examples/idle-workflows.toml"),
         include_str!("../examples/repository-config.toml"),
         include_str!("../.github/xero-bot.toml"),
+        include_str!("../example.toml"),
     ] {
         let cfg = parse(text);
         let c = cfg.comments.unwrap();
@@ -554,6 +555,17 @@ fn shipped_defaults_and_opt_in_examples_are_valid_and_separate() {
         include_str!("../.github/xero-bot.toml"),
         include_str!("../examples/repository-config.toml")
     );
+    let reference = parse(include_str!("../example.toml"));
+    assert!(reference.problems().is_empty());
+    assert!(reference.idle.unwrap().is_none());
+    assert!(reference.events.unwrap().is_empty());
+    let paths = reference.paths.unwrap();
+    assert!(paths.rules.is_empty());
+    assert_eq!(paths.max_cc_users_per_pr, 10);
+    assert_eq!(
+        paths.events,
+        vec![Event::PullRequestOpened, Event::PullRequestSynchronize]
+    );
     let config = parse(include_str!("../examples/triggers-opt-in.toml"));
     assert!(config.problems().is_empty());
     let mut deployment = xero_bot::config::Config::from_env();
@@ -561,7 +573,7 @@ fn shipped_defaults_and_opt_in_examples_are_valid_and_separate() {
     deployment.label_merge_queue_testing = "merge queue: testing".into();
     deployment.codeql_label = "codeql".into();
     let events = config.events.unwrap();
-    assert_eq!(events.len(), 2);
+    assert_eq!(events.len(), 4);
     for rule in events {
         rule.value
             .unwrap()

@@ -11,7 +11,7 @@ Features:
 - **CodeQL quality reports** — reads the repo's existing code scanning alerts and maps them to files changed in the PR
 - **Bilingual replies** — answers in English or Chinese, chosen from the PR's own commit messages; no configuration
 
-Repository trigger policy, durable sessions, opt-in creation actions, and PR path labels/CC are available independently of the idle scheduler. See the [trigger and upgrade guide](docs/triggers.md), [complete defaults](.github/xero-bot.toml), separate [opt-in examples](examples/triggers-opt-in.toml), and [cross-feature acceptance](docs/issue-18-acceptance.md).
+Repository trigger policy, durable sessions, opt-in creation actions, and PR path labels/CC are available independently of the idle scheduler. See the [trigger and upgrade guide](docs/triggers.md), [annotated example.toml](example.toml), [complete defaults](.github/xero-bot.toml), separate [opt-in examples](examples/triggers-opt-in.toml), and [cross-feature acceptance](docs/issue-18-acceptance.md).
 
 ## Command reference
 
@@ -36,8 +36,9 @@ repository policy before duplicates or conflicting statuses are resolved.
 By default, `claim`, `unclaim`, `cc`, `r?` and `ready` need no mention. `r+` and
 `r-` require a mention **every time**; `r= @user`, `r+ as @user` and `r+ @user`
 are equivalent approval forms, and invalid/missing targets never become ordinary
-approvals. Other commands use `mention_once`. A valid explicit mention opens a **30-day** session
-for the same installation/repository/thread/user; only explicit mentions renew it.
+approvals. Other commands use `mention_once`. A valid explicit mention opens a session
+for the same installation/repository/thread/user (**30 days by default**, configurable
+from 1–365 days via `command_sessions.ttl_days`); only explicit mentions renew it.
 Upgrades do not import old wake-ups: mention the bot again. Edits do not wake,
 deletions do not revoke, and closing/reopening does not renew. Later mentions cannot
 authorize older comments. `disabled` permanently vetoes the command and aliases
