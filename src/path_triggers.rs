@@ -165,6 +165,7 @@ pub struct PathMatch {
     pub paths: Vec<String>,
 }
 
+/// Return the label projection of the shared, validated path-match evidence.
 pub fn matched_rules(
     rules: &[PathRule],
     files: &[Value],

@@ -59,6 +59,7 @@ fn display(value: &str) -> String {
     text
 }
 
+/// Render only reserved mentions, escaped evidence, and a stable recovery marker.
 fn render(plan: &PathPlan, claim: &super::super::super::Claim) -> String {
     let mentions = claim
         .operation
@@ -95,6 +96,42 @@ fn render(plan: &PathPlan, claim: &super::super::super::Claim) -> String {
     body
 }
 
+/// Distinguish a permanent recipient refusal from an outdated snapshot.
+enum Preflight {
+    Ready,
+    Superseded,
+    InvalidRecipient { login: String, reason: String },
+}
+
+/// A missing/non-personal/renamed account is a definite refusal. API outages
+/// and malformed identity responses remain retryable without sending a comment.
+async fn recipient_refusal(gh: &Client, login: &str) -> Result<Option<String>> {
+    let user = match gh.get(&format!("/users/{login}")).await {
+        Ok(user) => user,
+        Err(GhError::Api { status: 404, .. }) => return Ok(Some("account does not exist".into())),
+        Err(error) => return Err(error.into()),
+    };
+    let kind = user["type"].as_str().filter(|s| !s.is_empty());
+    let actual_login = user["login"].as_str().filter(|s| !s.is_empty());
+    let (Some(kind), Some(actual_login), Some(_)) =
+        (kind, actual_login, user["id"].as_i64().filter(|id| *id > 0))
+    else {
+        return Err(
+            format!("incomplete GitHub identity response for path CC recipient {login}").into(),
+        );
+    };
+    if kind != "User" {
+        return Ok(Some(format!("account type {kind} is not a personal User")));
+    }
+    if !actual_login.eq_ignore_ascii_case(login) {
+        return Ok(Some(
+            "account login no longer matches the configured login".into(),
+        ));
+    }
+    Ok(None)
+}
+
+/// Reconcile or claim one snapshot's CC, then preflight and checkpoint its send.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn execute(
     runtime: &Runtime,
@@ -216,39 +253,57 @@ pub(super) async fn execute(
         )?;
         return Ok(());
     }
-    // All preflight failures are definitely unsent. Preserve retryable plans
-    // without leaking reservations; the body is regenerated only after no-send.
-    let preflight: Result<bool> = async {
+    // Every preflight refusal is unsent. Permanent recipient errors end this
+    // snapshot; only transient failures release slots into a retryable plan.
+    let preflight: Result<Preflight> = async {
         for login in &claim.operation.recipients {
-            let user = gh.get(&format!("/users/{login}")).await?;
-            if user["type"] != "User"
-                || !user["login"]
-                    .as_str()
-                    .is_some_and(|u| u.eq_ignore_ascii_case(login))
-                || !user["id"].as_i64().is_some_and(|id| id > 0)
-            {
-                return Err(format!(
-                    "path CC recipient {login} is not a verified personal GitHub user"
-                )
-                .into());
+            if let Some(reason) = recipient_refusal(gh, login).await? {
+                return Ok(Preflight::InvalidRecipient {
+                    login: login.clone(),
+                    reason,
+                });
             }
         }
         if valid_rules(gh, ctx, &plan.rules).await?.len() != plan.rules.len() {
-            return Ok(false);
+            return Ok(Preflight::Superseded);
         }
         let current = gh.get_pr(&ctx.repo, ctx.number).await?;
         let state = cache.load(gh, repo_key, &ctx.repo).await;
         let (_, paths) = path_policy(&state, &ctx.repo)?;
         Ok(
-            path_snapshot(&current)? == (plan.head_sha.as_str(), plan.base_sha.as_str())
+            if path_snapshot(&current)? == (plan.head_sha.as_str(), plan.base_sha.as_str())
                 && path_plan_compatible(paths, cfg, plan)
-                && paths.is_some_and(|p| p.max_cc_users_per_pr >= max),
+                && paths.is_some_and(|p| p.max_cc_users_per_pr >= max)
+            {
+                Preflight::Ready
+            } else {
+                Preflight::Superseded
+            },
         )
     }
     .await;
     match preflight {
-        Ok(true) => {}
-        Ok(false) => {
+        Ok(Preflight::Ready) => {}
+        Ok(Preflight::InvalidRecipient { login, reason }) => {
+            let rules: Vec<_> = plan
+                .rules
+                .iter()
+                .filter(|rule| rule.cc.contains(&login))
+                .map(|rule| rule.id.as_str())
+                .collect();
+            let detail = format!("path CC recipient {login} refused: {reason}");
+            store.finish(
+                &claim,
+                State::Failed,
+                Some(&json!({"invalid_recipient":login,"rules":rules,"reason":reason})),
+                &detail,
+                now(),
+            )?;
+            tracing::error!(repo=%ctx.repo, pr=ctx.number, %login, ?rules, %reason,
+                "path CC snapshot failed permanently; correct the configured recipient");
+            return Ok(());
+        }
+        Ok(Preflight::Superseded) => {
             store.finish(
                 &claim,
                 State::Superseded,
@@ -267,7 +322,13 @@ pub(super) async fn execute(
                 now(),
             )?;
             let op = store.get(&key)?.ok_or("missing notification")?;
-            store.resolve_unknown(&op, "not_sent", None, "preflight ended before send", now())?;
+            store.resolve_unknown(
+                &op,
+                "not_sent",
+                None,
+                &format!("preflight ended before send: {error}"),
+                now(),
+            )?;
             return Err(error);
         }
     }

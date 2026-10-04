@@ -2,10 +2,15 @@
 use super::path_review_fixes::run_paths;
 use super::*;
 
+#[path = "path_notification_review_tests.rs"]
+mod review;
+
+/// Build trusted path policy with a chosen lifetime cap and explicit recipients.
 fn cc_rules(max: u8, users: &[&str]) -> String {
     format!("[path_triggers]\nmax_cc_users_per_pr={max}\nevents=['pull_request.opened','pull_request.synchronize']\n[[path_triggers.rules]]\nid='rust'\ninclude=['src/**']\ncc={}\n",serde_json::to_string(users).unwrap())
 }
 
+/// Attest the fixture PR has no historical recipients before enabling CC.
 fn verified(runtime: &Runtime) {
     runtime
         .store
@@ -13,6 +18,7 @@ fn verified(runtime: &Runtime) {
         .unwrap();
 }
 
+/// Mount the complete PR snapshot, label inventory and personal-account endpoints.
 async fn fixture(server: &MockServer, rules: &str, head: &str, files: Value, status: u16) {
     policy(server, rules).await;
     response(server,"GET","/repos/example/project/pulls/3",200,json!({
@@ -64,10 +70,12 @@ async fn fixture(server: &MockServer, rules: &str, head: &str, files: Value, sta
         .await;
 }
 
+/// Provide one complete changed-file record for the path rule.
 fn files() -> Value {
     json!([{"filename":"src/lib.rs","status":"modified"}])
 }
 
+/// Extract posted notification bodies without counting label requests.
 async fn comments(server: &MockServer) -> Vec<String> {
     writes(server)
         .await
@@ -82,6 +90,7 @@ async fn comments(server: &MockServer) -> Vec<String> {
         .collect()
 }
 
+/// Inspect only path-CC operations, excluding imported historical ledger rows.
 fn notifications(runtime: &Runtime) -> Vec<Operation> {
     runtime
         .store
@@ -471,6 +480,7 @@ async fn reservation_crash_revalidates_current_head_and_releases_only_unsent_slo
         .any(|o| o.state == State::Superseded && o.recipients.is_empty()));
 }
 
+/// Wait until the mock request reaches the intended crash or mutation boundary.
 async fn wait_reached(reached: &std::sync::atomic::AtomicBool) {
     tokio::time::timeout(std::time::Duration::from_secs(3), async {
         while !reached.load(Ordering::SeqCst) {
@@ -501,11 +511,16 @@ async fn request_timeout_retains_reservations_and_valid_app_receipt_recovers_wit
         .with_priority(1)
         .mount(&server)
         .await;
-    let result = tokio::time::timeout(
-        std::time::Duration::from_millis(400),
-        run_paths(&runtime, &server, &path_sync()),
-    )
-    .await;
+    let result = {
+        let ctx = path_sync();
+        let work = run_paths(&runtime, &server, &ctx);
+        tokio::pin!(work);
+        tokio::select! {
+            _ = wait_reached(&reached) => {}
+            result = &mut work => panic!("path work ended before the delayed send: {result:?}"),
+        }
+        tokio::time::timeout(std::time::Duration::from_millis(100), work).await
+    };
     assert!(result.is_err());
     assert!(reached.load(Ordering::SeqCst));
     let body = comments(&server).await.remove(0);
@@ -662,13 +677,20 @@ async fn nonexistent_users_bots_and_rejected_posts_never_consume_sent_slots() {
                 .and(path("/users/alice"))
                 .respond_with(
                     ResponseTemplate::new(if failure == "missing" { 404 } else { 200 })
-                        .set_body_json(json!({"id":42,"login":"alice","type":"Bot"})),
+                        .set_body_json(if failure == "missing" {
+                            json!({"message":"Not Found"})
+                        } else {
+                            json!({"id":42,"login":"alice","type":"Bot"})
+                        }),
                 )
                 .with_priority(1)
                 .mount(&server)
                 .await;
         }
-        assert!(run_paths(&runtime, &server, &path_sync()).await.is_err());
+        assert_eq!(
+            run_paths(&runtime, &server, &path_sync()).await.is_err(),
+            failure == "permission"
+        );
         assert!(notifications(&runtime)[0].recipients.is_empty());
         assert_eq!(
             comments(&server).await.len(),

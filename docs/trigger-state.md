@@ -39,6 +39,11 @@ canonical command/arguments, independent of delivery ID. Aliases and normalized
 login lists share a key. Opened actions have a repository/thread/stable rule ID
 key; notification recipients have a repository/PR/lowercase-login key. Configuration
 and head SHAs are audit/snapshot data, never part of a lifetime recipient key.
+GitHub repository IDs are globally stable; installation IDs remain in event and
+operation audit context and in configuration-cache keys. The lifetime recipient
+ledger deliberately spans replacement installations of the same repository, so
+reinstalling the App cannot reset a PR's notification budget. Other repositories
+and PRs have separate ledgers.
 
 The first successfully loaded opened-event plan is frozen in `opened_plans`,
 including an empty plan. It survives inbox cleanup and prevents configuration
@@ -133,7 +138,16 @@ The total budget is 0–10. Success commits reservations; unknown keeps them;
 confirmed no-send releases them. A sent operation cannot simply be superseded to
 reclaim slots. Recipient records and successful/unknown actions have no ordinary
 expiry or seven-day scheduler cleanup. Closing/reopening a PR, configuration
-changes and deleting comments do not reset them. Path matching/aggregation is #16/#17. `request.suppressed` records excess
+changes and deleting comments do not reset them. Path matching/aggregation is #16/#17.
+
+A missing account (404), a verified non-personal account, or a renamed login
+permanently fails the snapshot's notification operation and releases its unsent
+reservations. The error records the login and rule IDs, while the processed inbox
+can finish. This aggregate is not partially sent; correct the configuration for a
+later supported snapshot. Transport, permission/rate-limit/server errors and
+incomplete identity responses remain retryable before any send.
+
+`request.suppressed` records excess
 canonical recipients without reserving slots; public comments expose only their
 count. Per-PR processing is serialized, with reservation and operation claim in
 one SQLite transaction. Rule/path display is escaped and bounded, so it cannot
