@@ -60,10 +60,16 @@ For opened events, a verified invalid TOML document/events domain records a
 permanent refusal for that thread; later policy repairs cannot backfill it.
 Transient configuration reads retain retryable inbox work.
 See [opened-event behavior and acceptance](issue-15-acceptance.md). Path rules
-still return `Unsupported` until #16–#17 implement them. Failures are available
-through `RepositoryConfig::problems()`, logged on load and shown by help/ping.
-Path `labels`/`cc` are independent static actions, not aliases for comment commands.
-The path CC budget accepts 0–10; only PR opened/synchronize event names are accepted.
+run only for PR `opened` and `synchronize` events. They match the complete
+base/head file list with a case-sensitive repository-root glob subset (`*`, `?`,
+and a standalone `**` path segment), including both names of a rename and
+excluding paths matched by `exclude`. Labels are coalesced across matching
+rules, checked against the repository label inventory, and added without ever
+creating, removing, or touching merge-queue/CodeQL control labels. Missing,
+truncated, malformed or changing file lists fail closed and produce no label
+write. Path `cc` remains `Unsupported` until #17; its 0–10 budget is retained
+for that follow-up. Failures are available through `RepositoryConfig::problems()`
+and logged on load.
 
 ## Snapshots, failures and diagnostics
 

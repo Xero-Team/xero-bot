@@ -48,7 +48,7 @@ pub struct Operation {
     pub spec: OperationSpec,
     pub state: State,
     pub attempts: u32,
-    /// Delivery that owns the current attempt; the original spec remains immutable.
+    /// Delivery that owns the current attempt, separate from the original source delivery.
     pub lease_delivery: String,
     pub sent: bool,
     pub result: Option<Value>,
@@ -109,6 +109,8 @@ impl Store {
             );
             CREATE INDEX IF NOT EXISTS operation_parent ON operations(parent);
             CREATE TABLE IF NOT EXISTS opened_plans(key TEXT PRIMARY KEY, plan TEXT NOT NULL);
+            CREATE INDEX IF NOT EXISTS automatic_plan_scope ON opened_plans(
+                json_extract(key,'$[0]'),json_extract(key,'$[1]'),json_extract(key,'$[2]'));
             CREATE INDEX IF NOT EXISTS operation_delivery_state ON operations(delivery,state);
             CREATE INDEX IF NOT EXISTS inbox_due ON inbox(state,next_at);
             CREATE INDEX IF NOT EXISTS inbox_retention ON inbox(state,updated_at);
@@ -431,13 +433,102 @@ impl Store {
         Ok(serde_json::from_str(&saved)?)
     }
 
+    /// Freeze the first source-event subscription and permanently remove any
+    /// revoked rules, even if fetching its first complete diff has not succeeded.
+    pub(super) fn path_subscription(&self, key: &str, proposed: &Value) -> Result<Value> {
+        let mut db = self.db()?;
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "INSERT OR IGNORE INTO opened_plans(key,plan) VALUES(?1,?2)",
+            params![key, serde_json::to_string(proposed)?],
+        )?;
+        let saved: String =
+            tx.query_row("SELECT plan FROM opened_plans WHERE key=?1", [key], |row| {
+                row.get(0)
+            })?;
+        let mut subscription: Value = serde_json::from_str(&saved)?;
+        let allowed = proposed["rules"]
+            .as_array()
+            .ok_or("missing proposed path rules")?;
+        subscription["rules"]
+            .as_array_mut()
+            .ok_or("missing saved path rules")?
+            .retain(|rule| allowed.contains(rule));
+        tx.execute(
+            "UPDATE opened_plans SET plan=?2 WHERE key=?1",
+            params![key, serde_json::to_string(&subscription)?],
+        )?;
+        tx.commit()?;
+        Ok(subscription)
+    }
+
+    /// Include unclaimed plans so a crash between planning and claiming cannot
+    /// hide a snapshot that must be revoked on the next supported event.
+    pub(super) fn path_plans(&self, ctx: &EventContext) -> Result<Vec<(String, Value)>> {
+        let db = self.db()?;
+        let mut stmt = db.prepare("SELECT key,plan FROM opened_plans WHERE json_extract(key,'$[0]')='path-plan' AND json_extract(key,'$[1]')=?1 AND json_extract(key,'$[2]')=?2 ORDER BY key")?;
+        let rows = stmt.query_map(params![ctx.repository_id, ctx.thread_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        rows.map(|row| {
+            let (key, plan) = row?;
+            Ok((key, serde_json::from_str(&plan)?))
+        })
+        .collect()
+    }
+
+    /// After read-only reconciliation, narrow a retry to labels still present
+    /// in the repository. Durable writes otherwise replay their original body,
+    /// which could recreate a label deleted since the first attempt.
+    pub(super) fn refresh_path_labels(
+        &self,
+        parent: &Claim,
+        selected: &[String],
+        now: i64,
+    ) -> Result<Vec<String>> {
+        let mut db = self.db()?;
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let key = &parent.operation.spec.key;
+        let active = Self::operation(&tx, key)?.ok_or("missing path planner")?;
+        if active.state != State::Running
+            || active.attempts != parent.attempt
+            || active.spec.kind != "path"
+        {
+            return Err("stale path label lease".into());
+        }
+        let child_key: Option<String> = tx.query_row(
+            "SELECT key FROM operations WHERE parent=?1 AND json_extract(spec,'$.kind')='ensure_labels' AND state='pending' AND sent=0",
+            [key], |row| row.get(0),
+        ).optional()?;
+        let mut labels = selected.to_vec();
+        if let Some(child_key) = child_key {
+            let mut child = Self::operation(&tx, &child_key)?.ok_or("missing path label write")?;
+            let original = child.spec.request["body"]["labels"]
+                .as_array()
+                .ok_or("missing label set")?;
+            labels.retain(|label| {
+                original.iter().any(|old| {
+                    old.as_str()
+                        .is_some_and(|old| old.to_lowercase() == label.to_lowercase())
+                })
+            });
+            child.spec.request["body"]["labels"] = serde_json::json!(labels);
+            tx.execute(
+                "UPDATE operations SET spec=?2,state=?3,detail='path labels revalidated against repository inventory',updated_at=?4 WHERE key=?1 AND state='pending' AND sent=0",
+                params![child_key,serde_json::to_string(&child.spec)?,if labels.is_empty() {"superseded"} else {"pending"},now],
+            )?;
+        }
+        tx.commit()?;
+        Ok(labels)
+    }
+
     /// Revoke a planner without hiding any uncertain GitHub child writes.
     /// `sent` on an opened planner means computation started, not a GitHub write.
     pub(super) fn revoke_opened(&self, key: &str, now: i64) -> Result<()> {
         let mut db = self.db()?;
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        tx.execute("UPDATE operations SET state='superseded',detail='opened rule removed, disabled or changed',updated_at=?2 WHERE key=?1 AND state IN ('pending','unknown') AND json_extract(spec,'$.kind')='opened'", params![key,now])?;
-        tx.execute("UPDATE operations SET state='superseded',detail='opened policy revoked',updated_at=?2 WHERE parent=?1 AND state IN ('pending','unknown') AND sent=0 AND EXISTS(SELECT 1 FROM operations p WHERE p.key=?1 AND p.state IN ('superseded','succeeded','failed') AND json_extract(p.spec,'$.kind')='opened')",params![key,now])?;
+        tx.execute("UPDATE operations SET state='superseded',detail='automatic rule removed, disabled or changed',updated_at=?2 WHERE key=?1 AND state IN ('pending','unknown') AND json_extract(spec,'$.kind') IN ('opened','path')", params![key,now])?;
+        tx.execute("UPDATE operations SET state='superseded',detail='automatic policy revoked',updated_at=?2 WHERE parent=?1 AND state IN ('pending','unknown') AND sent=0 AND EXISTS(SELECT 1 FROM operations p WHERE p.key=?1 AND p.state IN ('superseded','succeeded','failed') AND json_extract(p.spec,'$.kind') IN ('opened','path'))",params![key,now])?;
         tx.execute("DELETE FROM recipients WHERE committed=0 AND operation IN (SELECT key FROM operations WHERE parent=?1 AND state='superseded' AND sent=0)",[key])?;
         tx.commit()?;
         Ok(())

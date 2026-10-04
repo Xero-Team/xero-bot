@@ -6,6 +6,9 @@ static REVIEW_TEST: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 #[path = "event_review_tests.rs"]
 mod review_fixes;
 
+#[path = "path_review_tests.rs"]
+mod path_review_fixes;
+
 fn opened(pr: bool) -> EventContext {
     let thread = json!({"id":88,"number":3,"created_at":"2026-10-02T01:00:00Z",
         "user":{"id":5,"login":"alice","type":"User"},"draft":true,
@@ -52,6 +55,17 @@ async fn labels(server: &MockServer) {
 async fn pr_meta(server: &MockServer) {
     response(server,"GET","/repos/example/project/pulls/3",200,
         json!({"number":3,"head":{"sha":"new-head"},"base":{"sha":"base","ref":"main"},"changed_files":1,"user":{"login":"alice"},"title":"Draft change"})).await;
+}
+
+async fn path_pr_meta(server: &MockServer, changed_files: u64) {
+    response(
+        server,
+        "GET",
+        "/repos/example/project/pulls/3",
+        200,
+        json!({"number":3,"head":{"sha":"new-head"},"base":{"sha":"base","ref":"main"},"changed_files":changed_files,"user":{"login":"alice"},"title":"Path change"}),
+    )
+    .await;
 }
 
 async fn writes(server: &MockServer) -> Vec<wiremock::Request> {
@@ -589,6 +603,198 @@ async fn lost_label_response_is_adopted_or_revoked_without_repeating_the_write()
         );
         assert!(writes(&server).await.is_empty());
     }
+}
+
+fn path_sync() -> EventContext {
+    let payload = json!({
+        "action":"synchronize",
+        "repository":{"id":9,"full_name":"example/project"},
+        "installation":{"id":7},
+        "pull_request":{"id":88,"number":3,"updated_at":"2026-10-03T01:00:00Z",
+            "user":{"id":5,"login":"alice","type":"User"},
+            "head":{"sha":"new-head"},"base":{"sha":"base"}}
+    });
+    EventContext::capture("pull_request", &payload, Some("sync-1"))
+        .unwrap()
+        .unwrap()
+}
+
+fn path_rules() -> &'static str {
+    "[path_triggers]\nevents=['pull_request.synchronize']\n[[path_triggers.rules]]\nid='rust'\ninclude=['src/**/*.rs']\nexclude=['src/generated/**']\nlabels=['area/rust']\n[[path_triggers.rules]]\nid='docs'\ninclude=['docs/**']\nlabels=['documentation']"
+}
+
+#[tokio::test]
+async fn path_rules_match_complete_diff_and_coalesce_existing_labels() {
+    let dir = Dir::new();
+    let runtime = Runtime::open(&dir.0).unwrap();
+    let server = MockServer::start().await;
+    let gh = client(&server);
+    policy(&server, path_rules()).await;
+    path_pr_meta(&server, 2).await;
+    response(
+        &server,
+        "GET",
+        "/repos/example/project/pulls/3/files",
+        200,
+        json!([
+            {"filename":"src/lib.rs","status":"modified"},
+            {"filename":"docs/guide.md","status":"added"}
+        ]),
+    )
+    .await;
+    response(
+        &server,
+        "GET",
+        "/repos/example/project/labels",
+        200,
+        json!([{"name":"area/rust"},{"name":"documentation"}]),
+    )
+    .await;
+    response(
+        &server,
+        "POST",
+        "/repos/example/project/issues/3/labels",
+        200,
+        json!([]),
+    )
+    .await;
+    let ctx = path_sync();
+    runtime
+        .process(&gh, &cfg(), &RepositoryConfigCache::default(), &ctx)
+        .await
+        .unwrap();
+    let requests = writes(&server).await;
+    assert_eq!(requests.len(), 1);
+    let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(body["labels"], json!(["area/rust", "documentation"]));
+    let mut duplicate = ctx.clone();
+    duplicate.delivery = "sync-duplicate".into();
+    runtime
+        .process(&gh, &cfg(), &RepositoryConfigCache::default(), &duplicate)
+        .await
+        .unwrap();
+    assert_eq!(writes(&server).await.len(), 1);
+}
+
+#[tokio::test]
+async fn path_rules_skip_missing_labels_without_blocking_existing_labels() {
+    let dir = Dir::new();
+    let runtime = Runtime::open(&dir.0).unwrap();
+    let server = MockServer::start().await;
+    let gh = client(&server);
+    policy(&server, path_rules()).await;
+    path_pr_meta(&server, 2).await;
+    response(
+        &server,
+        "GET",
+        "/repos/example/project/pulls/3/files",
+        200,
+        json!([
+            {"filename":"src/lib.rs","status":"modified"},
+            {"filename":"docs/guide.md","status":"added"}
+        ]),
+    )
+    .await;
+    response(
+        &server,
+        "GET",
+        "/repos/example/project/labels",
+        200,
+        json!([{"name":"area/rust"}]),
+    )
+    .await;
+    response(
+        &server,
+        "POST",
+        "/repos/example/project/issues/3/labels",
+        200,
+        json!([]),
+    )
+    .await;
+    runtime
+        .process(&gh, &cfg(), &RepositoryConfigCache::default(), &path_sync())
+        .await
+        .unwrap();
+    let requests = writes(&server).await;
+    assert_eq!(requests.len(), 1);
+    let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(body["labels"], json!(["area/rust"]));
+}
+
+#[tokio::test]
+async fn path_rules_reject_partial_or_malformed_file_lists_without_writes() {
+    for files in [
+        json!([{"filename":"src/lib.rs","status":"renamed"}]),
+        json!([
+            {"filename":"src/lib.rs","status":"modified"},
+            {"filename":"docs/guide.md","status":"added"}
+        ]),
+    ] {
+        let dir = Dir::new();
+        let runtime = Runtime::open(&dir.0).unwrap();
+        let server = MockServer::start().await;
+        let gh = client(&server);
+        policy(&server, path_rules()).await;
+        path_pr_meta(&server, 1).await;
+        response(
+            &server,
+            "GET",
+            "/repos/example/project/pulls/3/files",
+            200,
+            files,
+        )
+        .await;
+        let result = runtime
+            .process(&gh, &cfg(), &RepositoryConfigCache::default(), &path_sync())
+            .await;
+        assert!(result.is_err());
+        assert!(writes(&server).await.is_empty());
+        assert!(runtime.store.list(None).unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn path_rules_keep_renames_and_exclusions_semantic() {
+    let dir = Dir::new();
+    let runtime = Runtime::open(&dir.0).unwrap();
+    let server = MockServer::start().await;
+    let gh = client(&server);
+    policy(&server, path_rules()).await;
+    path_pr_meta(&server, 1).await;
+    response(
+        &server,
+        "GET",
+        "/repos/example/project/pulls/3/files",
+        200,
+        json!([
+            {"filename":"src/generated/new.rs","previous_filename":"docs/old.md","status":"renamed"}
+        ]),
+    )
+    .await;
+    response(
+        &server,
+        "GET",
+        "/repos/example/project/labels",
+        200,
+        json!([{"name":"documentation"}]),
+    )
+    .await;
+    response(
+        &server,
+        "POST",
+        "/repos/example/project/issues/3/labels",
+        200,
+        json!([]),
+    )
+    .await;
+    runtime
+        .process(&gh, &cfg(), &RepositoryConfigCache::default(), &path_sync())
+        .await
+        .unwrap();
+    let writes = writes(&server).await;
+    assert_eq!(writes.len(), 1);
+    let body: Value = serde_json::from_slice(&writes[0].body).unwrap();
+    assert_eq!(body["labels"], json!(["documentation"]));
 }
 
 #[tokio::test]

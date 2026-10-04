@@ -59,6 +59,7 @@ Xero-Team 的组织级 GitHub App 机器人。Rust 实现,主服务与离线状�
 自动行为(无需命令):
 
 - 默认分支 `.github/xero-bot.toml` 中可显式配置 `event_triggers`：Issue/PR 创建时添加已有标签，PR 创建时（含草稿）执行 AI review 或 CodeQL。默认规则为空；AI 只发布 COMMENT，禁止添加合并队列控制标签和 `CODEQL_LABEL`。自动规则不建立评论会话，也不放宽手动模式。参见[配置示例](examples/repository-config.toml)与[验收及恢复说明](docs/issue-15-acceptance.md)。
+- 可选的 `path_triggers` 在 PR `opened`/`synchronize` 时匹配完整 base/head diff，并给命中规则添加已有标签的并集。glob 区分大小写（`*`、`?`、独立的 `**` 路径段）；改名同时匹配新旧路径，排除优先。文件列表缺失、不完整或发生变化时 fail-closed；显式 `cc` 名单留给后续路径通知子任务。参见[路径配置](docs/repository-config.md)和 [#16 验收](docs/issue-16-acceptance.md)。
 - PR push/reopen 后检测冲突 → 打 `needs-rebase` + 提醒评论;冲突解决 → 摘标签
 - 周期 sweep(内置循环,默认 6h)兜底检测
 - 给 PR 打 `codeql` 标签(若配置了 `CODEQL_LABEL`)→ 自动生成 CodeQL 报告

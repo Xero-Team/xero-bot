@@ -45,4 +45,13 @@ ttl_days = 30 # 1..365; the durable session implementation is #13/#14
 # command = "label"
 # add = ["needs-triage"] # no queue control labels or CODEQL_LABEL
 #
-# Path rules remain Unsupported until #16–#17.
+# Path rules match complete PR diffs on opened/synchronize and add existing labels.
+# Path cc lists remain unsupported until #17.
+# [path_triggers]
+# events = ["pull_request.opened", "pull_request.synchronize"]
+# max_cc_users_per_pr = 10
+# [[path_triggers.rules]]
+# id = "rust"
+# include = ["src/**/*.rs"]
+# exclude = ["src/generated/**"]
+# labels = ["area/rust"]

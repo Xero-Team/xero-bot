@@ -33,6 +33,7 @@ toml = "0.8"
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde_yaml = "0.9"
 chrono = "0.4"
+glob = "0.3.3"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
