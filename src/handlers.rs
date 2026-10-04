@@ -60,66 +60,9 @@ automatic merge** — batches are tested on the `staging` branch, then advanced 
     }
 }
 
-pub fn help_text(bot_name: &str, merge_queue_enabled: bool, lang: Lang, on_behalf: bool) -> String {
-    match lang {
-        Lang::En => format!(
-            "### xero-bot commands\n\n\
-| Command | What it does |\n|---|---|\n\
-| `@{bot_name} review` | AI code review (incremental: last review plus new commits) |\n\
-| `@{bot_name} codeql` | CodeQL quality report (existing repo alerts mapped onto this change) |\n\
-| `@{bot_name} ping` | Health check |\n\
-| `@{bot_name} help` | Show this help |\n\
-| `r? @user` | Request review from @user (assigns them as reviewer) |\n\
-| `@{bot_name} cc @user…` | Notify the listed users |\n\
-| `@{bot_name} ready` / `?r` | Waiting for review (adds `waiting-on-review`) |\n\
-| `@{bot_name} author` | Waiting on the author (adds `waiting-on-author`) |\n\
-| `@{bot_name} blocked` | Blocked (adds `blocked`) |\n\
-| `@{bot_name} label +a -b` | Add / remove labels |\n\
-| `@{bot_name} assign @user` | Assign to @user |\n\
-| `@{bot_name} claim` | Claim (assign to yourself) |\n\
-| `@{bot_name} unclaim` | Release the assignment |\n\
-| `@{bot_name} r+` | Relay an approval (needs write; the bot APPROVEs in your name) |\n\
-| `@{bot_name} r+ as @user` | {on_behalf_help} |\n\
-| `@{bot_name} r-` | Withdraw the bot's approval |\n\
-| `@{bot_name} queue` | Show the merge queue (batch under test + waiting PRs) |\n\n\
-{queue_help}",
-            on_behalf_help = if on_behalf {
-                "Relay an approval crediting @user (they need write access too)"
-            } else {
-                "**Disabled in this deployment** — set `R_PLUS_ALLOW_ON_BEHALF=true` to enable"
-            },
-            queue_help = queue_note(merge_queue_enabled, Lang::En)
-        ),
-        Lang::Zh => format!(
-            "### xero-bot 命令参考\n\n\
-| 命令 | 说明 |\n|---|---|\n\
-| `@{bot_name} review` | AI 代码审查(增量:结合上一轮审查与新提交) |\n\
-| `@{bot_name} codeql` | CodeQL 质量报告(读取仓库存量告警并映射到本次变更) |\n\
-| `@{bot_name} ping` | 健康检查 |\n\
-| `@{bot_name} help` | 显示本帮助 |\n\
-| `r? @user` | 请求 @user 审查(自动指派为 reviewer) |\n\
-| `@{bot_name} cc @user…` | 抄送/通知指定用户 |\n\
-| `@{bot_name} ready` / `?r` | 标记等待审查(打 `waiting-on-review`) |\n\
-| `@{bot_name} author` | 标记等待作者(打 `waiting-on-author`) |\n\
-| `@{bot_name} blocked` | 标记受阻(打 `blocked`) |\n\
-| `@{bot_name} label +a -b` | 添加/移除标签 |\n\
-| `@{bot_name} assign @user` | 指派给 @user |\n\
-| `@{bot_name} claim` | 认领(指派给自己) |\n\
-| `@{bot_name} unclaim` | 释放指派 |\n\
-| `@{bot_name} r+` | 代审批(需 write 权限;bot 以你的名义提交 APPROVE) |\n\
-| `@{bot_name} r+ as @user` | {on_behalf_help} |\n\
-| `@{bot_name} r-` | 撤回 bot 的审批 |\n\
-| `@{bot_name} queue` | 查看合并队列(在测批次 + 排队 PR) |\n\n\
-{queue_help}",
-            on_behalf_help = if on_behalf {
-                "以 @user 名义代审批(该用户同样需要 write 权限)"
-            } else {
-                "**本部署已禁用** —— 需设置 `R_PLUS_ALLOW_ON_BEHALF=true` 开启"
-            },
-            queue_help = queue_note(merge_queue_enabled, Lang::Zh)
-        ),
-    }
-}
+mod help;
+pub use help::help_text;
+pub(crate) use help::{repository_help, HelpSession};
 
 /// Collapse a GitHub call into the short result label that `dispatch` logs,
 /// recording the underlying error first.
@@ -149,6 +92,18 @@ pub async fn handle_comment(
     commands: Vec<Command>,
     diagnostics: Vec<String>,
 ) -> Vec<String> {
+    handle_comment_with_help(gh, cfg, ctx, commands, diagnostics, None).await
+}
+
+/// Dispatch supplies help rendered from its verified repository/session evidence.
+pub(crate) async fn handle_comment_with_help(
+    gh: &Client,
+    cfg: &Config,
+    ctx: &CommentContext,
+    commands: Vec<Command>,
+    diagnostics: Vec<String>,
+    help: Option<&str>,
+) -> Vec<String> {
     let mut results = Vec::new();
 
     // Posted before the commands run: `review` can take minutes, and a note
@@ -165,15 +120,24 @@ pub async fn handle_comment(
     }
 
     for cmd in commands {
-        let r =
-            crate::trigger_state::runtime::command(gh, &cmd, handle_one(gh, cfg, ctx, cmd.clone()))
-                .await;
+        let r = crate::trigger_state::runtime::command(
+            gh,
+            &cmd,
+            handle_one(gh, cfg, ctx, cmd.clone(), help),
+        )
+        .await;
         results.push(r);
     }
     results
 }
 
-async fn handle_one(gh: &Client, cfg: &Config, ctx: &CommentContext, cmd: Command) -> String {
+async fn handle_one(
+    gh: &Client,
+    cfg: &Config,
+    ctx: &CommentContext,
+    cmd: Command,
+    help: Option<&str>,
+) -> String {
     let lang = ctx.lang;
 
     // One gate for all four PR-only commands, where `review` used to have the
@@ -210,20 +174,25 @@ async fn handle_one(gh: &Client, cfg: &Config, ctx: &CommentContext, cmd: Comman
             gh.post_issue_comment(&ctx.repo, ctx.pr_number, "pong 🏓")
                 .await,
         ),
-        Command::Help => labeled(
-            "help reply",
-            gh.post_issue_comment(
-                &ctx.repo,
-                ctx.pr_number,
-                &help_text(
-                    &cfg.bot_name,
-                    cfg.merge_queue_enabled,
-                    lang,
-                    cfg.r_plus_allow_on_behalf,
-                ),
+        Command::Help => {
+            let fallback;
+            let body = match help {
+                Some(body) => body,
+                None => {
+                    fallback = help_text(
+                        &cfg.bot_name,
+                        cfg.merge_queue_enabled,
+                        lang,
+                        cfg.r_plus_allow_on_behalf,
+                    );
+                    &fallback
+                }
+            };
+            labeled(
+                "help reply",
+                gh.post_issue_comment(&ctx.repo, ctx.pr_number, body).await,
             )
-            .await,
-        ),
+        }
         Command::Review => {
             if !cfg.ai_ready() && cfg.review_engine == "builtin" {
                 let _ = gh

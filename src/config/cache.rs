@@ -75,9 +75,9 @@ impl ConfigState {
                 if stale_reference.is_some() {
                     message.push_str(match lang {
                         crate::lang::Lang::En => {
-                            " Previous configuration is an expired reference only; no actions ran."
+                            " Previous configuration is an expired reference only; it cannot authorize actions."
                         }
-                        crate::lang::Lang::Zh => " 旧配置仅作过期参考，未执行任何动作。",
+                        crate::lang::Lang::Zh => " 旧配置仅作过期参考，不能据此执行动作。",
                     });
                 }
                 Some(message)
@@ -124,7 +124,8 @@ impl RepositoryConfigCache {
         static CACHE: OnceLock<Arc<RepositoryConfigCache>> = OnceLock::new();
         Arc::clone(CACHE.get_or_init(|| Arc::new(Self::default())))
     }
-    /// Local suppression until #13 provides durable claim/delivery records.
+    /// Per-process rate limit for new source comments. Durable write receipts
+    /// separately prevent replay of the same diagnostic across restart.
     /// Reserve before sending: an unknown write result must not cause retries.
     pub fn claim_diagnostic(&self, key: RepositoryKey, issue: i64, reason: ReasonCode) -> bool {
         let now = self.clock.now();

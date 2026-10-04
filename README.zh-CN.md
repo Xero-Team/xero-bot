@@ -11,8 +11,9 @@ Xero-Team 的组织级 GitHub App 机器人。Rust 实现,主服务与离线状�
 - **CodeQL 质量报告** — 读取仓库存量 code scanning 告警,映射到 PR 变更文件
 - **中英双语回复** — 依 PR 自身的 commit 信息决定用中文还是英文,无需配置
 
-仓库 TOML 读取、指令禁用及配置故障拦截已独立于 idle 开关接入。详见[配置契约与当前交付范围](docs/repository-config.md)、[#13 持久化状态存储](docs/issue-13-acceptance.md)和 [#14 会话验收](docs/issue-14-acceptance.md)；严格解析、逐候选模式检查与会话生命周期均已接入。
-
+仓库触发策略、持久化会话、显式创建动作和 PR 路径标签/CC 均独立于 idle scheduler。参见
+[触发与升级指南](docs/triggers.zh-CN.md)、[完整配置参考 example.toml](example.toml)、[完整默认示例](.github/xero-bot.toml)、单独的
+[显式启用示例](examples/triggers-opt-in.toml)和[跨功能验收](docs/issue-18-acceptance.md)。
 
 ## 命令参考
 
@@ -33,8 +34,16 @@ Xero-Team 的组织级 GitHub App 机器人。Rust 实现,主服务与离线状�
 
 默认 `claim`、`unclaim`、`cc`、`r?`、`ready` 无需 @；`r+`、`r-` **每次都须 @**。
 `r= @user`、`r+ as @user`、`r+ @user` 语义一致，缺失、非法或多余参数不会降级为普通批准。
-其他命令使用 `mention_once`。会话证据来自同一用户的显式、未禁用持久化唤醒记录，不再扫描历史评论；
-持久化存储及源时间/TTL 查询接口由 #13 提供；#14 已接入会话策略与授权预检。完整边界见[解析器验收记录](docs/issue-12-acceptance.md)和[#14 会话验收](docs/issue-14-acceptance.md)。
+其他命令使用 `mention_once`。有效显式 @ 为同一 installation/仓库/线程/用户建立会话，
+**默认 30 天**，可通过 `command_sessions.ttl_days` 配置为 1–365 天，仅显式 @ 续期。
+升级不导入旧唤醒，需要重新 @；编辑不唤醒，删除不撤销，关闭/重开不续期。
+后发 @ 不能反向放行旧评论。`disabled` 在所有入口永久禁用指令及别名，自动规则也不例外。
+@ 不授予仓库权限，`r-` 同样实时检查 write+ 权限。
+
+`@xero-review help` 展示该仓库的有效模式、别名、PR-only 限制、会话剩余有效性，以及独立的
+自动/路径规则部分。配置只读默认分支，缓存 **60 秒**，Push 会失效缓存；过期读取失败阻断动作。
+显式 help/ping 提供限频且脱敏的诊断，旧快照仅标记为参考。完整升级、故障和终身通知预算说明见
+[触发指南](docs/triggers.zh-CN.md)。
 
 | 命令 | 说明 |
 |---|---|
@@ -221,10 +230,15 @@ GitHub → Settings → Developer settings → GitHub Apps → **New GitHub App*
 |---|---|
 | Webhook URL | `https://<host>/webhook` |
 | Webhook secret | 任意随机字符串 — 必须与 `WEBHOOK_SECRET` 一致 |
-| 订阅事件 | **Issue comment** + **Pull request**(启用合并队列再加 **Pull request review**,建议再加 **Push** —— base 前进秒级提醒) |
-| 权限 | Contents: R(合并队列需 RW)· Pull requests: RW · Issues: RW · **Checks: R** · **Code scanning alerts: R** |
+| 订阅事件 | **Issue comment** + **Issues** + **Pull request** + **Push**；合并队列再加 **Pull request review**。各事件用途见[部署指南](docs/triggers.zh-CN.md#部署与恢复)。 |
+| 权限 | Contents: R，再按启用功能授予 Issues/PR 写权限、CodeQL 的 Code scanning alerts: R、队列的 Contents: RW + Checks: R、idle 的 Actions: RW。参见[功能权限表](docs/triggers.zh-CN.md#部署与恢复)，不新增组织/CODEOWNERS 权限。 |
 
 然后:**生成私钥**(会下载 `.pem` 文件),记下数字 **App ID** 与 bot 的 @-名(填 `BOT_NAME`),并把 App 安装到目标组织/仓库。
+
+使用单实例和持久化 `/data`，停止服务后备份完整卷/数据库及 WAL。丢失状态会丢失会话、去重和
+未知写入证据；旧 PR 在完整账本恢复前保守阻断自动 CC。用 `trigger-state /data list` / `show`
+检查不确定操作，凭证据处置，不删除数据库或盲目重试。GitHub 与 SQLite 不提供跨系统 exactly-once。
+参见[状态恢复](docs/trigger-state.md)和[升级指南](docs/triggers.zh-CN.md)。
 
 容器内的既有能力:
 - `/data` 具名卷(`xero-data`)缓存仓库 checkout 与 `pi` 会话 — 这是 bot 的**增量记忆**,删掉就丢审查上下文,不要轻易清理。布局:

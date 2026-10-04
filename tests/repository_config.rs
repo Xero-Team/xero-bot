@@ -16,6 +16,8 @@ fn defaults_empty_partial_and_idle_only() {
         "[idle_workflows]\nenabled=false",
         include_str!("../examples/idle-workflows.toml"),
         include_str!("../examples/repository-config.toml"),
+        include_str!("../.github/xero-bot.toml"),
+        include_str!("../example.toml"),
     ] {
         let cfg = parse(text);
         let c = cfg.comments.unwrap();
@@ -303,12 +305,12 @@ fn rule_failures_stay_per_rule_and_duplicate_ids_disable_only_the_domain() {
     assert!(cfg.idle.is_ok());
 }
 
-/// Path actions remain independent of comment modes, with shared event and CC-budget limits.
+/// Non-disabled manual mention modes do not change independent static path actions.
 #[test]
 fn paths_have_independent_static_actions_and_shared_domain_limits() {
     let rule = "[[path_triggers.rules]]\nid='rust'\ninclude=['src/**/*.rs']\nexclude=['src/generated/**']\nlabels=['rust']\ncc=['alice']\n";
     let cfg = parse(&format!(
-        "[command_triggers]\nlabel={{mode='disabled'}}\ncc={{mode='disabled'}}\n{rule}"
+        "[command_triggers]\nlabel={{mode='always_mention'}}\ncc={{mode='mention_once'}}\n{rule}"
     ));
     assert_eq!(
         cfg.paths.unwrap().rules[0].value.as_ref().unwrap().cc,
@@ -518,4 +520,125 @@ fn path_cc_normalizes_personal_logins_and_bounds_configuration() {
             .join(",");
         assert_eq!(rule(&cc).paths.unwrap().rules[0].value.is_ok(), valid);
     }
+}
+
+/// Path actions inherit the permanent disabled veto, never the other mention modes.
+#[test]
+fn path_actions_cannot_bypass_disabled_commands_or_invalid_comment_policy() {
+    for (command, action) in [
+        ("label", "labels=['rust']"),
+        ("relabel", "labels=['rust']"),
+        ("cc", "cc=['alice']"),
+    ] {
+        for mode in [
+            "disabled",
+            "always_mention",
+            "mention_once",
+            "no_mention",
+            "bad",
+        ] {
+            let cfg = parse(&format!("[command_triggers]\n'{command}'={{mode='{mode}'}}\n[[path_triggers.rules]]\nid='rust'\ninclude=['src/**']\n{action}"));
+            let rule = cfg.paths.unwrap().rules.remove(0).value;
+            match mode {
+                "disabled" => assert_eq!(rule.unwrap_err().code, ReasonCode::Disabled),
+                "bad" => assert_eq!(rule.unwrap_err().code, ReasonCode::InvalidComments),
+                _ => assert!(rule.is_ok()),
+            }
+        }
+    }
+}
+
+/// Shipped files are parsed and semantically validated, including deployment controls.
+#[test]
+fn shipped_defaults_and_opt_in_examples_are_valid_and_separate() {
+    assert_eq!(
+        include_str!("../.github/xero-bot.toml"),
+        include_str!("../examples/repository-config.toml")
+    );
+    let reference = parse(include_str!("../example.toml"));
+    assert!(reference.problems().is_empty());
+    assert!(reference.idle.unwrap().is_none());
+    assert!(reference.events.unwrap().is_empty());
+    let paths = reference.paths.unwrap();
+    assert!(paths.rules.is_empty());
+    assert_eq!(paths.max_cc_users_per_pr, 10);
+    assert_eq!(
+        paths.events,
+        vec![Event::PullRequestOpened, Event::PullRequestSynchronize]
+    );
+    let config = parse(include_str!("../examples/triggers-opt-in.toml"));
+    assert!(config.problems().is_empty());
+    let mut deployment = xero_bot::config::Config::from_env();
+    deployment.label_merge_queue_queued = "merge queue: queued".into();
+    deployment.label_merge_queue_testing = "merge queue: testing".into();
+    deployment.codeql_label = "codeql".into();
+    let events = config.events.unwrap();
+    assert_eq!(events.len(), 4);
+    for rule in events {
+        rule.value
+            .unwrap()
+            .action
+            .validate_deployment(&deployment)
+            .unwrap();
+    }
+    let paths = config.paths.unwrap();
+    assert_eq!(paths.max_cc_users_per_pr, 10);
+    assert_eq!(paths.rules.len(), 1);
+    paths.rules[0]
+        .value
+        .as_ref()
+        .unwrap()
+        .validate_deployment(&deployment)
+        .unwrap();
+}
+
+/// The complete reference must remain usable when idle is enabled, rather than
+/// hiding missing tasks or invalid inputs behind the default disabled switch.
+#[test]
+fn complete_reference_contains_valid_ci_monitors_tasks_and_dispatch_inputs() {
+    let mut document: toml::Value = toml::from_str(include_str!("../example.toml")).unwrap();
+    document["idle_workflows"]["enabled"] = toml::Value::Boolean(true);
+    let config = parse(&toml::to_string(&document).unwrap());
+    assert!(config.problems().is_empty(), "{:?}", config.problems());
+    let idle = config.idle.unwrap().unwrap();
+    assert_eq!(idle.idle_minutes, 30);
+    assert_eq!(idle.monitors.len(), 2);
+    assert_eq!(idle.monitors[0].repository.as_deref(), Some(REPO));
+    assert_eq!(idle.monitors[0].workflows, ["ci.yml"]);
+    assert_eq!(
+        idle.monitors[1].repository.as_deref(),
+        Some("your-org/related-repository")
+    );
+    assert_eq!(idle.monitors[1].workflows, ["ci.yml"]);
+    assert_eq!(idle.tasks.len(), 1);
+    let task = &idle.tasks[0];
+    assert_eq!(task.workflow, "publish-image.yml");
+    assert_eq!(task.branch, "main");
+    assert_eq!(task.retry_interval_minutes, 15);
+    assert_eq!(task.max_retries, 2);
+    assert_eq!(task.run_events, ["workflow_dispatch"]);
+    assert_eq!(task.inputs["channel"], serde_json::json!("nightly"));
+    assert_eq!(task.inputs["publish"], serde_json::json!(true));
+    assert_eq!(task.inputs["retention_days"], serde_json::json!(7));
+    xero_bot::idle_workflows::config::validate_dispatch(
+        r#"
+on:
+  workflow_dispatch:
+    inputs:
+      channel:
+        type: choice
+        options: [nightly, stable]
+        required: true
+      publish:
+        type: boolean
+        required: true
+      retention_days:
+        type: number
+        required: true
+"#,
+        task,
+    )
+    .unwrap();
+    assert!(config.events.unwrap().is_empty());
+    assert!(config.paths.unwrap().rules.is_empty());
 }

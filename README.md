@@ -11,8 +11,7 @@ Features:
 - **CodeQL quality reports** — reads the repo's existing code scanning alerts and maps them to files changed in the PR
 - **Bilingual replies** — answers in English or Chinese, chosen from the PR's own commit messages; no configuration
 
-Repository TOML loading, disabled-command vetoes, per-candidate mention gates, durable trigger storage, and session lifecycle policy are available independently of the idle scheduler. See the [configuration contract and current delivery scope](docs/repository-config.md), [#13 acceptance](docs/issue-13-acceptance.md), and [#14 acceptance](docs/issue-14-acceptance.md).
-
+Repository trigger policy, durable sessions, opt-in creation actions, and PR path labels/CC are available independently of the idle scheduler. See the [trigger and upgrade guide](docs/triggers.md), [annotated example.toml](example.toml), [complete defaults](.github/xero-bot.toml), separate [opt-in examples](examples/triggers-opt-in.toml), and [cross-feature acceptance](docs/issue-18-acceptance.md).
 
 ## Command reference
 
@@ -37,8 +36,21 @@ repository policy before duplicates or conflicting statuses are resolved.
 By default, `claim`, `unclaim`, `cc`, `r?` and `ready` need no mention. `r+` and
 `r-` require a mention **every time**; `r= @user`, `r+ as @user` and `r+ @user`
 are equivalent approval forms, and invalid/missing targets never become ordinary
-approvals. Other commands use `mention_once`. Session evidence comes from the durable wake ledger for the same user's explicit, enabled commands; runtime TTL, source-order policy and authorization preflight are backed by the #13 storage primitives. See the
-[parser acceptance record](docs/issue-12-acceptance.md) for the delivered boundaries.
+approvals. Other commands use `mention_once`. A valid explicit mention opens a session
+for the same installation/repository/thread/user (**30 days by default**, configurable
+from 1–365 days via `command_sessions.ttl_days`); only explicit mentions renew it.
+Upgrades do not import old wake-ups: mention the bot again. Edits do not wake,
+deletions do not revoke, and closing/reopening does not renew. Later mentions cannot
+authorize older comments. `disabled` permanently vetoes the command and aliases
+across all entry points, including automatic rules. Mentions never grant repository
+permissions; `r-` also requires current write+ access.
+
+`@xero-review help` displays this repository's effective modes, aliases, PR-only
+restrictions and remaining session validity, with separate automatic/path sections.
+Configuration is read only from the default branch with a **60-second** cache;
+Push invalidates it. After expiry, read failures block actions. Explicit help/ping
+provide a rate-limited, sanitized diagnosis, marking old snapshots as reference only.
+See the [upgrade, failure and notification-budget details](docs/triggers.md).
 
 | Command | Description |
 |---|---|
@@ -247,10 +259,18 @@ GitHub → Settings → Developer settings → GitHub Apps → **New GitHub App*
 |---|---|
 | Webhook URL | `https://<host>/webhook` |
 | Webhook secret | any random string — must match `WEBHOOK_SECRET` |
-| Subscribed events | **Issue comment** + **Pull request** (+ **Pull request review** for the merge queue; **Push** recommended — seconds-level notice when the base moves) |
-| Permissions | Contents: R (RW for the merge queue) · Pull requests: RW · Issues: RW · **Checks: R** · **Code scanning alerts: R** |
+| Subscribed events | **Issue comment** + **Issues** + **Pull request** + **Push**; add **Pull request review** for the merge queue. Event purposes are explained in the [deployment guide](docs/triggers.md#deployment-and-recovery). |
+| Permissions | Contents: R and permissions for the enabled features: Issues/PR writes, Code scanning alerts: R for CodeQL, Contents: RW + Checks: R for the queue, Actions: RW for idle dispatch. See the [feature permission matrix](docs/triggers.md#deployment-and-recovery); no new organization/CODEOWNERS permissions. |
 
 Then: **generate a private key** (downloads a `.pem` file), note the numeric **App ID** and the bot's @-name (for `BOT_NAME`), and install the App on the target org/repos.
+
+Run one instance with persistent `/data`. Stop the server before backing up the complete
+volume/database and WAL. Lost state loses sessions, deduplication and unknown-write
+evidence; old PRs conservatively block automatic CC until their complete ledger is
+restored. Inspect ambiguous operations with `trigger-state /data list` / `show` and
+resolve them with evidence, never by deleting the database or blindly retrying.
+GitHub and SQLite do not provide cross-system exactly-once delivery. See
+[state recovery](docs/trigger-state.md) and the [upgrade guide](docs/triggers.md).
 
 What you get in the container:
 - A `/data` named volume (`xero-data`) caches repo checkouts and `pi` sessions — this is the bot's **incremental memory**; wiping it loses review context. Leave it alone or back it up. The layout:
