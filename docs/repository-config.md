@@ -67,9 +67,31 @@ excluding paths matched by `exclude`. Labels are coalesced across matching
 rules, checked against the repository label inventory, and added without ever
 creating, removing, or touching merge-queue/CodeQL control labels. Missing,
 truncated, malformed or changing file lists fail closed and produce no label
-write. Path `cc` remains `Unsupported` until #17; its 0–10 budget is retained
-for that follow-up. Failures are available through `RepositoryConfig::problems()`
-and logged on load.
+write or notification. `cc` accepts up to 32 explicit personal logins per rule,
+without `@` or team syntax; logins are validated, lowercased and deduplicated.
+The App itself is excluded, and selected accounts are verified as GitHub users.
+A rule combining labels and CC must have all its labels present before either
+side effect. Label API failures and comment results are recorded independently.
+Failures are available through `RepositoryConfig::problems()` and logs.
+
+`max_cc_users_per_pr` defaults to 10 and accepts 0–10. Zero disables path CC
+while labels remain active. Within each installation/repository/PR, all heads and
+rules share a lifetime ledger keyed by the normalized login. Different
+installations have independent budgets. The ledger excludes already sent or
+uncertain recipients, then reserves remaining slots in login order. One aggregate
+comment contains only newly reserved mentions, safe
+rule/path examples, the checked head SHA, and a count of suppressed users.
+Fully suppressed plans write no comment. Manual CC has a separate lifecycle.
+
+Changing/deleting/recreating rules, changing the limit, closing/reopening the PR,
+deleting a notification comment, and restarting the process never reset slots.
+A lower limit blocks new recipients when existing usage meets or exceeds it.
+Unknown comments pause for App identity + stable marker + original body
+reconciliation. Missing comments do not prove no send. Initial deployment of
+this feature and a lost/recreated database both conservatively block CC on PRs
+created at or before the durable ledger epoch; labels continue. Restore a backup
+or attest a complete ledger through the offline CLI before enabling those PRs.
+See [notification acceptance and recovery](issue-17-acceptance.md).
 
 ## Snapshots, failures and diagnostics
 

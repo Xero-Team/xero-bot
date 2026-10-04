@@ -79,6 +79,8 @@ pub async fn reconcile(
                 && object["body"]
                     .as_str()
                     .is_some_and(|body| body.lines().any(|line| line == marker))
+                && (request["path_notification"] != true
+                    || object["body"] == request["body"]["body"])
                 && object["id"].as_i64().is_some_and(|id| id > 0)
         }) {
             store.resolve_unknown(
@@ -236,9 +238,12 @@ pub(crate) fn snapshot(config: &str, head: Option<&str>, base: Option<&str>) -> 
     Ok(())
 }
 
+type PathLocks = HashMap<(i64, i64, i64), std::sync::Weak<tokio::sync::Mutex<()>>>;
+
 pub struct Runtime {
     pub store: Arc<Store>,
     pump: tokio::sync::Mutex<()>,
+    path_locks: Mutex<PathLocks>,
 }
 impl Runtime {
     /// Acquire exclusive state ownership before starting any trigger worker.
@@ -246,7 +251,24 @@ impl Runtime {
         Ok(Self {
             store: Arc::new(Store::open(data_dir)?),
             pump: tokio::sync::Mutex::new(()),
+            path_locks: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Single-volume ownership plus a per-PR lock serializes complete path plans.
+    /// The database transaction remains the authority for recipient reservations.
+    fn path_lock(&self, ctx: &EventContext) -> Result<Arc<tokio::sync::Mutex<()>>> {
+        let mut locks = self.path_locks.lock().map_err(|_| "path mutex poisoned")?;
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        let entry = locks
+            .entry((ctx.installation_id, ctx.repository_id, ctx.thread_id))
+            .or_default();
+        if let Some(lock) = entry.upgrade() {
+            return Ok(lock);
+        }
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        *entry = Arc::downgrade(&lock);
+        Ok(lock)
     }
 
     /// Run up to eight deliveries concurrently, continuously refilling free

@@ -28,8 +28,8 @@ polling already claimed workers until they finish or reach their own deadlines,
 then returns the first error. It does not cancel healthy in-flight writes because
 another delivery failed to save its state. Opened envelopes execute the explicit
 whitelist from `event_triggers`; PR path envelopes execute the verified label
-subset from `path_triggers`. Path notification recipients remain the #17
-follow-up. Both use the same durable inbox and recovery boundary.
+and explicit notification actions from `path_triggers`. Labels and notifications
+use the same durable inbox and independent operation receipts.
 Rebase, CodeQL label,
 native review/merge queue, and idle workflow routing keep their existing switches
 and are not dispatched a second time by this worker.
@@ -37,8 +37,12 @@ and are not dispatched a second time by this worker.
 The business key for a manual command is its repository ID, comment ID and
 canonical command/arguments, independent of delivery ID. Aliases and normalized
 login lists share a key. Opened actions have a repository/thread/stable rule ID
-key; notification recipients have a repository/PR/lowercase-login key. Configuration
-and head SHAs are audit/snapshot data, never part of a lifetime recipient key.
+key; notification recipients have an installation/repository/PR/lowercase-login
+key. Configuration and head SHAs are audit/snapshot data, never part of a lifetime
+recipient key. Recipient uniqueness, budget queries, completeness proofs, path
+subscriptions, snapshots, operation keys and per-PR locks all include installation.
+Each installation/repository/PR has a separate lifetime budget. Repeated events,
+configuration edits and restarts within that scope never reset it.
 
 The first successfully loaded opened-event plan is frozen in `opened_plans`,
 including an empty plan. It survives inbox cleanup and prevents configuration
@@ -134,6 +138,58 @@ confirmed no-send releases them. A sent operation cannot simply be superseded to
 reclaim slots. Recipient records and successful/unknown actions have no ordinary
 expiry or seven-day scheduler cleanup. Closing/reopening a PR, configuration
 changes and deleting comments do not reset them. Path matching/aggregation is #16/#17.
+
+A missing account (404), a verified non-personal account, or a renamed login
+permanently fails the snapshot's notification operation and releases its unsent
+reservations. The error records the login and rule IDs, while the processed inbox
+can finish. This aggregate is not partially sent; correct the configuration for a
+later supported snapshot. Transport, permission/rate-limit/server errors and
+incomplete identity responses remain retryable before any send.
+
+`request.suppressed` records excess
+canonical recipients without reserving slots; public comments expose only their
+count. Per-PR processing is serialized, with reservation and operation claim in
+one SQLite transaction. Rule/path display is escaped and bounded, so it cannot
+introduce extra mentions.
+
+`path_notification_epoch` is initialized once when the feature first opens a
+state database. A PR created at or before that timestamp cannot receive automatic
+CC until its complete ledger is restored. This intentionally applies to upgrades
+as well as lost volumes: an empty database cannot prove that old comments never
+existed. Restoring the original complete database preserves its epoch and budget.
+If that is impossible, stop the server and use the evidence-backed command below
+(arguments are installation ID, repository ID, then PR database ID, not the
+PR's displayed number):
+
+```sh
+trigger-state /data restore-notification-ledger 67890 12345 98765 '["alice","bob"]' 'Complete ledger verified from backup and audit records, including deleted or uncertain comments'
+```
+
+Import is additive within the specified installation and records an audit entry.
+The installation ID is required; the earlier ambiguous CLI syntax is rejected.
+Include everyone ever notified or possibly notified in that scope; an empty list requires proof of no historical recipients.
+The CLI cannot prove completeness for you. Visible comments alone are insufficient
+when deletion or unknown requests are possible. If evidence is incomplete, leave
+that PR blocked and investigate manually. No network call is made by the CLI.
+New PRs created after the persisted epoch can use automatic CC normally. See
+[issue 17 acceptance](issue-17-acceptance.md) for the full operational boundary.
+
+Database version 4 migrates notification ownership in one transaction. Existing
+recipient rows with a positive installation in their operation context retain
+that installation, receipt state and reserved slots. Legacy operation keys/bodies
+remain intact: the matching installation reuses their original markers during
+reconciliation. New operations use installation-bearing keys. Legacy path plans
+are adopted only when records for the matching snapshot or exact source event
+identify one installation. Other events or manual commands on the PR cannot
+establish ownership.
+
+Unowned recipients, unscoped completeness proofs and ambiguous plans remain as
+legacy evidence and block automatic CC for that repository/PR until the operator
+restores a complete ledger for the intended installation. The proof only unblocks
+that installation; it is never lent to another. `legacy_recipients` and
+`legacy_path_notification_ledgers` preserve the old records for investigation.
+A migration error rolls back the scope changes and version so startup can be
+retried after the fault is fixed. Version-3 binaries cannot open version-4 state.
 
 `record_wake` stores installation/repository/issue-or-PR number/GitHub user/source comment IDs and GitHub
 source time. `session_before` selects a wake strictly before the calling comment,

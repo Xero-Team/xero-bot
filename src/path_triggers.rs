@@ -156,14 +156,34 @@ fn rule_matches_path(rule: &CompiledRule<'_>, path: &[&str]) -> bool {
             .any(|pattern| path_matches(pattern, path))
 }
 
-/// Return the rule IDs and labels matched by a complete GitHub PR file list.
-/// A renamed file contributes both its old and new path; a missing old path on
-/// a rename is rejected because treating it as a normal modification would
-/// silently skip a configured match.
+/// A rule match from the same validated complete diff used for path labels.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct PathMatch {
+    pub id: String,
+    pub labels: Vec<String>,
+    /// Bounded examples for notification display; never another file-list fetch.
+    pub paths: Vec<String>,
+}
+
+/// Return the label projection of the shared, validated path-match evidence.
 pub fn matched_rules(
     rules: &[PathRule],
     files: &[Value],
 ) -> Result<Vec<(String, Vec<String>)>, Problem> {
+    Ok(matched_rules_with_evidence(rules, files)?
+        .into_iter()
+        .map(|m| (m.id, m.labels))
+        .collect())
+}
+
+/// Return the rule IDs and labels matched by a complete GitHub PR file list.
+/// A renamed file contributes both its old and new path; a missing old path on
+/// a rename is rejected because treating it as a normal modification would
+/// silently skip a configured match.
+pub fn matched_rules_with_evidence(
+    rules: &[PathRule],
+    files: &[Value],
+) -> Result<Vec<PathMatch>, Problem> {
     let compiled: Vec<_> = rules
         .iter()
         .map(|rule| {
@@ -182,7 +202,7 @@ pub fn matched_rules(
             })
         })
         .collect::<Result<_, Problem>>()?;
-    let mut matched: Vec<(String, Vec<String>)> = Vec::new();
+    let mut matched = std::collections::BTreeMap::<String, PathMatch>::new();
     for file in files {
         let filename = file["filename"].as_str().ok_or_else(|| {
             Problem::new(
@@ -212,33 +232,33 @@ pub fn matched_rules(
             }
             paths.push(previous);
         }
-        let path_segments: Vec<Vec<_>> =
-            paths.iter().map(|path| path.split('/').collect()).collect();
         for rule in &compiled {
-            if path_segments
-                .iter()
-                .any(|segments| rule_matches_path(rule, segments))
-            {
-                if let Some((_, labels)) = matched.iter_mut().find(|(id, _)| id == &rule.rule.id) {
-                    for label in &rule.rule.labels {
-                        if !labels
-                            .iter()
-                            .any(|current| current.eq_ignore_ascii_case(label))
-                        {
-                            labels.push(label.clone());
-                        }
+            for path in &paths {
+                if rule_matches_path(rule, &path.split('/').collect::<Vec<_>>()) {
+                    let entry = matched
+                        .entry(rule.rule.id.clone())
+                        .or_insert_with(|| PathMatch {
+                            id: rule.rule.id.clone(),
+                            labels: rule.rule.labels.clone(),
+                            paths: Vec::new(),
+                        });
+                    if !entry.paths.iter().any(|p| p == path) {
+                        entry.paths.push((*path).to_string());
+                        entry.paths.sort();
+                        entry.paths.truncate(3);
                     }
-                } else {
-                    matched.push((rule.rule.id.clone(), rule.rule.labels.clone()));
                 }
             }
         }
     }
-    matched.sort_by(|a, b| a.0.cmp(&b.0));
-    for (_, labels) in &mut matched {
-        labels.sort();
-        labels.dedup();
-    }
+    let matched = matched
+        .into_values()
+        .map(|mut entry| {
+            entry.labels.sort();
+            entry.labels.dedup();
+            entry
+        })
+        .collect();
     Ok(matched)
 }
 

@@ -46,7 +46,7 @@ ttl_days = 30 # 1..365; the durable session implementation is #13/#14
 # add = ["needs-triage"] # no queue control labels or CODEQL_LABEL
 #
 # Path rules match complete PR diffs on opened/synchronize and add existing labels.
-# Path cc lists remain unsupported until #17.
+# Explicit personal logins only; <=32 per rule. Unknown sends keep lifetime slots.
 # [path_triggers]
 # events = ["pull_request.opened", "pull_request.synchronize"]
 # max_cc_users_per_pr = 10
@@ -55,3 +55,4 @@ ttl_days = 30 # 1..365; the durable session implementation is #13/#14
 # include = ["src/**/*.rs"]
 # exclude = ["src/generated/**"]
 # labels = ["area/rust"]
+# cc = ["octocat"] # no @, teams, owner inference, reviewer requests or assignments

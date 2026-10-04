@@ -192,3 +192,39 @@ fn offline_admin_cli_lists_and_records_explicit_confirmation() {
         State::Pending
     );
 }
+
+/// The offline restore command requires installation identity, scopes its
+/// completeness proof, and never accepts the old ambiguous argument layout.
+#[test]
+fn offline_notification_restore_requires_and_persists_installation() {
+    let dir = Dir::new();
+    let old = Command::new(env!("CARGO_BIN_EXE_trigger-state"))
+        .arg(&dir.0)
+        .args(["restore-notification-ledger", "1", "3", "[]", "old syntax"])
+        .output()
+        .unwrap();
+    assert_eq!(old.status.code(), Some(2));
+    let output = Command::new(env!("CARGO_BIN_EXE_trigger-state"))
+        .arg(&dir.0)
+        .args([
+            "restore-notification-ledger",
+            "2",
+            "1",
+            "3",
+            "[\"Alice\"]",
+            "complete install 2 evidence",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let store = Store::open(&dir.0).unwrap();
+    assert!(store.notification_ledger_ready(2, 1, 3, 0).unwrap());
+    assert!(!store.notification_ledger_ready(4, 1, 3, 0).unwrap());
+    let op = store.list(None).unwrap().remove(0);
+    assert_eq!(op.spec.context.installation_id, 2);
+    assert_eq!(op.recipients, vec!["alice"]);
+}

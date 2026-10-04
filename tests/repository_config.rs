@@ -311,8 +311,8 @@ fn paths_have_independent_static_actions_and_shared_domain_limits() {
         "[command_triggers]\nlabel={{mode='disabled'}}\ncc={{mode='disabled'}}\n{rule}"
     ));
     assert_eq!(
-        cfg.paths.unwrap().rules[0].value.as_ref().unwrap_err().code,
-        ReasonCode::Unsupported
+        cfg.paths.unwrap().rules[0].value.as_ref().unwrap().cc,
+        vec!["alice"]
     );
     for settings in [
         "max_cc_users_per_pr=11",
@@ -339,10 +339,7 @@ fn paths_have_independent_static_actions_and_shared_domain_limits() {
         "{rule}[[path_triggers.rules]]\nid='bad'\ninclude=[]\ncc=['org/team']"
     ));
     let paths = cfg.paths.unwrap();
-    assert_eq!(
-        paths.rules[0].value.as_ref().unwrap_err().code,
-        ReasonCode::Unsupported
-    );
+    assert_eq!(paths.rules[0].value.as_ref().unwrap().cc, vec!["alice"]);
     assert_eq!(
         paths.rules[1].value.as_ref().unwrap_err().code,
         ReasonCode::InvalidRule
@@ -350,7 +347,7 @@ fn paths_have_independent_static_actions_and_shared_domain_limits() {
 }
 
 #[test]
-fn path_label_rules_validate_globs_and_limits_but_keep_cc_for_issue17() {
+fn path_label_rules_validate_globs_and_limits() {
     let cfg = parse(
         "[path_triggers]\nevents=['pull_request.opened','pull_request.synchronize']\n[[path_triggers.rules]]\nid='rust'\ninclude=['src/**/*.rs']\nexclude=['src/generated/**']\nlabels=['area/rust']",
     );
@@ -478,5 +475,47 @@ fn r_equals_accepts_trailing_punctuation_and_preserves_command_boundaries() {
             "{text}: {:?}",
             output.diagnostics
         );
+    }
+}
+
+#[test]
+fn path_cc_normalizes_personal_logins_and_bounds_configuration() {
+    let rule = |cc: &str| {
+        parse(&format!(
+            "[[path_triggers.rules]]\nid='cc'\ninclude=['**']\ncc=[{cc}]"
+        ))
+    };
+    assert_eq!(
+        rule("'BOB','Alice','alice'").paths.unwrap().rules[0]
+            .value
+            .as_ref()
+            .unwrap()
+            .cc,
+        vec!["alice", "bob"]
+    );
+    for invalid in [
+        "@alice",
+        "org/team",
+        "some text",
+        "-alice",
+        "alice-",
+        "a--b",
+        "bot[bot]",
+        "",
+        "中文",
+    ] {
+        assert!(
+            rule(&format!("'{invalid}'")).paths.unwrap().rules[0]
+                .value
+                .is_err(),
+            "{invalid}"
+        );
+    }
+    for (count, valid) in [(32, true), (33, false)] {
+        let cc = (0..count)
+            .map(|i| format!("'user{i}'"))
+            .collect::<Vec<_>>()
+            .join(",");
+        assert_eq!(rule(&cc).paths.unwrap().rules[0].value.is_ok(), valid);
     }
 }

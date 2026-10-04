@@ -286,11 +286,11 @@ async fn disabled_codeql_label_event_cannot_bypass_configuration() {
     assert_eq!(f.assert_only_config_and_diagnostics().await, 0);
 }
 
-/// Help must expose unsupported automatic rules while valid comment commands remain usable.
+/// Help must expose invalid automatic rules while valid comment commands remain usable.
 #[tokio::test]
-async fn unsupported_path_rules_are_reported_by_help_without_disabling_comments() {
+async fn invalid_path_rules_are_reported_by_help_without_disabling_comments() {
     let f = Fixture::new(
-        "[[path_triggers.rules]]\nid='rust'\ninclude=['src/**']\nlabels=['rust']\ncc=['alice']",
+        "[[path_triggers.rules]]\nid='rust'\ninclude=['src/**']\nlabels=['rust']\ncc=['org/team']",
     )
     .await;
     Mock::given(method("GET"))
@@ -314,7 +314,7 @@ async fn unsupported_path_rules_are_reported_by_help_without_disabling_comments(
         })
         .collect();
     assert_eq!(bodies.len(), 2);
-    assert!(bodies.iter().any(|b| b.contains("Unsupported")));
+    assert!(bodies.iter().any(|b| b.contains("InvalidRule")));
     assert!(bodies.iter().any(|b| b.contains("xero-bot commands")));
 }
 
