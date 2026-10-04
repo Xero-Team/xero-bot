@@ -238,7 +238,7 @@ pub(crate) fn snapshot(config: &str, head: Option<&str>, base: Option<&str>) -> 
     Ok(())
 }
 
-type PathLocks = HashMap<(i64, i64), std::sync::Weak<tokio::sync::Mutex<()>>>;
+type PathLocks = HashMap<(i64, i64, i64), std::sync::Weak<tokio::sync::Mutex<()>>>;
 
 pub struct Runtime {
     pub store: Arc<Store>,
@@ -260,7 +260,9 @@ impl Runtime {
     fn path_lock(&self, ctx: &EventContext) -> Result<Arc<tokio::sync::Mutex<()>>> {
         let mut locks = self.path_locks.lock().map_err(|_| "path mutex poisoned")?;
         locks.retain(|_, lock| lock.strong_count() > 0);
-        let entry = locks.entry((ctx.repository_id, ctx.thread_id)).or_default();
+        let entry = locks
+            .entry((ctx.installation_id, ctx.repository_id, ctx.thread_id))
+            .or_default();
         if let Some(lock) = entry.upgrade() {
             return Ok(lock);
         }

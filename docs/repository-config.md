@@ -75,9 +75,11 @@ side effect. Label API failures and comment results are recorded independently.
 Failures are available through `RepositoryConfig::problems()` and logs.
 
 `max_cc_users_per_pr` defaults to 10 and accepts 0–10. Zero disables path CC
-while labels remain active. Across all heads and rules, the PR lifetime ledger
-excludes already sent or uncertain recipients, then reserves remaining slots in
-login order. One aggregate comment contains only newly reserved mentions, safe
+while labels remain active. Within each installation/repository/PR, all heads and
+rules share a lifetime ledger keyed by the normalized login. Different
+installations have independent budgets. The ledger excludes already sent or
+uncertain recipients, then reserves remaining slots in login order. One aggregate
+comment contains only newly reserved mentions, safe
 rule/path examples, the checked head SHA, and a count of suppressed users.
 Fully suppressed plans write no comment. Manual CC has a separate lifecycle.
 

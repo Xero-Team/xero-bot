@@ -22,7 +22,7 @@ cc = ["alice", "bob"]
 每条规则最多 32 个个人 login，不带 `@`；统一校验、转小写、跨规则去重、按字典序选人。拒绝团队语法、非法用户名及任意文本，排除本 App，并对实际选中的接收人查询 GitHub 个人账号。不会读取 CODEOWNERS、git blame、组织或团队，也不会指派用户或请求 reviewer。
 
 上限默认 10，只能配置 0–10。它限制 PR 生命周期累计不同接收人，所有规则共用；0 只关闭通知。手动 cc 不使用这个预算。规则重建/改 ID、配置或 head 变化、关闭重开、删除通知评论和进程重启均不重置账本。降低上限不会撤回评论，只会阻止超过新上限的新增通知。
-仓库 ID 是 GitHub 的全局稳定标识，installation 保留在事件、操作审计和配置缓存中；同仓库重装 App 不产生第二份终身预算，其他仓库和 PR 分别隔离。
+去重身份为 `installation + repository + PR + lowercase login`；人数预算、完整性证明、路径订阅/快照、通知操作与锁全部按 installation 隔离。每个 installation/repository/PR 各有独立生命周期预算，同一范围内的重启、重投递、规则变化不重置已用额度。
 
 ## 发布与恢复
 
@@ -41,10 +41,12 @@ cc = ["alice", "bob"]
 优先恢复完整持久卷备份。如无法恢复，停止服务后，凭完整备份/审计记录核对该 PR 所有已通知或可能已通知的人，然后导入：
 
 ```sh
-trigger-state /data restore-notification-ledger REPOSITORY_ID PR_DATABASE_ID '["alice","bob"]' '完整性依据，包括已删除评论和未知发送结果'
+trigger-state /data restore-notification-ledger INSTALLATION_ID REPOSITORY_ID PR_DATABASE_ID '["alice","bob"]' '完整性依据，包括已删除评论和未知发送结果'
 ```
 
-`PR_DATABASE_ID` 是 GitHub PR 的数据库 `id`，不是页面上的 `number`。导入只增加保护，不重置现有名单和名额；导入的历史接收人不能被旧的未发送计划恢复过程释放。空名单也必须有完整性依据。CLI 记录审计证据，不会自动判断证据可靠性；只查看当前可见评论无法排除历史评论删除。无法证明完整性时保持阻断并人工处理。单个不确定操作的核对命令见 [触发状态运维](trigger-state.md)。
+`INSTALLATION_ID` 必填，旧的无 installation 命令格式会被拒绝。完整性证明仅对指定 installation 生效。`PR_DATABASE_ID` 是 GitHub PR 的数据库 `id`，不是页面上的 `number`。导入只增加保护，不重置现有名单和名额；导入的历史接收人不能被旧的未发送计划恢复过程释放。空名单也必须有完整性依据。CLI 记录审计证据，不会自动判断证据可靠性；只查看当前可见评论无法排除历史评论删除。无法证明完整性时保持阻断并人工处理。单个不确定操作的核对命令见 [触发状态运维](trigger-state.md)。
+
+数据库升级到 version 4：有明确 installation 上下文的旧接收人记录迁入对应账本，保留成功/未知状态和预占；旧操作继续使用原 key、marker 和正文核对。路径计划仅在历史上下文能唯一确定 installation 时接续。没有 installation 的导入记录、旧完整性证明和归属不明的计划保留为历史证据，并阻断对应仓库/PR 的自动通知，直到为目标 installation 完成核对恢复；不把未知归属当作空账本。整个迁移在事务中完成，失败回滚。
 
 ## 验收证据
 
@@ -63,9 +65,11 @@ trigger-state /data restore-notification-ledger REPOSITORY_ID PR_DATABASE_ID '["
 
 配置测试验证 login 校验、32/33 人边界、大小写去重和非法上限。#16 的完整分页、3000 文件上限、数量不符、API 错误、反复 base/head 变化及生成/二进制文件用例同时回归；通知复用同一次 `list_pr_files_complete` 和匹配输出，没有宽松匹配入口。#13 的原子事务回滚、排他进程所有权及通知预算恢复用例同时回归。
 
-`src/trigger_state/path_notification_review_tests.rs` 另覆盖确定性账号错误下的 inbox 完成、重投递/重启不重复查询、后续修正配置、403/429/503 与不完整响应的重试恢复，以及 installation 变更不重置终身预算和仓库/PR 隔离。
+`src/trigger_state/path_notification_review_tests.rs` 另覆盖确定性账号错误下的 inbox 完成、重投递/重启不重复查询、后续修正配置、403/429/503 与不完整响应的重试恢复，以及 installation/repository/PR 的预算隔离。
 
-2026-10-04 本地验收：全量 500 项测试通过，格式、Clippy（warnings-as-errors）、Rustdoc（warnings-as-errors）及 diff 检查通过。
+`src/trigger_state/notification_scope_tests.rs` 验证跨 installation 并发额度、同快照独立 marker、未知发送隔离、scope 不匹配拒绝、重启持久性、有归属旧记录及原 marker 恢复、无归属证据阻断和迁移事务回滚。迁移只依据对应快照或完整源事件的记录，其他 head、源时间或手动命令不能冒用旧计划。管理命令的真实子进程测试验证必填 installation 与完整性证明隔离。
+
+2026-10-04 本地验收：全量 510 项测试通过，格式、Clippy（warnings-as-errors）、Rustdoc（warnings-as-errors）及 diff 检查通过。
 
 验收命令：
 

@@ -5,6 +5,9 @@ use super::*;
 #[path = "path_notification_review_tests.rs"]
 mod review;
 
+#[path = "notification_scope_tests.rs"]
+mod installation_scope;
+
 /// Build trusted path policy with a chosen lifetime cap and explicit recipients.
 fn cc_rules(max: u8, users: &[&str]) -> String {
     format!("[path_triggers]\nmax_cc_users_per_pr={max}\nevents=['pull_request.opened','pull_request.synchronize']\n[[path_triggers.rules]]\nid='rust'\ninclude=['src/**']\ncc={}\n",serde_json::to_string(users).unwrap())
@@ -14,7 +17,14 @@ fn cc_rules(max: u8, users: &[&str]) -> String {
 fn verified(runtime: &Runtime) {
     runtime
         .store
-        .restore_notification_ledger(9, 88, &[], "Fixture: complete empty historical ledger", 1)
+        .restore_notification_ledger(
+            7,
+            9,
+            88,
+            &[],
+            "Fixture: complete empty historical ledger",
+            1,
+        )
         .unwrap();
 }
 
@@ -238,6 +248,7 @@ async fn concurrent_pushes_share_the_remaining_slot_and_one_aggregate_snapshot()
     runtime
         .store
         .restore_notification_ledger(
+            7,
             9,
             88,
             &["alice".into()],
@@ -325,6 +336,7 @@ async fn lost_volume_blocks_old_pr_cc_but_labels_continue_and_complete_import_is
     runtime
         .store
         .restore_notification_ledger(
+            7,
             9,
             88,
             &["ALICE".into()],
@@ -336,10 +348,13 @@ async fn lost_volume_blocks_old_pr_cc_but_labels_continue_and_complete_import_is
     run_paths(&runtime, &server, &path_sync()).await.unwrap();
     assert!(comments(&server).await[0].contains("cc @bob"));
     assert!(!comments(&server).await[0].contains("@alice"));
-    assert!(!runtime.store.notification_ledger_ready(9, 89, 0).unwrap());
+    assert!(!runtime
+        .store
+        .notification_ledger_ready(7, 9, 89, 0)
+        .unwrap());
     assert!(runtime
         .store
-        .notification_ledger_ready(9, 89, crate::github::chrono_now_secs() + 1)
+        .notification_ledger_ready(7, 9, 89, crate::github::chrono_now_secs() + 1)
         .unwrap());
 }
 
@@ -750,6 +765,7 @@ fn restored_historical_recipients_cannot_be_released_by_old_unsent_plan_recovery
         .unwrap();
     store
         .restore_notification_ledger(
+            7,
             9,
             88,
             &["alice".into()],

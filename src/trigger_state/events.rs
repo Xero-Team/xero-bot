@@ -562,7 +562,8 @@ async fn process_paths(
                 event_name(event),
                 ctx.source_time,
                 ctx.head_sha,
-                ctx.base_sha
+                ctx.base_sha,
+                ctx.installation_id
             ])
             .to_string(),
             &serde_json::to_value(proposed)?,
@@ -737,7 +738,8 @@ fn path_plan_key(ctx: &EventContext, event: Event, pr: &serde_json::Value) -> St
         ctx.thread_id,
         event_name(event),
         pr["head"]["sha"],
-        pr["base"]["sha"]
+        pr["base"]["sha"],
+        ctx.installation_id
     ])
     .to_string()
 }
@@ -824,6 +826,7 @@ async fn execute_path_labels(
     ])
     .to_string();
     let store = &runtime.store;
+    let parent = store.path_operation_key(ctx, &parent)?;
     if let Some(old) = store.get(&parent)? {
         if old.state == State::Running {
             return Err("path action is owned by another worker".into());

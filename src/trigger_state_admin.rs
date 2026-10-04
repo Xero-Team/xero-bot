@@ -4,20 +4,25 @@ use xero_bot::trigger_state::{operation_marker, Store};
 /// Run one offline query or evidence-backed state transition under exclusive ownership.
 fn run() -> xero_bot::trigger_state::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let usage = "usage: trigger-state DATA_DIR list|inbox|show [CURSOR_OR_OPERATION_SHA256]\n       trigger-state DATA_DIR confirm-success|confirm-not-sent|retry OPERATION_SHA256 EVIDENCE [RECEIPT_JSON]\n       trigger-state DATA_DIR restore-notification-ledger REPOSITORY_ID PR_DATABASE_ID LOGINS_JSON COMPLETENESS_EVIDENCE\nStop the server first. Unknown writes cannot be blindly retried; confirm-not-sent requires external evidence.";
+    let usage = "usage: trigger-state DATA_DIR list|inbox|show [CURSOR_OR_OPERATION_SHA256]\n       trigger-state DATA_DIR confirm-success|confirm-not-sent|retry OPERATION_SHA256 EVIDENCE [RECEIPT_JSON]\n       trigger-state DATA_DIR restore-notification-ledger INSTALLATION_ID REPOSITORY_ID PR_DATABASE_ID LOGINS_JSON COMPLETENESS_EVIDENCE\nStop the server first. Unknown writes cannot be blindly retried; confirm-not-sent requires external evidence.";
     if args.len() < 2 {
         return Err(usage.into());
     }
     let store = Store::open(std::path::Path::new(&args[0]))?;
     if args[1] == "restore-notification-ledger" {
-        let repository = args.get(2).ok_or(usage)?.parse()?;
-        let pr = args.get(3).ok_or(usage)?.parse()?;
-        let users: Vec<String> = serde_json::from_str(args.get(4).ok_or(usage)?)?;
+        if args.len() != 7 {
+            return Err(usage.into());
+        }
+        let installation = args[2].parse()?;
+        let repository = args[3].parse()?;
+        let pr = args[4].parse()?;
+        let users: Vec<String> = serde_json::from_str(&args[5])?;
         store.restore_notification_ledger(
+            installation,
             repository,
             pr,
             &users,
-            args.get(5).ok_or(usage)?,
+            &args[6],
             xero_bot::github::chrono_now_secs(),
         )?;
         println!("Recorded complete notification ledger; existing reservations are preserved.");
@@ -37,7 +42,7 @@ fn run() -> xero_bot::trigger_state::Result<()> {
         for op in operations {
             println!(
                 "{}",
-                serde_json::json!({"marker":operation_marker(&op.spec.key),"state":op.state,"kind":op.spec.kind,"delivery":op.spec.context.delivery,"detail":op.detail})
+                serde_json::json!({"marker":operation_marker(&op.spec.key),"state":op.state,"kind":op.spec.kind,"delivery":op.spec.context.delivery,"installation_id":op.spec.context.installation_id,"repository_id":op.spec.context.repository_id,"thread_id":op.spec.context.thread_id,"detail":op.detail})
             );
         }
         return Ok(());

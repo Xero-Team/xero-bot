@@ -7,6 +7,8 @@ use serde_json::Value;
 
 use super::{retry_delay, EventContext, Result, SessionWake};
 
+#[path = "notification_migration.rs"]
+mod notification_migration;
 #[path = "notification_store.rs"]
 mod notifications;
 
@@ -89,7 +91,7 @@ impl Store {
     /// already initialized volume. No idle scheduler switch participates here.
     pub fn open(data_dir: &Path) -> Result<Self> {
         std::fs::create_dir_all(data_dir)?;
-        let db = Connection::open(data_dir.join("command-triggers.sqlite"))?;
+        let mut db = Connection::open(data_dir.join("command-triggers.sqlite"))?;
         db.busy_timeout(std::time::Duration::from_millis(250))?;
         db.execute_batch("PRAGMA locking_mode=EXCLUSIVE;
             PRAGMA journal_mode=WAL;
@@ -119,9 +121,9 @@ impl Store {
             CREATE INDEX IF NOT EXISTS inbox_retention ON inbox(state,updated_at);
             CREATE INDEX IF NOT EXISTS operation_running_age ON operations(state,updated_at);
             CREATE TABLE IF NOT EXISTS recipients(
-                repository INTEGER NOT NULL, pr INTEGER NOT NULL, login TEXT NOT NULL,
+                installation INTEGER NOT NULL CHECK(installation > 0), repository INTEGER NOT NULL, pr INTEGER NOT NULL, login TEXT NOT NULL,
                 operation TEXT NOT NULL REFERENCES operations(key), committed INTEGER NOT NULL DEFAULT 0,
-                PRIMARY KEY(repository,pr,login)
+                PRIMARY KEY(installation,repository,pr,login)
             );
             CREATE TABLE IF NOT EXISTS sessions(
                 installation INTEGER NOT NULL DEFAULT 0, repository INTEGER NOT NULL,
@@ -135,7 +137,7 @@ impl Store {
             );
             COMMIT;")?;
         let version: i64 = db.query_row("SELECT version FROM trigger_meta", [], |r| r.get(0))?;
-        if !(1..=3).contains(&version) {
+        if !(1..=4).contains(&version) {
             return Err("unsupported trigger database version".into());
         }
         if version == 1 {
@@ -193,13 +195,15 @@ impl Store {
             "CREATE TABLE IF NOT EXISTS path_notification_epoch(
             singleton INTEGER PRIMARY KEY CHECK(singleton=1), initialized_at INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS path_notification_ledgers(
-            repository INTEGER NOT NULL, pr INTEGER NOT NULL, verified_at INTEGER NOT NULL,
-            evidence TEXT NOT NULL, PRIMARY KEY(repository,pr));",
+            installation INTEGER NOT NULL CHECK(installation > 0), repository INTEGER NOT NULL,
+            pr INTEGER NOT NULL, verified_at INTEGER NOT NULL,
+            evidence TEXT NOT NULL, PRIMARY KEY(installation,repository,pr));",
         )?;
         db.execute(
             "INSERT OR IGNORE INTO path_notification_epoch VALUES(1,?1)",
             [crate::github::chrono_now_secs()],
         )?;
+        notification_migration::migrate(&mut db)?;
         let store = Self(Mutex::new(db));
         // All attempts from the previous owner have lost their authority. First
         // make uncertainty explicit; only reconciliation can make them runnable.
@@ -480,10 +484,11 @@ impl Store {
     /// hide a snapshot that must be revoked on the next supported event.
     pub(super) fn path_plans(&self, ctx: &EventContext) -> Result<Vec<(String, Value)>> {
         let db = self.db()?;
-        let mut stmt = db.prepare("SELECT key,plan FROM opened_plans WHERE json_extract(key,'$[0]')='path-plan' AND json_extract(key,'$[1]')=?1 AND json_extract(key,'$[2]')=?2 ORDER BY key")?;
-        let rows = stmt.query_map(params![ctx.repository_id, ctx.thread_id], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?;
+        let mut stmt = db.prepare("SELECT key,plan FROM opened_plans WHERE json_extract(key,'$[0]')='path-plan' AND json_extract(key,'$[1]')=?1 AND json_extract(key,'$[2]')=?2 AND json_extract(key,'$[6]')=?3 ORDER BY key")?;
+        let rows = stmt.query_map(
+            params![ctx.repository_id, ctx.thread_id, ctx.installation_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )?;
         rows.map(|row| {
             let (key, plan) = row?;
             Ok((key, serde_json::from_str(&plan)?))
@@ -575,6 +580,12 @@ impl Store {
         if max > 10 || spec.kind != "comment" {
             return Err("notification requires a comment and budget <= 10".into());
         }
+        let ctx = &spec.context;
+        if ctx.installation_id <= 0 || ctx.repository_id <= 0 || ctx.thread_id <= 0 {
+            return Err(
+                "notification scope requires positive installation/repository/PR IDs".into(),
+            );
+        }
         self.claim_with_recipients(spec, users, Some(max), now)
     }
 
@@ -588,7 +599,12 @@ impl Store {
     ) -> Result<Option<Claim>> {
         let mut normalized = std::collections::BTreeSet::new();
         for user in users {
-            super::recipient_key(spec.context.repository_id, spec.context.thread_id, user)?;
+            super::recipient_key(
+                spec.context.installation_id,
+                spec.context.repository_id,
+                spec.context.thread_id,
+                user,
+            )?;
             normalized.insert(user.to_ascii_lowercase());
         }
         let mut db = self.db()?;
@@ -597,6 +613,20 @@ impl Store {
             "INSERT OR IGNORE INTO operations(key,parent,delivery,spec,updated_at) VALUES(?1,?2,?3,?4,?5)",
             params![spec.key, spec.parent, spec.context.delivery, serde_json::to_string(spec)?, now],
         )?;
+        if max.is_some() {
+            let stored =
+                Self::operation(&tx, &spec.key)?.ok_or("missing notification operation")?;
+            let old = &stored.spec.context;
+            let ctx = &spec.context;
+            if (old.installation_id, old.repository_id, old.thread_id)
+                != (ctx.installation_id, ctx.repository_id, ctx.thread_id)
+            {
+                return Err(
+                    "notification operation key belongs to another installation/repository/PR"
+                        .into(),
+                );
+            }
+        }
         let changed = tx.execute("UPDATE operations SET state='running',attempts=attempts+1,sent=0,updated_at=?2,lease_delivery=?3 WHERE key=?1 AND state='pending' AND next_at<=?2", params![spec.key,now,spec.context.delivery])?;
         if changed == 0 {
             tx.commit()?;
@@ -605,16 +635,16 @@ impl Store {
         if let Some(max) = max {
             let ctx = &spec.context;
             let count: u32 = tx.query_row(
-                "SELECT count(*) FROM recipients WHERE repository=?1 AND pr=?2",
-                params![ctx.repository_id, ctx.thread_id],
+                "SELECT count(*) FROM recipients WHERE installation=?1 AND repository=?2 AND pr=?3",
+                params![ctx.installation_id, ctx.repository_id, ctx.thread_id],
                 |r| r.get(0),
             )?;
             let mut remaining = (max as u32).saturating_sub(count);
             let mut suppressed = Vec::new();
             for user in normalized {
                 let exists: bool = tx.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM recipients WHERE repository=?1 AND pr=?2 AND login=?3)",
-                    params![ctx.repository_id,ctx.thread_id,user], |r| r.get(0))?;
+                    "SELECT EXISTS(SELECT 1 FROM recipients WHERE installation=?1 AND repository=?2 AND pr=?3 AND login=?4)",
+                    params![ctx.installation_id,ctx.repository_id,ctx.thread_id,user], |r| r.get(0))?;
                 if exists {
                     continue;
                 }
@@ -622,8 +652,8 @@ impl Store {
                     suppressed.push(user);
                 } else {
                     tx.execute(
-                        "INSERT INTO recipients(repository,pr,login,operation) VALUES(?1,?2,?3,?4)",
-                        params![ctx.repository_id, ctx.thread_id, user, spec.key],
+                        "INSERT INTO recipients(installation,repository,pr,login,operation) VALUES(?1,?2,?3,?4,?5)",
+                        params![ctx.installation_id, ctx.repository_id, ctx.thread_id, user, spec.key],
                     )?;
                     remaining -= 1;
                 }

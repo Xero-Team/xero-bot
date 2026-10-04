@@ -110,10 +110,10 @@ fn keys_use_semantic_parameters_and_never_delivery_config_or_head() {
     );
     assert_ne!(opened_key(9, 3, "a"), opened_key(9, 3, "b"));
     assert_eq!(
-        recipient_key(9, 88, "Alice").unwrap(),
-        recipient_key(9, 88, "alice").unwrap()
+        recipient_key(7, 9, 88, "Alice").unwrap(),
+        recipient_key(7, 9, 88, "alice").unwrap()
     );
-    assert!(recipient_key(9, 88, "org/team").is_err());
+    assert!(recipient_key(7, 9, 88, "org/team").is_err());
 }
 
 /// Verify that concurrent deliveries claim one business action and one inbox owner.

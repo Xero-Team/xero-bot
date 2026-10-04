@@ -52,12 +52,22 @@ pub fn opened_key(repository: i64, thread: i64, rule: &str) -> String {
     serde_json::json!(["opened", repository, thread, rule]).to_string()
 }
 
-/// Validate and normalize a personal login for lifetime PR notification deduplication.
-pub fn recipient_key(repository: i64, pr: i64, login: &str) -> Result<String> {
+/// Key a normalized recipient within one installation/repository/PR lifetime.
+pub fn recipient_key(installation: i64, repository: i64, pr: i64, login: &str) -> Result<String> {
+    if installation <= 0 || repository <= 0 || pr <= 0 {
+        return Err("notification scope requires positive installation/repository/PR IDs".into());
+    }
     if !crate::commands::is_valid_login(login) {
         return Err("notification recipient must be a personal GitHub login".into());
     }
-    Ok(serde_json::json!(["recipient", repository, pr, login.to_ascii_lowercase()]).to_string())
+    Ok(serde_json::json!([
+        "recipient",
+        installation,
+        repository,
+        pr,
+        login.to_ascii_lowercase()
+    ])
+    .to_string())
 }
 
 #[cfg(test)]

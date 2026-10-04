@@ -175,10 +175,9 @@ async fn transient_recipient_lookup_errors_preserve_retry_and_recover_once() {
     }
 }
 
-/// Repository database IDs isolate ledgers, while replacing an installation
-/// cannot create a second lifetime budget for the same repository and PR.
+/// Every installation/repository/PR owns its own lifetime recipient budget.
 #[test]
-fn installation_changes_preserve_lifetime_dedup_and_repository_isolation() {
+fn notification_budgets_are_isolated_by_installation_repository_and_pr() {
     let dir = Dir::new();
     let store = Store::open(&dir.0).unwrap();
     let first = store
@@ -200,7 +199,7 @@ fn installation_changes_preserve_lifetime_dedup_and_repository_isolation() {
         .claim_notification(&reinstalled, &["alice".into(), "bob".into()], 1, 3)
         .unwrap()
         .unwrap();
-    assert!(next.operation.recipients.is_empty());
+    assert_eq!(next.operation.recipients, vec!["alice"]);
     assert_eq!(next.operation.spec.request["suppressed"], json!(["bob"]));
     assert_eq!(
         next.operation.spec.context.installation_id,

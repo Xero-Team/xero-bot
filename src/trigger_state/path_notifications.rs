@@ -155,6 +155,7 @@ pub(super) async fn execute(
         plan.base_sha
     ])
     .to_string();
+    let key = store.path_operation_key(ctx, &key)?;
     if let Some(old) = store.get(&key)? {
         if old.state == State::Unknown
             && reconcile(store, gh, cfg.app_id.parse()?, &old, now()).await? == Recovery::Paused
@@ -226,7 +227,12 @@ pub(super) async fn execute(
             .ok_or("PR missing creation time; cannot verify notification ledger")?,
     )?
     .timestamp();
-    if !store.notification_ledger_ready(ctx.repository_id, ctx.thread_id, created)? {
+    if !store.notification_ledger_ready(
+        ctx.installation_id,
+        ctx.repository_id,
+        ctx.thread_id,
+        created,
+    )? {
         return Err("path CC blocked: old PR notification ledger is unverified; restore persistent state or use trigger-state restore-notification-ledger with complete evidence".into());
     }
     let users: Vec<String> = plan
