@@ -324,6 +324,35 @@ fn session_valid(
         .map_err(|error| error.to_string())
 }
 
+/// Help shows the recorded wake for later comments, without lending that wake
+/// to bare candidates in the current comment. Missing storage is never active.
+fn help_session(
+    call: Option<&crate::trigger_state::SessionWake>,
+    recorded: bool,
+    ttl_days: u16,
+) -> crate::handlers::HelpSession {
+    use crate::handlers::HelpSession;
+    let Some(call) = call.filter(|_| crate::trigger_state::runtime::active()) else {
+        return HelpSession::Unavailable;
+    };
+    let evidence = if recorded {
+        Ok(Some(call.clone()))
+    } else {
+        crate::trigger_state::runtime::session_before(call, ttl_days)
+    };
+    match evidence {
+        Ok(wake) => HelpSession::from_wake(
+            wake.as_ref(),
+            ttl_days,
+            chrono::Utc::now().timestamp_millis(),
+        ),
+        Err(error) => {
+            tracing::warn!("help session lookup failed: {error}");
+            HelpSession::Unavailable
+        }
+    }
+}
+
 /// Explain trigger failures as actionable command refusals, separately from
 /// configuration loading errors. The reason key is shared with the limiter.
 fn trigger_message(problem: &Problem, command: &str, bot: &str, lang: crate::lang::Lang) -> String {
@@ -420,7 +449,7 @@ pub(crate) async fn execute_comment_with_client(
         }
     };
     // Show failures in other domains on an explicit status/help request while
-    // keeping independently valid comment commands usable. Dynamic help is #18.
+    // keeping independently valid comment commands usable.
     if commands.iter().any(|c| {
         matches!(
             c.command,
@@ -542,6 +571,9 @@ pub(crate) async fn execute_comment_with_client(
         })
         .map(|candidate| candidate.command.clone())
         .collect();
+    let help_explicit = permitted.iter().any(|candidate| {
+        candidate.command == crate::commands::Command::Help && candidate.is_explicit()
+    });
     let commands = resolve_commands(&cfg.bot_name, permitted, &mut diagnostics);
     if commands.is_empty() && diagnostics.is_empty() {
         return Ok(());
@@ -606,7 +638,70 @@ pub(crate) async fn execute_comment_with_client(
                 continue;
             }
         }
-        results.extend(handle_comment(gh, cfg, &ctx, vec![command], vec![]).await);
+        if command == crate::commands::Command::Help {
+            // A preceding review can outlive the snapshot. Never call an old
+            // policy effective, or render help after it has been disabled.
+            let current = cache.load(gh, key, &repo).await;
+            let checked = current.snapshot().and_then(|s| s.config.comments.as_ref());
+            let current_policy = match checked {
+                Ok(policy) => policy,
+                Err(problem) => {
+                    let message = current
+                        .diagnostic(lang)
+                        .unwrap_or_else(|| problem.message(lang));
+                    report_config_problem(gh, cache, key, &repo, pr_number, problem, &message)
+                        .await;
+                    return Err(format!("configuration unavailable: {problem}"));
+                }
+            };
+            let mut decision = current_policy.gate(command.id(), is_pr, help_explicit, false);
+            if matches!(&decision, Err(p) if p.code == ReasonCode::SessionRequired) {
+                decision = match session_valid(call.as_ref(), current_policy.ttl_days) {
+                    Ok(open) => current_policy.gate(command.id(), is_pr, help_explicit, open),
+                    Err(_) => Err(Problem::new(
+                        ReasonCode::SessionUnavailable,
+                        "session storage unavailable",
+                    )),
+                };
+            }
+            if let Err(problem) = decision {
+                if crate::trigger_state::runtime::active() {
+                    crate::trigger_state::runtime::reject_command(&command, &problem.to_string())
+                        .map_err(|error| error.to_string())?;
+                }
+                report_config_problem(
+                    gh,
+                    cache,
+                    key,
+                    &repo,
+                    pr_number,
+                    &problem,
+                    &trigger_message(&problem, command.id().name(), &cfg.bot_name, lang),
+                )
+                .await;
+                continue;
+            }
+            let status = help_session(call.as_ref(), wake, current_policy.ttl_days);
+            let help = crate::handlers::repository_help(
+                current.snapshot().expect("checked above"),
+                cfg,
+                lang,
+                &status,
+            );
+            results.extend(
+                crate::handlers::handle_comment_with_help(
+                    gh,
+                    cfg,
+                    &ctx,
+                    vec![command],
+                    vec![],
+                    Some(&help),
+                )
+                .await,
+            );
+        } else {
+            results.extend(handle_comment(gh, cfg, &ctx, vec![command], vec![]).await);
+        }
     }
     tracing::info!("comment commands on {repo}#{pr_number}: {results:?}");
     Ok(())

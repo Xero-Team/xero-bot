@@ -1262,3 +1262,6 @@ mod drain;
 
 #[path = "event_tests.rs"]
 mod events;
+
+#[path = "acceptance_tests.rs"]
+mod acceptance;

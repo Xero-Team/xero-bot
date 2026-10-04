@@ -1,4 +1,4 @@
-# Repository configuration contract (#11)
+# Repository configuration contract
 
 The bot reads `.github/xero-bot.toml` from the **target repository's default branch**.
 It does not read policy from a PR head or fork. This reader is independent of
@@ -9,13 +9,12 @@ See the [complete defaults](../examples/repository-config.toml),
 
 ## Delivery scope
 
-The shared configuration reader provides configuration failure and `disabled`
-vetoes in comment/CodeQL-label entry points. #12 adds strict command-block parsing,
-source-bearing candidates and per-candidate mention gates before deduplication or
-status resolution. It does not add automatic actions or persistent sessions.
-Session evidence uses the durable wake ledger for the same user's explicit, enabled
-commands. `ttl_days`, source ordering and authorization preflight are enforced at runtime by #13/#14.
-See the [#12 acceptance record](issue-12-acceptance.md).
+The comment, creation-event and path consumers share verified default-branch
+configuration, disabled vetoes and durable state. Strict parsing gates each
+candidate before deduplication; source-ordered sessions have a configurable TTL.
+Dynamic help uses the effective snapshot and persisted session evidence. See the
+[English trigger/upgrade guide](triggers.md), [中文指南](triggers.zh-CN.md),
+and [cross-feature acceptance](issue-18-acceptance.md).
 
 `r= @user`, `r+ as @user` and `r+ @user` normalize to the same on-behalf approval,
 with unchanged execution permissions and deployment switch. Missing, invalid or
@@ -40,8 +39,8 @@ and `always_mention`; `auto` is rejected.
 
 `command_sessions.ttl_days` defaults to 30 and accepts 1–365. No command defaults
 to `disabled`. A disabled command is rejected before session lookup or handler
-execution, regardless of its alias or existing session. Existing historical commands
-that are currently disabled cannot qualify as session openers. Permission checks
+execution, regardless of its alias or existing session. Old comments are not imported as session openers; only valid explicit interactions
+recorded by the durable consumer count. Permission checks
 in command handlers remain required; the configuration contract grants no authority.
 
 Syntax, type, missing required fields and unknown fields reject the whole document.
@@ -72,7 +71,11 @@ without `@` or team syntax; logins are validated, lowercased and deduplicated.
 The App itself is excluded, and selected accounts are verified as GitHub users.
 A rule combining labels and CC must have all its labels present before either
 side effect. Label API failures and comment results are recorded independently.
-Failures are available through `RepositoryConfig::problems()` and logs.
+A disabled `label` (including `relabel`) or `cc` invalidates path rules that
+reference it; either veto rejects a mixed rule. Invalid comment policy also blocks
+these dependent rules. Other manual mention modes do not change automatic
+subscriptions. Failures are available through `RepositoryConfig::problems()`,
+dynamic help and logs.
 
 `max_cc_users_per_pr` defaults to 10 and accepts 0–10. Zero disables path CC
 while labels remain active. Within each installation/repository/PR, all heads and
@@ -117,6 +120,8 @@ return a short English/Chinese failure diagnosis without executing bundled comma
 
 Reason codes are typed; diagnostics never interpolate TOML source, workflow inputs
 or remote error bodies. Existing entry points suppress duplicate diagnostics for
-10 minutes per repository/thread/reason within the process. **Durable suppression,
-retry inboxes and restart-safe delivery are #13**, not guarantees of this in-memory
-adapter. Automatic failures are logged rather than generating per-event comments.
+10 minutes per installation/repository/thread/reason within the process. Durable
+write receipts prevent replaying the same diagnostic source comment across restart;
+the in-memory rate window resets for new comments. The inbox retains retryable
+work, and uncertain writes require reconciliation. Automatic failures are logged
+rather than generating per-event comments. See [state operations](trigger-state.md).

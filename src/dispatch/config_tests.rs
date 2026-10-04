@@ -509,3 +509,160 @@ async fn bare_history_cannot_self_authorize_a_block_of_session_commands() {
     assert_eq!(posts.len(), 1);
     assert!(String::from_utf8_lossy(&posts[0].body).contains("SessionRequired"));
 }
+
+/// Help renders actual overrides and safe independent rule summaries, not defaults.
+#[tokio::test]
+async fn help_uses_effective_policy_without_mentioning_the_configured_recipients() {
+    let f = Fixture::new("[command_triggers]\ntake={mode='disabled'}\ncc={mode='always_mention'}\n[command_sessions]\nttl_days=7\n[[event_triggers]]\nid='review-open'\nevent='pull_request.opened'\ncommand='review'\n[[path_triggers.rules]]\nid='@outsider | <b>'\ninclude=['src/**']\ncc=['private-recipient']").await;
+    Mock::given(method("GET"))
+        .and(path(format!("/repos/{REPO}/pulls/1/commits")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .mount(&f.server)
+        .await;
+    f.comment("@bot help", 1).await;
+    let bodies = f
+        .server
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.method == "POST")
+        .map(|r| {
+            serde_json::from_slice::<Value>(&r.body).unwrap()["body"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(bodies.len(), 1);
+    let help = &bodies[0];
+    assert!(help.contains("| `claim` / `take` | `disabled`"));
+    assert!(help.contains("| `cc` | `always_mention`"));
+    assert!(help.contains("TTL: 7 days"));
+    assert!(help.contains("Session storage is unavailable"));
+    assert!(help.contains("review-open"));
+    assert!(help.contains("PR path rules"));
+    assert!(!help.contains("private-recipient"));
+    assert!(!help.contains("@outsider"));
+    assert!(!help.contains("<b>"));
+}
+
+/// Expiry plus a private server error must return a bounded diagnosis, never old help.
+#[tokio::test]
+async fn expired_help_snapshot_is_reference_only_and_private_failure_is_not_echoed() {
+    let f = Fixture::new("[command_triggers]\nreview={mode='no_mention'}").await;
+    f.cache
+        .load(
+            &f.gh,
+            RepositoryKey {
+                installation_id: 7,
+                repository_id: 9,
+            },
+            REPO,
+        )
+        .await;
+    f.clock.0.store(60, Ordering::SeqCst);
+    Mock::given(method("GET"))
+        .and(path(format!("/repos/{REPO}")))
+        .respond_with(
+            ResponseTemplate::new(503)
+                .set_body_json(json!({"message":"private-input secret-token hidden-workflow"})),
+        )
+        .with_priority(1)
+        .mount(&f.server)
+        .await;
+    for body in ["@bot help; claim", "@bot ping", "@bot help"] {
+        f.comment(body, 1).await;
+    }
+    assert_eq!(f.assert_only_config_and_diagnostics().await, 1);
+    let requests = f.server.received_requests().await.unwrap();
+    let post = requests.iter().find(|r| r.method == "POST").unwrap();
+    let body = String::from_utf8_lossy(&post.body);
+    assert!(body.contains("expired reference only"));
+    assert!(body.contains(CONFIG_PATH));
+    for forbidden in [
+        "xero-bot commands",
+        "no_mention",
+        "private-input",
+        "secret-token",
+        "hidden-workflow",
+        "pong",
+    ] {
+        assert!(!body.contains(forbidden));
+    }
+}
+
+/// Simulate a slow preceding command with the controlled clock: help must
+/// refresh its snapshot and recheck its own gate at the publication boundary.
+#[tokio::test]
+async fn help_after_another_command_revalidates_expired_policy_and_disabled_gate() {
+    for replacement in [
+        "[command_triggers]\ncc={mode='always_mention'}",
+        "[command_triggers]\nhelp={mode='disabled'}",
+        "outage",
+    ] {
+        let f = Fixture::new("").await;
+        let changed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = changed.clone();
+        let replacement = replacement.to_owned();
+        let next_config = replacement.clone();
+        Mock::given(method("GET")).and(path(format!("/repos/{REPO}/contents/{CONFIG_PATH}")))
+            .respond_with(move |_: &wiremock::Request| {
+                let is_new = observed.load(Ordering::SeqCst);
+                if is_new && next_config == "outage" { return ResponseTemplate::new(503); }
+                ResponseTemplate::new(200).set_body_json(json!({"type":"file","encoding":"base64","sha":if is_new {"new-blob"} else {"old-blob"},"content":base64::engine::general_purpose::STANDARD.encode(if is_new {next_config.as_str()} else {""})}))
+            }).with_priority(1).mount(&f.server).await;
+        let clock = f.clock.clone();
+        Mock::given(method("POST"))
+            .and(path(format!("/repos/{REPO}/issues/1/comments")))
+            .respond_with(move |request: &wiremock::Request| {
+                let body: Value = serde_json::from_slice(&request.body).unwrap();
+                if body["body"].as_str().unwrap().starts_with("pong") {
+                    changed.store(true, Ordering::SeqCst);
+                    clock.0.store(60, Ordering::SeqCst);
+                }
+                ResponseTemplate::new(201).set_body_json(json!({"id":99}))
+            })
+            .with_priority(1)
+            .mount(&f.server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/repos/{REPO}/pulls/1/commits")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .mount(&f.server)
+            .await;
+        let Routing::Act(work) = f.route("@bot ping; help", 1) else {
+            panic!("not routed")
+        };
+        let result = execute_comment_with_client(&f.gh, &f.cfg, &f.cache, work).await;
+        assert_eq!(result.is_err(), replacement == "outage");
+        let replies = f
+            .server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.method == "POST")
+            .map(|r| {
+                serde_json::from_slice::<Value>(&r.body).unwrap()["body"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(replies.len(), 2);
+        assert!(replies[0].starts_with("pong"));
+        match replacement.as_str() {
+            "outage" => {
+                assert!(replies[1].contains("expired reference only"));
+                assert!(!replies[1].contains("no actions ran"));
+                assert!(!replies[1].contains("xero-bot commands"));
+            }
+            s if s.contains("disabled") => {
+                assert!(replies[1].contains("Disabled"));
+                assert!(!replies[1].contains("xero-bot commands"));
+            }
+            _ => assert!(replies[1].contains("| `cc` | `always_mention`")),
+        }
+    }
+}

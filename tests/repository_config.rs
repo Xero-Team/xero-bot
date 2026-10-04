@@ -16,6 +16,7 @@ fn defaults_empty_partial_and_idle_only() {
         "[idle_workflows]\nenabled=false",
         include_str!("../examples/idle-workflows.toml"),
         include_str!("../examples/repository-config.toml"),
+        include_str!("../.github/xero-bot.toml"),
     ] {
         let cfg = parse(text);
         let c = cfg.comments.unwrap();
@@ -303,12 +304,12 @@ fn rule_failures_stay_per_rule_and_duplicate_ids_disable_only_the_domain() {
     assert!(cfg.idle.is_ok());
 }
 
-/// Path actions remain independent of comment modes, with shared event and CC-budget limits.
+/// Non-disabled manual mention modes do not change independent static path actions.
 #[test]
 fn paths_have_independent_static_actions_and_shared_domain_limits() {
     let rule = "[[path_triggers.rules]]\nid='rust'\ninclude=['src/**/*.rs']\nexclude=['src/generated/**']\nlabels=['rust']\ncc=['alice']\n";
     let cfg = parse(&format!(
-        "[command_triggers]\nlabel={{mode='disabled'}}\ncc={{mode='disabled'}}\n{rule}"
+        "[command_triggers]\nlabel={{mode='always_mention'}}\ncc={{mode='mention_once'}}\n{rule}"
     ));
     assert_eq!(
         cfg.paths.unwrap().rules[0].value.as_ref().unwrap().cc,
@@ -518,4 +519,63 @@ fn path_cc_normalizes_personal_logins_and_bounds_configuration() {
             .join(",");
         assert_eq!(rule(&cc).paths.unwrap().rules[0].value.is_ok(), valid);
     }
+}
+
+/// Path actions inherit the permanent disabled veto, never the other mention modes.
+#[test]
+fn path_actions_cannot_bypass_disabled_commands_or_invalid_comment_policy() {
+    for (command, action) in [
+        ("label", "labels=['rust']"),
+        ("relabel", "labels=['rust']"),
+        ("cc", "cc=['alice']"),
+    ] {
+        for mode in [
+            "disabled",
+            "always_mention",
+            "mention_once",
+            "no_mention",
+            "bad",
+        ] {
+            let cfg = parse(&format!("[command_triggers]\n'{command}'={{mode='{mode}'}}\n[[path_triggers.rules]]\nid='rust'\ninclude=['src/**']\n{action}"));
+            let rule = cfg.paths.unwrap().rules.remove(0).value;
+            match mode {
+                "disabled" => assert_eq!(rule.unwrap_err().code, ReasonCode::Disabled),
+                "bad" => assert_eq!(rule.unwrap_err().code, ReasonCode::InvalidComments),
+                _ => assert!(rule.is_ok()),
+            }
+        }
+    }
+}
+
+/// Shipped files are parsed and semantically validated, including deployment controls.
+#[test]
+fn shipped_defaults_and_opt_in_examples_are_valid_and_separate() {
+    assert_eq!(
+        include_str!("../.github/xero-bot.toml"),
+        include_str!("../examples/repository-config.toml")
+    );
+    let config = parse(include_str!("../examples/triggers-opt-in.toml"));
+    assert!(config.problems().is_empty());
+    let mut deployment = xero_bot::config::Config::from_env();
+    deployment.label_merge_queue_queued = "merge queue: queued".into();
+    deployment.label_merge_queue_testing = "merge queue: testing".into();
+    deployment.codeql_label = "codeql".into();
+    let events = config.events.unwrap();
+    assert_eq!(events.len(), 2);
+    for rule in events {
+        rule.value
+            .unwrap()
+            .action
+            .validate_deployment(&deployment)
+            .unwrap();
+    }
+    let paths = config.paths.unwrap();
+    assert_eq!(paths.max_cc_users_per_pr, 10);
+    assert_eq!(paths.rules.len(), 1);
+    paths.rules[0]
+        .value
+        .as_ref()
+        .unwrap()
+        .validate_deployment(&deployment)
+        .unwrap();
 }

@@ -503,7 +503,7 @@ impl RepositoryConfig {
         })?;
         let comments = comments(doc.command_triggers, doc.command_sessions);
         let events = events(doc.event_triggers, &comments);
-        let paths = paths(doc.path_triggers);
+        let paths = paths(doc.path_triggers, &comments);
         let idle = idle::validate(doc.idle_workflows, repository)
             .map_err(|_| Problem::new(ReasonCode::InvalidIdle, "invalid idle workflow settings"));
         Ok(Self {
@@ -615,8 +615,8 @@ fn event_rule(r: RawEventRule, comments: &Domain<Comments>) -> Domain<EventRule>
     })
 }
 /// Validate shared path settings, then retain independent rule diagnostics.
-/// Static path actions do not inherit the similarly named comment command modes.
-fn paths(raw: RawPaths) -> Domain<Paths> {
+/// Only disabled is inherited: mention modes never authorize automatic actions.
+fn paths(raw: RawPaths, comments: &Domain<Comments>) -> Domain<Paths> {
     if raw.rules.len() > 32 {
         return Err(Problem::new(
             ReasonCode::InvalidPathSettings,
@@ -685,6 +685,16 @@ fn paths(raw: RawPaths) -> Domain<Paths> {
                         .collect(),
                 })
             };
+            let value = value.and_then(|rule| {
+                let policy = comments.as_ref().map_err(Clone::clone)?;
+                if !rule.labels.is_empty() {
+                    policy.enabled(CommandId::Label)?;
+                }
+                if !rule.cc.is_empty() {
+                    policy.enabled(CommandId::Cc)?;
+                }
+                Ok(rule)
+            });
             Rule { id, value }
         })
         .collect();

@@ -5,8 +5,10 @@ The server always opens `XERO_DATA_DIR/command-triggers.sqlite`, even with
 volume. A second owner of the same database fails at startup. Different volumes
 are **not coordinated**; active replicas are unsupported. Docker Compose already
 mounts `/data`. Keep the database and its WAL together; stop the server before a
-filesystem backup or offline administration. Version 1 databases migrate transactionally
-to version 2, retaining intents, receipts, sessions, and recipient reservations.
+filesystem backup or offline administration. Existing databases migrate transactionally through version 4, retaining intents,
+receipts, sessions and recipient reservations; notification scope migration is
+described below. See the [English](triggers.md) / [Chinese](triggers.zh-CN.md)
+upgrade guide for trigger policy and deployment changes.
 
 ## Ingress and execution
 

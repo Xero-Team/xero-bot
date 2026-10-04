@@ -1,0 +1,26 @@
+# OPT-IN EXAMPLE: copying these sections to .github/xero-bot.toml on the
+# default branch ENABLES automatic actions. Create the labels first and replace
+# octocat with an intended personal GitHub login. Omitted manual settings keep
+# their defaults. Do not disable a command referenced by an automatic rule.
+
+[[event_triggers]]
+id = "review-on-open"
+event = "pull_request.opened"
+command = "review" # PR only; COMMENT, never APPROVE or merge queue
+
+[[event_triggers]]
+id = "issue-triage-on-open"
+event = "issues.opened"
+command = "label"
+add = ["needs-triage"] # existing labels; no queue / CODEQL_LABEL controls
+
+[path_triggers]
+events = ["pull_request.opened", "pull_request.synchronize"]
+max_cc_users_per_pr = 10 # 0..10, lifetime distinct recipients across all rules
+
+[[path_triggers.rules]]
+id = "rust-maintainers"
+include = ["src/**/*.rs"]
+exclude = ["src/generated/**"]
+labels = ["area/rust"]
+cc = ["octocat"] # explicit personal login, no @ or team / CODEOWNERS inference

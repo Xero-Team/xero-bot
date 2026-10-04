@@ -606,7 +606,7 @@ async fn remote_success_local_receipt_failure_reconciles_exact_body_and_marker()
 
 #[tokio::test]
 async fn final_head_check_and_current_policy_revoke_unsent_reservations() {
-    for change in ["head", "rule", "budget"] {
+    for change in ["head", "rule", "budget", "disabled"] {
         let dir = Dir::new();
         let runtime = Arc::new(Runtime::open(&dir.0).unwrap());
         verified(&runtime);
@@ -656,6 +656,8 @@ async fn final_head_check_and_current_policy_revoke_unsent_reservations() {
             server.reset().await;
             let replacement = if change == "rule" {
                 String::new()
+            } else if change == "disabled" {
+                format!("[command_triggers]\ncc={{mode='disabled'}}\n{rules}")
             } else {
                 cc_rules(0, &["alice"])
             };
@@ -789,4 +791,23 @@ fn restored_historical_recipients_cannot_be_released_by_old_unsent_plan_recovery
         .unwrap();
     assert!(retry.operation.recipients.is_empty());
     assert_eq!(retry.operation.spec.request["suppressed"], json!(["bob"]));
+}
+
+/// Both automatic path effects are vetoed, including aliases and mixed rules.
+#[tokio::test]
+async fn disabled_path_actions_never_create_a_notification_or_label_request() {
+    for command in ["label", "relabel", "cc"] {
+        let dir = Dir::new();
+        let runtime = Runtime::open(&dir.0).unwrap();
+        verified(&runtime);
+        let server = MockServer::start().await;
+        let rules = format!(
+            "[command_triggers]\n{command}={{mode='disabled'}}\n{}labels=['area/rust']\n",
+            cc_rules(10, &["alice"])
+        );
+        fixture(&server, &rules, "head", files(), 201).await;
+        run_paths(&runtime, &server, &path_sync()).await.unwrap();
+        assert!(writes(&server).await.is_empty());
+        assert!(notifications(&runtime).is_empty());
+    }
 }
