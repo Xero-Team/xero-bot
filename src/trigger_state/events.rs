@@ -5,6 +5,9 @@ use crate::config::repository::{Event, EventAction, EventRule, PathRule, Paths, 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+#[path = "path_notifications.rs"]
+mod notifications;
+
 #[derive(Clone, Serialize, Deserialize)]
 struct Plan {
     rules: Vec<String>,
@@ -20,6 +23,8 @@ struct PathSubscription {
 
 #[derive(Clone, Serialize, Deserialize)]
 struct PathPlan {
+    #[serde(default)]
+    matches: Vec<crate::path_triggers::PathMatch>,
     rules: Vec<PathRule>,
     labels: Vec<String>,
     event: Event,
@@ -513,6 +518,8 @@ async fn process_paths(
     cache: &RepositoryConfigCache,
     ctx: &EventContext,
 ) -> Result<()> {
+    let lock = runtime.path_lock(ctx)?;
+    let _guard = lock.lock().await;
     let event = match ctx.action.as_str() {
         "opened" => Event::PullRequestOpened,
         "synchronize" => Event::PullRequestSynchronize,
@@ -578,6 +585,7 @@ async fn process_paths(
                 runtime,
                 gh,
                 cfg,
+                cache,
                 ctx,
                 &serde_json::Value::Null,
                 &plan,
@@ -590,11 +598,12 @@ async fn process_paths(
             }
         }
     }
-    if deferred {
-        return Err("path revocation requires reconciliation".into());
-    }
     if !needs_snapshot {
-        return Ok(());
+        return if deferred {
+            Err("path revocation requires reconciliation".into())
+        } else {
+            Ok(())
+        };
     }
     let mut pr = gh.get_pr(&ctx.repo, ctx.number).await?;
     path_snapshot(&pr)?;
@@ -610,15 +619,15 @@ async fn process_paths(
             if compatible && plan.event != event {
                 continue;
             }
-            if let Err(error) = execute_path(runtime, gh, cfg, ctx, &pr, &plan, compatible).await {
+            if let Err(error) =
+                execute_path(runtime, gh, cfg, cache, ctx, &pr, &plan, compatible).await
+            {
                 tracing::warn!(repo=%ctx.repo, "path recovery deferred: {error}");
                 deferred = true;
             }
         }
     }
-    if deferred {
-        return Err("path plans require retry or reconciliation".into());
-    }
+    // An uncertain old notification must not prevent current-head labels.
     let state = cache.load(gh, key, &ctx.repo).await;
     let (_, current) = path_policy(&state, &ctx.repo)?;
     let usable: Vec<_> = subscription
@@ -631,7 +640,11 @@ async fn process_paths(
             .iter()
             .any(|(key, _)| key == &path_plan_key(ctx, event, &pr))
     {
-        return Ok(());
+        return if deferred {
+            Err("path plans require retry or reconciliation".into())
+        } else {
+            Ok(())
+        };
     }
     let files = {
         let mut snapshot = pr.clone();
@@ -665,14 +678,15 @@ async fn process_paths(
         .filter(|sha| !sha.is_empty())
         .ok_or("PR snapshot missing base SHA")?;
     let plan_key = path_plan_key(ctx, event, &pr);
+    let usable = notifications::valid_rules(gh, ctx, &usable).await?;
     let proposed = {
-        let matched = crate::path_triggers::matched_rules(&usable, &files)
+        let matched = crate::path_triggers::matched_rules_with_evidence(&usable, &files)
             .map_err(|problem| problem.to_string())?;
         let mut labels = BTreeMap::new();
         let mut matched_rules = Vec::new();
-        for (id, rule_labels) in matched {
-            if let Some(rule) = usable.iter().find(|rule| rule.id == id) {
-                for label in rule_labels {
+        for matched_rule in &matched {
+            if let Some(rule) = usable.iter().find(|rule| rule.id == matched_rule.id) {
+                for label in matched_rule.labels.iter().cloned() {
                     labels.entry(label.to_lowercase()).or_insert(label);
                 }
                 matched_rules.push(rule.clone());
@@ -683,6 +697,7 @@ async fn process_paths(
         } else {
             matched_rules.sort_by(|a, b| a.id.cmp(&b.id));
             vec![PathPlan {
+                matches: matched,
                 rules: matched_rules,
                 labels: labels.into_values().collect(),
                 event,
@@ -701,9 +716,17 @@ async fn process_paths(
         let state = cache.load(gh, key, &ctx.repo).await;
         let (_, current) = path_policy(&state, &ctx.repo)?;
         let compatible = path_plan_compatible(current, cfg, &plan);
-        execute_path(runtime, gh, cfg, ctx, &pr, &plan, compatible).await?;
+        if let Err(error) = execute_path(runtime, gh, cfg, cache, ctx, &pr, &plan, compatible).await
+        {
+            tracing::warn!(repo=%ctx.repo, "path execution deferred: {error}");
+            deferred = true;
+        }
     }
-    Ok(())
+    if deferred {
+        Err("path plans require retry or reconciliation".into())
+    } else {
+        Ok(())
+    }
 }
 
 /// A snapshot plan coalesces out-of-order deliveries that observe the same diff.
@@ -757,8 +780,28 @@ fn path_plan_compatible(paths: Option<&Paths>, cfg: &Config, plan: &PathPlan) ->
         .all(|rule| path_rule_compatible(paths, cfg, plan.event, rule))
 }
 
-/// Execute the one coalesced label action for a matched path snapshot.
+/// Checkpoint labels and CC independently, including when either fails.
+#[allow(clippy::too_many_arguments)]
 async fn execute_path(
+    runtime: &Runtime,
+    gh: &Client,
+    cfg: &Config,
+    cache: &RepositoryConfigCache,
+    ctx: &EventContext,
+    pr: &Value,
+    plan: &PathPlan,
+    compatible: bool,
+) -> Result<()> {
+    let labels = execute_path_labels(runtime, gh, cfg, ctx, pr, plan, compatible).await;
+    let cc = notifications::execute(runtime, gh, cfg, cache, ctx, plan, compatible).await;
+    if let Err(error) = &cc {
+        tracing::error!(repo=%ctx.repo, pr=ctx.number, "path notification deferred: {error}");
+    }
+    labels.and(cc)
+}
+
+/// Execute the one coalesced label action for a matched path snapshot.
+async fn execute_path_labels(
     runtime: &Runtime,
     gh: &Client,
     cfg: &Config,
@@ -856,7 +899,7 @@ async fn execute_path(
     };
     // Inventory failures happen before claiming; they remain retryable. The
     // final snapshot fence follows inventory pagination, immediately before writes.
-    let selected = if compatible {
+    let selected = if compatible && !plan.labels.is_empty() {
         present_path_labels(gh, ctx, &plan.labels).await?
     } else {
         Vec::new()

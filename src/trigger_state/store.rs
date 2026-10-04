@@ -7,6 +7,9 @@ use serde_json::Value;
 
 use super::{retry_delay, EventContext, Result, SessionWake};
 
+#[path = "notification_store.rs"]
+mod notifications;
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum State {
@@ -186,6 +189,17 @@ impl Store {
         db.execute_batch(
             "CREATE INDEX IF NOT EXISTS operation_lease ON operations(lease_delivery,state);",
         )?;
+        db.execute_batch(
+            "CREATE TABLE IF NOT EXISTS path_notification_epoch(
+            singleton INTEGER PRIMARY KEY CHECK(singleton=1), initialized_at INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS path_notification_ledgers(
+            repository INTEGER NOT NULL, pr INTEGER NOT NULL, verified_at INTEGER NOT NULL,
+            evidence TEXT NOT NULL, PRIMARY KEY(repository,pr));",
+        )?;
+        db.execute(
+            "INSERT OR IGNORE INTO path_notification_epoch VALUES(1,?1)",
+            [crate::github::chrono_now_secs()],
+        )?;
         let store = Self(Mutex::new(db));
         // All attempts from the previous owner have lost their authority. First
         // make uncertainty explicit; only reconciliation can make them runnable.
@@ -362,7 +376,7 @@ impl Store {
             params![key, crate::redact::scrub(detail), now],
         )?;
         tx.execute(
-            "DELETE FROM recipients WHERE operation=?1 AND committed=0",
+            "DELETE FROM recipients WHERE operation=?1 AND committed=0 AND EXISTS(SELECT 1 FROM operations WHERE key=?1 AND state='failed' AND sent=0)",
             [key],
         )?;
         tx.commit()?;
@@ -596,13 +610,32 @@ impl Store {
                 |r| r.get(0),
             )?;
             let mut remaining = (max as u32).saturating_sub(count);
+            let mut suppressed = Vec::new();
             for user in normalized {
-                if remaining == 0 {
-                    break;
+                let exists: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM recipients WHERE repository=?1 AND pr=?2 AND login=?3)",
+                    params![ctx.repository_id,ctx.thread_id,user], |r| r.get(0))?;
+                if exists {
+                    continue;
                 }
-                let inserted = tx.execute("INSERT OR IGNORE INTO recipients(repository,pr,login,operation) VALUES(?1,?2,?3,?4)", params![ctx.repository_id,ctx.thread_id,user,spec.key])?;
-                remaining -= inserted as u32;
+                if remaining == 0 {
+                    suppressed.push(user);
+                } else {
+                    tx.execute(
+                        "INSERT INTO recipients(repository,pr,login,operation) VALUES(?1,?2,?3,?4)",
+                        params![ctx.repository_id, ctx.thread_id, user, spec.key],
+                    )?;
+                    remaining -= 1;
+                }
             }
+            let mut intent = Self::operation(&tx, &spec.key)?
+                .ok_or("claim disappeared")?
+                .spec;
+            intent.request["suppressed"] = serde_json::json!(suppressed);
+            tx.execute(
+                "UPDATE operations SET spec=?2 WHERE key=?1",
+                params![spec.key, serde_json::to_string(&intent)?],
+            )?;
         }
         let operation = Self::operation(&tx, &spec.key)?.ok_or("claim disappeared")?;
         tx.commit()?;

@@ -28,8 +28,8 @@ polling already claimed workers until they finish or reach their own deadlines,
 then returns the first error. It does not cancel healthy in-flight writes because
 another delivery failed to save its state. Opened envelopes execute the explicit
 whitelist from `event_triggers`; PR path envelopes execute the verified label
-subset from `path_triggers`. Path notification recipients remain the #17
-follow-up. Both use the same durable inbox and recovery boundary.
+and explicit notification actions from `path_triggers`. Labels and notifications
+use the same durable inbox and independent operation receipts.
 Rebase, CodeQL label,
 native review/merge queue, and idle workflow routing keep their existing switches
 and are not dispatched a second time by this worker.
@@ -133,7 +133,31 @@ The total budget is 0–10. Success commits reservations; unknown keeps them;
 confirmed no-send releases them. A sent operation cannot simply be superseded to
 reclaim slots. Recipient records and successful/unknown actions have no ordinary
 expiry or seven-day scheduler cleanup. Closing/reopening a PR, configuration
-changes and deleting comments do not reset them. Path matching/aggregation is #16/#17.
+changes and deleting comments do not reset them. Path matching/aggregation is #16/#17. `request.suppressed` records excess
+canonical recipients without reserving slots; public comments expose only their
+count. Per-PR processing is serialized, with reservation and operation claim in
+one SQLite transaction. Rule/path display is escaped and bounded, so it cannot
+introduce extra mentions.
+
+`path_notification_epoch` is initialized once when the feature first opens a
+state database. A PR created at or before that timestamp cannot receive automatic
+CC until its complete ledger is restored. This intentionally applies to upgrades
+as well as lost volumes: an empty database cannot prove that old comments never
+existed. Restoring the original complete database preserves its epoch and budget.
+If that is impossible, stop the server and use the evidence-backed command below
+(the PR argument is its GitHub database ID, not its displayed PR number):
+
+```sh
+trigger-state /data restore-notification-ledger 12345 98765 '["alice","bob"]' 'Complete ledger verified from backup and audit records, including deleted or uncertain comments'
+```
+
+Import is additive and records an audit entry. Include everyone ever notified or
+possibly notified; an empty list requires proof of no historical recipients.
+The CLI cannot prove completeness for you. Visible comments alone are insufficient
+when deletion or unknown requests are possible. If evidence is incomplete, leave
+that PR blocked and investigate manually. No network call is made by the CLI.
+New PRs created after the persisted epoch can use automatic CC normally. See
+[issue 17 acceptance](issue-17-acceptance.md) for the full operational boundary.
 
 `record_wake` stores installation/repository/issue-or-PR number/GitHub user/source comment IDs and GitHub
 source time. `session_before` selects a wake strictly before the calling comment,

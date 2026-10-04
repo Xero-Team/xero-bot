@@ -6,6 +6,9 @@ static REVIEW_TEST: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 #[path = "event_review_tests.rs"]
 mod review_fixes;
 
+#[path = "path_notification_tests.rs"]
+mod path_notifications;
+
 #[path = "path_review_tests.rs"]
 mod path_review_fixes;
 

@@ -659,6 +659,7 @@ fn paths(raw: RawPaths) -> Domain<Paths> {
                 || (r.labels.is_empty() && r.cc.is_empty())
                 || r.labels.len() > 20
                 || r.labels.iter().any(|s| s.trim().is_empty())
+                || r.cc.len() > 32
                 || r.cc.iter().any(|s| !crate::commands::is_valid_login(s))
                 || r.include
                     .iter()
@@ -669,18 +670,19 @@ fn paths(raw: RawPaths) -> Domain<Paths> {
                     ReasonCode::InvalidRule,
                     "invalid path rule, labels or explicit personal logins",
                 ))
-            } else if !r.cc.is_empty() {
-                Err(Problem::new(
-                    ReasonCode::Unsupported,
-                    "path notifications are not implemented yet (#17)",
-                ))
             } else {
                 Ok(PathRule {
                     id: r.id,
                     include: r.include,
                     exclude: r.exclude,
                     labels: r.labels,
-                    cc: r.cc,
+                    cc: r
+                        .cc
+                        .into_iter()
+                        .map(|login| login.to_ascii_lowercase())
+                        .collect::<std::collections::BTreeSet<_>>()
+                        .into_iter()
+                        .collect(),
                 })
             };
             Rule { id, value }

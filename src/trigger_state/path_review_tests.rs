@@ -31,7 +31,11 @@ async fn path_fixture(server: &MockServer, rules: &str, inventory: Value, status
     .await;
 }
 
-async fn run_paths(runtime: &Runtime, server: &MockServer, ctx: &EventContext) -> Result<()> {
+pub(super) async fn run_paths(
+    runtime: &Runtime,
+    server: &MockServer,
+    ctx: &EventContext,
+) -> Result<()> {
     runtime
         .process(
             &client(server),
