@@ -1,8 +1,9 @@
 # xero-bot 完整配置参考 / Annotated repository configuration
-# 对应 issue #10 及其 #11–#18 子任务已经实现的配置。
+# 包含 main 已有的 CI/idle workflow 管理，以及 issue #10 / #11–#18 的触发配置。
 # 复制到目标仓库默认分支的 .github/xero-bot.toml；PR head / fork 的配置不生效。
 # 本文件保持内置手动默认，自动创建/路径规则为空，idle 调度关闭。
-# 自动功能的可用启用示例：examples/triggers-opt-in.toml、examples/idle-workflows.toml。
+# 下方直接列出完整 CI 监控、调度任务、重试与 inputs；按实际仓库替换示例值后再启用。
+# 自动创建/路径的启用示例：examples/triggers-opt-in.toml；idle 专项说明：docs/idle-workflows-cn.md。
 # 部署密钥与全局开关放在环境变量中，参见 .env.example；不要写 token 到此文件。
 #
 # 配置缓存 60 秒；默认分支 Push 会立即失效缓存。过期刷新失败阻断相关动作，
@@ -77,13 +78,57 @@ max_cc_users_per_pr = 10 # 0–10；同 installation/仓库/PR 终身不同接�
 # 持久卷丢失/首次升级时，旧 PR 的 CC 须先恢复完整账本。unknown 发送保留名额并暂停核对。
 
 # 既有 idle workflow 调度 / Existing idle workflow scheduling
+# 等待开发活动空闲且被监控 CI 全部结束，再触发任务，补偿漏跑并按预算重试失败。
+# 开启前替换下方关联仓库、CI 文件名、任务 workflow/branch 及 inputs；
+# 示例 workflow 和 inputs 不代表仓库已经存在同名定义。
 [idle_workflows]
-enabled = false # 仅开启此项还不够，部署也须 IDLE_WORKFLOWS_ENABLED=true
-idle_minutes = 30
-# 没有配置自动调度任务。启用时先替换本节为 examples/idle-workflows.toml，
-# 按实际仓库填写 monitors、tasks、workflow/branch 和 workflow_dispatch inputs。
-# 默认 retry_interval_minutes=15、max_retries=2、run_events=["workflow_dispatch"]。
-# 不要仅改 enabled=true：开启的 idle 配置需要至少一条有效 task。
+enabled = false # 仓库开关，默认关闭；部署还须 IDLE_WORKFLOWS_ENABLED=true
+idle_minutes = 30 # 开发活动连续空闲分钟数；默认 30，允许 1–43200
+
+# 等待哪些 CI / CI monitors：最多 32 项，同一仓库不能重复声明。
+# 不写 monitors 时监控当前仓库全部 Actions；workflows=[] 也表示监控该仓库全部 Actions。
+# 过滤适用于选中 workflow 的所有执行，包括 PR、push、staging、merge_group 和手动运行。
+# 运行中或等待人工批准会阻塞；已结束的失败 CI 视为结束；API 读取失败不会被当作空闲。
+[[idle_workflows.monitors]]
+# 省略 repository 表示当前仓库，无需写死当前仓库的 owner/name。
+workflows = ["ci.yml"] # 支持文件名、.github/workflows/路径或字符串数字 ID
+
+# 关联仓库 / Related repository：适合共享 Actions 容量；无需跨仓库监控时删除本块。
+# 关联仓库的开发活动及所选 CI 也参与空闲门槛，当前仓库始终包含在监控范围内。
+# App 必须安装到该仓库且具有 Actions: read；替换以下占位仓库。
+[[idle_workflows.monitors]]
+repository = "your-org/related-repository"
+workflows = ["ci.yml"] # 改为 [] 可等待该关联仓库的全部 Actions
+
+# 空闲时运行哪些 workflow / Scheduled tasks：启用时必须配置 1–32 项。
+# 每个 workflow/branch 对唯一；需要更多任务时增加完整的 [[idle_workflows.tasks]] 块。
+# 任务 workflow 必须启用，并在默认分支和目标分支都支持 workflow_dispatch。
+[[idle_workflows.tasks]]
+workflow = "publish-image.yml" # 支持文件名、.github/workflows/路径或字符串数字 ID
+branch = "main" # 目标分支；支持 release/1.x 等，不带 refs/heads/ 前缀
+retry_interval_minutes = 15 # 失败或上次请求后的最小间隔；默认 15，允许 1–43200
+max_retries = 2 # 首次尝试之外的重试次数；默认 2（共 3 次），允许 0–100；0 不重试
+
+# 哪些已有运行可视为本任务的等价执行；同 workflow/branch/SHA 的运行参与去重和尝试预算。
+# 必须包含 workflow_dispatch。只有 schedule/push 确实构建 run.head_sha 且 inputs 等价时才加入；
+# 例如“构建昨日提交”的 nightly cron 不能算本任务成功。
+run_events = ["workflow_dispatch"]
+
+# 传给上方任务的 workflow_dispatch inputs；最多 25 项，允许字符串、布尔值和数字。
+# 名称和类型必须与该 workflow 的 on.workflow_dispatch.inputs 定义一致，不需要时删除本表。
+# 这里展示三类值，启用前替换为真实任务支持的 inputs；表内不要放 token 等凭据。
+[idle_workflows.tasks.inputs]
+channel = "nightly" # 字符串或 workflow 声明的 choice
+publish = true # 布尔值
+retention_days = 7 # 数字
+
+# 新增下一个任务时，先写 [[idle_workflows.tasks]]，避免把 workflow/branch 等误写进 inputs 表。
+# 重试重跑原 run，保留其 SHA/inputs；分支更新后不继续重试旧 SHA，取消的运行不自动重试。
+# 成功、取消、重试预算及不确定请求保存在 XERO_DATA_DIR/workflow-scheduler.sqlite（含 WAL）。
+# 重启或配置变化重新等待完整空闲窗口；已开始的构建不会被后来开发活动抢占取消。
+# 部署配套环境变量：IDLE_WORKFLOWS_ENABLED=false、IDLE_WORKFLOWS_POLL_INTERVAL_SECS=60
+# （轮询最少 15 秒）、XERO_DATA_DIR=/data；在 .env 中设置，不是 TOML 字段。
+# 合并队列的 MERGE_QUEUE_* 批量、CI 超时、轮询等部署配置仍见 .env.example 的合并队列一节。
 
 # 部署 / Operations
 # 按需订阅 Issue comment、Issues、Pull request、Push；原生审查队列再加 Pull request review。

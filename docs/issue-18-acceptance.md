@@ -78,3 +78,16 @@ git diff --check
   创建/路径触发和 idle 共存配置。复制此文件保留默认手动行为，自动规则为空且 idle 关闭。
 - 独立 opt-in 示例补全 PR CodeQL、PR 静态标签，覆盖所有创建事件白名单动作；
   现有 fixture 测试校验完整参考不会启用自动动作，以及显式启用示例的解析与语义。
+
+## 完整 CI 管理示例补齐
+
+2026-10-05 对照 main 的 `idle_workflows::config` 补齐 `example.toml` 中遗漏的实际配置块：
+当前及关联仓库 monitors、tasks 的 workflow/branch、重试间隔/次数、run_events，以及
+字符串/布尔/数字 inputs。默认保留 `enabled=false`；启用前需替换示例仓库、workflow 和 inputs。
+部署级 idle 轮询和 merge queue 参数标明其 `.env.example` 配置位置，不作为未知 TOML 字段加入。
+
+新增 `complete_reference_contains_valid_ci_monitors_tasks_and_dispatch_inputs`：先将原示例的
+idle 开关打开复现 `InvalidIdle`，补齐后通过真实解析与语义校验，并校验所有任务输入与
+`workflow_dispatch` 定义兼容；原有检查继续保证直接复制主示例时不会启用自动调度。
+
+本轮完整验收：522 项测试通过，0 失败、0 忽略；fmt、Clippy、Rustdoc、diff 和文档本地链接检查通过。

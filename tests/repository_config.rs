@@ -591,3 +591,54 @@ fn shipped_defaults_and_opt_in_examples_are_valid_and_separate() {
         .validate_deployment(&deployment)
         .unwrap();
 }
+
+/// The complete reference must remain usable when idle is enabled, rather than
+/// hiding missing tasks or invalid inputs behind the default disabled switch.
+#[test]
+fn complete_reference_contains_valid_ci_monitors_tasks_and_dispatch_inputs() {
+    let mut document: toml::Value = toml::from_str(include_str!("../example.toml")).unwrap();
+    document["idle_workflows"]["enabled"] = toml::Value::Boolean(true);
+    let config = parse(&toml::to_string(&document).unwrap());
+    assert!(config.problems().is_empty(), "{:?}", config.problems());
+    let idle = config.idle.unwrap().unwrap();
+    assert_eq!(idle.idle_minutes, 30);
+    assert_eq!(idle.monitors.len(), 2);
+    assert_eq!(idle.monitors[0].repository.as_deref(), Some(REPO));
+    assert_eq!(idle.monitors[0].workflows, ["ci.yml"]);
+    assert_eq!(
+        idle.monitors[1].repository.as_deref(),
+        Some("your-org/related-repository")
+    );
+    assert_eq!(idle.monitors[1].workflows, ["ci.yml"]);
+    assert_eq!(idle.tasks.len(), 1);
+    let task = &idle.tasks[0];
+    assert_eq!(task.workflow, "publish-image.yml");
+    assert_eq!(task.branch, "main");
+    assert_eq!(task.retry_interval_minutes, 15);
+    assert_eq!(task.max_retries, 2);
+    assert_eq!(task.run_events, ["workflow_dispatch"]);
+    assert_eq!(task.inputs["channel"], serde_json::json!("nightly"));
+    assert_eq!(task.inputs["publish"], serde_json::json!(true));
+    assert_eq!(task.inputs["retention_days"], serde_json::json!(7));
+    xero_bot::idle_workflows::config::validate_dispatch(
+        r#"
+on:
+  workflow_dispatch:
+    inputs:
+      channel:
+        type: choice
+        options: [nightly, stable]
+        required: true
+      publish:
+        type: boolean
+        required: true
+      retention_days:
+        type: number
+        required: true
+"#,
+        task,
+    )
+    .unwrap();
+    assert!(config.events.unwrap().is_empty());
+    assert!(config.paths.unwrap().rules.is_empty());
+}
