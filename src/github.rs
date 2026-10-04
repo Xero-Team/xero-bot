@@ -699,14 +699,27 @@ impl Client {
 
     /// Fetch and validate the complete current PR file list for a path trigger.
     /// The metadata read before and after pagination fences the list to one
-    /// base/head snapshot; a changed PR is retried by the caller on a later
-    /// webhook rather than executing against a partial or stale diff.
+    /// base/head snapshot; the caller retries a changed PR without executing
+    /// against a partial or stale diff.
     pub async fn list_pr_files_complete(
         &self,
         repo: &str,
         number: i64,
         snapshot: &Value,
     ) -> Result<Vec<Value>, GhError> {
+        for side in ["head", "base"] {
+            if snapshot[side]["sha"].as_str().is_none_or(str::is_empty) {
+                return Err(GhError::BadShape("PR snapshot missing SHA".into()));
+            }
+        }
+        if snapshot["changed_files"]
+            .as_u64()
+            .is_none_or(|count| count > 3000)
+        {
+            return Err(GhError::BadShape(
+                "PR changed_files is missing or exceeds the 3000-file API limit".into(),
+            ));
+        }
         let files = self
             .get_all(&format!("/repos/{repo}/pulls/{number}/files?per_page=100"))
             .await?;
@@ -719,6 +732,7 @@ impl Client {
             ));
         }
         Self::validate_pr_files(&files, snapshot, true)?;
+        Self::validate_pr_files(&files, &current, true)?;
         Ok(files)
     }
 
@@ -742,6 +756,22 @@ impl Client {
                 }
                 continue;
             };
+            if require_status
+                && !matches!(
+                    status,
+                    "added"
+                        | "removed"
+                        | "modified"
+                        | "renamed"
+                        | "copied"
+                        | "changed"
+                        | "unchanged"
+                )
+            {
+                return Err(GhError::BadShape(
+                    "PR file list has an unknown file status".into(),
+                ));
+            }
             if status == "renamed" && file["previous_filename"].as_str().is_none_or(str::is_empty) {
                 return Err(GhError::BadShape(
                     "renamed PR file is missing previous_filename".into(),

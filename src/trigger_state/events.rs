@@ -13,6 +13,12 @@ struct Plan {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
+struct PathSubscription {
+    rules: Vec<PathRule>,
+    config_sha: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
 struct PathPlan {
     rules: Vec<PathRule>,
     labels: Vec<String>,
@@ -518,13 +524,115 @@ async fn process_paths(
     };
     let state = cache.load(gh, key, &ctx.repo).await;
     let (config_sha, paths) = path_policy(&state, &ctx.repo)?;
-    let Some(paths) = paths else {
-        return Ok(());
+    // Freeze policy by source event as well as by the eventual current diff.
+    // A disabled event needs a durable empty subscription without scanning files.
+    let proposed = PathSubscription {
+        rules: paths
+            .filter(|paths| paths.events.contains(&event))
+            .map(|paths| {
+                paths
+                    .rules
+                    .iter()
+                    .filter_map(|rule| {
+                        let value = rule.value.as_ref().ok()?;
+                        if let Err(problem) = value.validate_deployment(cfg) {
+                            tracing::warn!(rule=%rule.id, "path rule refused: {problem}");
+                            return None;
+                        }
+                        Some(value.clone())
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        config_sha: config_sha.unwrap_or_default().into(),
     };
-    if paths.rules.is_empty() || !paths.events.contains(&event) {
+    let subscription: PathSubscription = serde_json::from_value(
+        runtime.store.path_subscription(
+            &json!([
+                "path-event",
+                ctx.repository_id,
+                ctx.thread_id,
+                event_name(event),
+                ctx.source_time,
+                ctx.head_sha,
+                ctx.base_sha
+            ])
+            .to_string(),
+            &serde_json::to_value(proposed)?,
+        )?,
+    )?;
+    let saved = runtime.store.path_plans(ctx)?;
+    if subscription.rules.is_empty() && saved.is_empty() {
+        return Ok(());
+    }
+    let mut deferred = false;
+    let mut needs_snapshot = subscription
+        .rules
+        .iter()
+        .any(|rule| path_rule_compatible(paths, cfg, event, rule));
+    for (_, value) in &saved {
+        for plan in serde_json::from_value::<Vec<PathPlan>>(value.clone())? {
+            if path_plan_compatible(paths, cfg, &plan) {
+                needs_snapshot |= plan.event == event;
+            } else if let Err(error) = execute_path(
+                runtime,
+                gh,
+                cfg,
+                ctx,
+                &serde_json::Value::Null,
+                &plan,
+                false,
+            )
+            .await
+            {
+                tracing::warn!(repo=%ctx.repo, "path revocation deferred: {error}");
+                deferred = true;
+            }
+        }
+    }
+    if deferred {
+        return Err("path revocation requires reconciliation".into());
+    }
+    if !needs_snapshot {
         return Ok(());
     }
     let mut pr = gh.get_pr(&ctx.repo, ctx.number).await?;
+    path_snapshot(&pr)?;
+    // Reconcile every frozen snapshot, including plans whose first claim was
+    // interrupted. A newer head must retire old writes instead of orphaning them.
+    for (_, value) in &saved {
+        for plan in serde_json::from_value::<Vec<PathPlan>>(value.clone())? {
+            let state = cache.load(gh, key, &ctx.repo).await;
+            let (_, current) = path_policy(&state, &ctx.repo)?;
+            let compatible = path_plan_compatible(current, cfg, &plan)
+                && pr["head"]["sha"].as_str() == Some(plan.head_sha.as_str())
+                && pr["base"]["sha"].as_str() == Some(plan.base_sha.as_str());
+            if compatible && plan.event != event {
+                continue;
+            }
+            if let Err(error) = execute_path(runtime, gh, cfg, ctx, &pr, &plan, compatible).await {
+                tracing::warn!(repo=%ctx.repo, "path recovery deferred: {error}");
+                deferred = true;
+            }
+        }
+    }
+    if deferred {
+        return Err("path plans require retry or reconciliation".into());
+    }
+    let state = cache.load(gh, key, &ctx.repo).await;
+    let (_, current) = path_policy(&state, &ctx.repo)?;
+    let usable: Vec<_> = subscription
+        .rules
+        .into_iter()
+        .filter(|rule| path_rule_compatible(current, cfg, event, rule))
+        .collect();
+    if usable.is_empty()
+        || saved
+            .iter()
+            .any(|(key, _)| key == &path_plan_key(ctx, event, &pr))
+    {
+        return Ok(());
+    }
     let files = {
         let mut snapshot = pr.clone();
         let mut last = None;
@@ -556,28 +664,8 @@ async fn process_paths(
         .as_str()
         .filter(|sha| !sha.is_empty())
         .ok_or("PR snapshot missing base SHA")?;
-    let plan_key = serde_json::json!([
-        "path-plan",
-        ctx.repository_id,
-        ctx.thread_id,
-        event_name(event),
-        head_sha,
-        base_sha
-    ])
-    .to_string();
+    let plan_key = path_plan_key(ctx, event, &pr);
     let proposed = {
-        let usable: Vec<PathRule> = paths
-            .rules
-            .iter()
-            .filter_map(|rule| {
-                let value = rule.value.as_ref().ok()?;
-                if let Err(problem) = value.validate_deployment(cfg) {
-                    tracing::warn!(rule=%rule.id, "path rule refused: {problem}");
-                    return None;
-                }
-                Some(value.clone())
-            })
-            .collect();
         let matched = crate::path_triggers::matched_rules(&usable, &files)
             .map_err(|problem| problem.to_string())?;
         let mut labels = BTreeMap::new();
@@ -600,7 +688,7 @@ async fn process_paths(
                 event,
                 head_sha: head_sha.into(),
                 base_sha: base_sha.into(),
-                config_sha: config_sha.unwrap_or_default().into(),
+                config_sha: subscription.config_sha,
             }]
         }
     };
@@ -612,19 +700,61 @@ async fn process_paths(
     for plan in plans {
         let state = cache.load(gh, key, &ctx.repo).await;
         let (_, current) = path_policy(&state, &ctx.repo)?;
-        let compatible = current.is_some_and(|paths| {
-            paths.events.contains(&plan.event)
-                && plan.rules.iter().all(|planned| {
-                    paths.rules.iter().any(|current| {
-                        current.value.as_ref().is_ok_and(|value| {
-                            value == planned && value.validate_deployment(cfg).is_ok()
-                        })
-                    })
-                })
-        });
+        let compatible = path_plan_compatible(current, cfg, &plan);
         execute_path(runtime, gh, cfg, ctx, &pr, &plan, compatible).await?;
     }
     Ok(())
+}
+
+/// A snapshot plan coalesces out-of-order deliveries that observe the same diff.
+fn path_plan_key(ctx: &EventContext, event: Event, pr: &serde_json::Value) -> String {
+    json!([
+        "path-plan",
+        ctx.repository_id,
+        ctx.thread_id,
+        event_name(event),
+        pr["head"]["sha"],
+        pr["base"]["sha"]
+    ])
+    .to_string()
+}
+
+/// Missing metadata is an outage, not evidence that a prior snapshot is stale.
+fn path_snapshot(pr: &serde_json::Value) -> Result<(&str, &str)> {
+    let head = pr["head"]["sha"]
+        .as_str()
+        .filter(|sha| !sha.is_empty())
+        .ok_or("PR snapshot missing head SHA")?;
+    let base = pr["base"]["sha"]
+        .as_str()
+        .filter(|sha| !sha.is_empty())
+        .ok_or("PR snapshot missing base SHA")?;
+    Ok((head, base))
+}
+
+/// Only unchanged, still-enabled rules retain execution authority.
+fn path_rule_compatible(
+    paths: Option<&Paths>,
+    cfg: &Config,
+    event: Event,
+    rule: &PathRule,
+) -> bool {
+    paths.is_some_and(|paths| {
+        paths.events.contains(&event)
+            && paths.rules.iter().any(|current| {
+                current
+                    .value
+                    .as_ref()
+                    .is_ok_and(|value| value == rule && value.validate_deployment(cfg).is_ok())
+            })
+    })
+}
+
+/// Revalidate every rule represented by a coalesced label request.
+fn path_plan_compatible(paths: Option<&Paths>, cfg: &Config, plan: &PathPlan) -> bool {
+    plan.rules
+        .iter()
+        .all(|rule| path_rule_compatible(paths, cfg, plan.event, rule))
 }
 
 /// Execute the one coalesced label action for a matched path snapshot.
@@ -637,14 +767,6 @@ async fn execute_path(
     plan: &PathPlan,
     compatible: bool,
 ) -> Result<()> {
-    let current = gh
-        .get(&format!("/repos/{}/pulls/{}", ctx.repo, ctx.number))
-        .await?;
-    if current["head"]["sha"].as_str() != Some(plan.head_sha.as_str())
-        || current["base"]["sha"].as_str() != Some(plan.base_sha.as_str())
-    {
-        return Err("PR changed before path label execution".into());
-    }
     let parent = serde_json::json!([
         "path",
         ctx.repository_id,
@@ -663,13 +785,17 @@ async fn execute_path(
         if old.state == State::Running {
             return Err("path action is owned by another worker".into());
         }
-        if !compatible {
+        let revoked = !compatible || old.state == State::Superseded;
+        if revoked {
             store.revoke_opened(&parent, now())?;
         }
         for child in store.children(&parent)? {
             if child.state == State::Unknown {
                 reconcile(store, gh, cfg.app_id.parse()?, &child, now()).await?;
             }
+        }
+        if revoked {
+            store.revoke_opened(&parent, now())?;
         }
         let children = store.children(&parent)?;
         if children
@@ -680,7 +806,7 @@ async fn execute_path(
                 "path label publication uncertain; operator reconciliation required".into(),
             );
         }
-        if !compatible
+        if revoked
             || matches!(
                 old.state,
                 State::Succeeded | State::Failed | State::Superseded
@@ -728,7 +854,22 @@ async fn execute_path(
             "base_sha": plan.base_sha,
         }),
     };
-    if !compatible {
+    // Inventory failures happen before claiming; they remain retryable. The
+    // final snapshot fence follows inventory pagination, immediately before writes.
+    let selected = if compatible {
+        present_path_labels(gh, ctx, &plan.labels).await?
+    } else {
+        Vec::new()
+    };
+    let snapshot_changed = if compatible {
+        let current = gh
+            .get(&format!("/repos/{}/pulls/{}", ctx.repo, ctx.number))
+            .await?;
+        path_snapshot(&current)? != (plan.head_sha.as_str(), plan.base_sha.as_str())
+    } else {
+        false
+    };
+    if !compatible || snapshot_changed {
         if let Some(claim) = store.claim(&spec, now())? {
             store.finish(
                 &claim,
@@ -738,11 +879,16 @@ async fn execute_path(
                 now(),
             )?;
         }
+        store.revoke_opened(&parent, now())?;
+        if snapshot_changed {
+            return Err("PR changed before path label execution".into());
+        }
         return Ok(());
     }
     let Some(claim) = store.claim(&spec, now())? else {
-        return Ok(());
+        return Err("path action already claimed or deferred".into());
     };
+    let selected = store.refresh_path_labels(&claim, &selected, now())?;
     store.mark_sent(&claim, now())?;
     let frame = Arc::new(Frame {
         store: store.clone(),
@@ -760,7 +906,10 @@ async fn execute_path(
     });
     let status = ACTIVE
         .scope(frame.clone(), async {
-            match add_present_labels(gh, ctx, &plan.labels).await {
+            if selected.is_empty() {
+                return "ok".into();
+            }
+            match gh.add_labels(&ctx.repo, ctx.number, &selected).await {
                 Ok(()) => "ok".into(),
                 Err(error) => format!("error: {error}"),
             }
@@ -776,10 +925,16 @@ async fn execute_path(
         });
     let state = if uncertain {
         State::Unknown
-    } else if status.contains("error") {
+    } else if status.contains("error") || children.iter().any(|child| child.state == State::Failed)
+    {
         State::Failed
     } else {
         State::Succeeded
+    };
+    let status = if state == State::Failed && status == "ok" {
+        "error: a prior path label request was rejected".to_string()
+    } else {
+        status
     };
     store.finish(
         &claim,
@@ -797,7 +952,11 @@ async fn execute_path(
 
 /// Path-trigger labels are best effort across matching rules: a removed or
 /// misspelled label must not block valid labels from another rule.
-async fn add_present_labels(gh: &Client, ctx: &EventContext, labels: &[String]) -> Result<()> {
+async fn present_path_labels(
+    gh: &Client,
+    ctx: &EventContext,
+    labels: &[String],
+) -> Result<Vec<String>> {
     let available = gh
         .get_all(&format!("/repos/{}/labels?per_page=100", ctx.repo))
         .await?;
@@ -811,10 +970,11 @@ async fn add_present_labels(gh: &Client, ctx: &EventContext, labels: &[String]) 
         .collect::<std::result::Result<Vec<_>, _>>()?;
     let mut selected: Vec<String> = Vec::new();
     for wanted in labels {
-        if let Some(name) = names.iter().find(|name| name.eq_ignore_ascii_case(wanted)) {
+        let wanted_key = wanted.to_lowercase();
+        if let Some(name) = names.iter().find(|name| name.to_lowercase() == wanted_key) {
             if !selected
                 .iter()
-                .any(|current| current.eq_ignore_ascii_case(name))
+                .any(|current| current.to_lowercase() == wanted_key)
             {
                 selected.push((*name).to_string());
             }
@@ -822,8 +982,5 @@ async fn add_present_labels(gh: &Client, ctx: &EventContext, labels: &[String]) 
             tracing::warn!(repo=%ctx.repo, label=%wanted, "path label does not exist; skipped");
         }
     }
-    if !selected.is_empty() {
-        gh.add_labels(&ctx.repo, ctx.number, &selected).await?;
-    }
-    Ok(())
+    Ok(selected)
 }

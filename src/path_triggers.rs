@@ -11,7 +11,14 @@ use crate::config::repository::{PathRule, Problem, ReasonCode};
 
 enum GlobSegment {
     AnyDepth,
-    Pattern(glob::Pattern),
+    Pattern(Vec<GlobPiece>),
+}
+
+/// Fixed-width glob fragments separated by `*`. Keeping stars outside the
+/// library avoids its recursive backtracking while retaining Unicode `?`.
+struct GlobPiece {
+    pattern: glob::Pattern,
+    width: usize,
 }
 
 struct CompiledGlob {
@@ -29,9 +36,10 @@ pub(crate) fn valid_glob(pattern: &str) -> bool {
     if pattern.is_empty()
         || pattern.starts_with('/')
         || pattern.contains('\\')
+        || pattern.contains('\0')
         || pattern
             .split('/')
-            .any(|segment| segment == ".." || segment.is_empty())
+            .any(|segment| matches!(segment, "." | ".." | ""))
         || pattern
             .chars()
             .any(|ch| matches!(ch, '!' | '{' | '}' | '[' | ']'))
@@ -46,6 +54,12 @@ pub(crate) fn valid_glob(pattern: &str) -> bool {
 
 /// Compile each non-recursive segment once and collapse adjacent `**` segments.
 fn compile_glob(pattern: &str) -> Result<CompiledGlob, Problem> {
+    if !valid_glob(pattern) {
+        return Err(Problem::new(
+            ReasonCode::InvalidRule,
+            "invalid path glob pattern",
+        ));
+    }
     let mut segments = Vec::new();
     for segment in pattern.split('/') {
         if segment == "**" {
@@ -53,36 +67,71 @@ fn compile_glob(pattern: &str) -> Result<CompiledGlob, Problem> {
                 segments.push(GlobSegment::AnyDepth);
             }
         } else {
-            segments.push(GlobSegment::Pattern(glob::Pattern::new(segment).map_err(
-                |_| Problem::new(ReasonCode::InvalidRule, "invalid path glob pattern"),
-            )?));
+            let pieces = segment
+                .split('*')
+                .map(|piece| {
+                    Ok(GlobPiece {
+                        pattern: glob::Pattern::new(piece).map_err(|_| {
+                            Problem::new(ReasonCode::InvalidRule, "invalid path glob pattern")
+                        })?,
+                        width: piece.chars().count(),
+                    })
+                })
+                .collect::<Result<_, Problem>>()?;
+            segments.push(GlobSegment::Pattern(pieces));
         }
     }
     Ok(CompiledGlob { segments })
 }
 
-/// Match repository path segments with a bounded dynamic-programming table.
+/// Match segment stars in polynomial time, at Unicode character boundaries.
+fn segment_matches(pieces: &[GlobPiece], path: &str) -> bool {
+    let offsets: Vec<_> = path
+        .char_indices()
+        .map(|(i, _)| i)
+        .chain([path.len()])
+        .collect();
+    let count = offsets.len() - 1;
+    let mut next = vec![false; count + 1];
+    next[count] = true;
+    for (index, piece) in pieces.iter().enumerate().rev() {
+        let mut row = vec![false; count + 1];
+        for start in (0..=count).rev() {
+            let end = start + piece.width;
+            row[start] = end <= count
+                && next[end]
+                && piece.pattern.matches(&path[offsets[start]..offsets[end]]);
+            if index > 0 && start < count {
+                row[start] |= row[start + 1];
+            }
+        }
+        next = row;
+    }
+    next[0]
+}
+
+/// Match repository path segments with a rolling dynamic-programming row.
 fn path_matches(pattern: &CompiledGlob, paths: &[&str]) -> bool {
-    let pattern_count = pattern.segments.len();
     let path_count = paths.len();
-    let mut dp = vec![vec![false; path_count + 1]; pattern_count + 1];
-    dp[pattern_count][path_count] = true;
-    for pattern_index in (0..pattern_count).rev() {
+    let mut next = vec![false; path_count + 1];
+    next[path_count] = true;
+    for segment in pattern.segments.iter().rev() {
+        let mut row = vec![false; path_count + 1];
         for path_index in (0..=path_count).rev() {
-            dp[pattern_index][path_index] = match &pattern.segments[pattern_index] {
+            row[path_index] = match segment {
                 GlobSegment::AnyDepth => {
-                    dp[pattern_index + 1][path_index]
-                        || (path_index < path_count && dp[pattern_index][path_index + 1])
+                    next[path_index] || (path_index < path_count && row[path_index + 1])
                 }
                 GlobSegment::Pattern(segment) => {
                     path_index < path_count
-                        && segment.matches(paths[path_index])
-                        && dp[pattern_index + 1][path_index + 1]
+                        && next[path_index + 1]
+                        && segment_matches(segment, paths[path_index])
                 }
             };
         }
+        next = row;
     }
-    dp[0][0]
+    next[0]
 }
 
 /// Reject paths that are not safe repository-relative slash-separated names.
@@ -90,9 +139,10 @@ fn valid_repo_path(path: &str) -> bool {
     !path.is_empty()
         && !path.starts_with('/')
         && !path.contains('\\')
+        && !path.contains('\0')
         && !path
             .split('/')
-            .any(|segment| segment.is_empty() || segment == "..")
+            .any(|segment| matches!(segment, "." | ".." | ""))
 }
 
 /// Apply include and exclude patterns to one repository-relative path.
@@ -248,5 +298,80 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err.code, ReasonCode::InvalidResponse);
+    }
+
+    #[test]
+    fn segment_dp_preserves_glob_semantics_for_small_unicode_patterns() {
+        let mut patterns = vec![String::new()];
+        let mut paths = vec![String::new()];
+        for _ in 0..4 {
+            patterns.extend(
+                patterns
+                    .clone()
+                    .into_iter()
+                    .flat_map(|s| ['a', '文', '?', '*'].map(|ch| format!("{s}{ch}"))),
+            );
+            paths.extend(
+                paths
+                    .clone()
+                    .into_iter()
+                    .flat_map(|s| ['a', '文', '.'].map(|ch| format!("{s}{ch}"))),
+            );
+        }
+        patterns.sort();
+        patterns.dedup();
+        paths.sort();
+        paths.dedup();
+        for pattern in patterns.into_iter().filter(|p| valid_glob(p)) {
+            let compiled = compile_glob(&pattern).unwrap();
+            let original = glob::Pattern::new(&pattern).unwrap();
+            for path in &paths {
+                assert_eq!(
+                    path_matches(&compiled, &[path]),
+                    original.matches(path),
+                    "{pattern:?} / {path:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn repeated_directory_and_segment_stars_have_bounded_cost() {
+        let pattern = format!("{}x", "**/a/".repeat(32));
+        assert!(!path_matches(
+            &compile_glob(&pattern).unwrap(),
+            &vec!["a"; 128]
+        ));
+        let pattern = format!("{}b", "*a".repeat(32));
+        assert!(!path_matches(
+            &compile_glob(&pattern).unwrap(),
+            &[&"a".repeat(128)]
+        ));
+        assert!(path_matches(
+            &compile_glob("文?/*明?.rs").unwrap(),
+            &["文档", "说明文.rs"]
+        ));
+    }
+
+    #[test]
+    fn invalid_new_or_previous_paths_fail_the_entire_match() {
+        for invalid in [
+            "",
+            "/src/lib.rs",
+            "src/../lib.rs",
+            "src/./lib.rs",
+            "src//lib.rs",
+            "src\\lib.rs",
+            "src/\0.rs",
+        ] {
+            for old in [false, true] {
+                let file = if old {
+                    json!({"filename":"src/lib.rs","status":"renamed","previous_filename":invalid})
+                } else {
+                    json!({"filename":invalid,"status":"removed"})
+                };
+                assert!(matched_rules(&[rule(&["**"], &[])], &[file]).is_err());
+            }
+        }
     }
 }

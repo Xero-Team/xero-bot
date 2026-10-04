@@ -108,7 +108,7 @@ pub async fn reconcile(
                 labels.iter().any(|label| {
                     label["name"]
                         .as_str()
-                        .is_some_and(|current| current.eq_ignore_ascii_case(name))
+                        .is_some_and(|current| current.to_lowercase() == name.to_lowercase())
                 })
             })
         });

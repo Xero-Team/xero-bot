@@ -6,6 +6,9 @@ static REVIEW_TEST: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 #[path = "event_review_tests.rs"]
 mod review_fixes;
 
+#[path = "path_review_tests.rs"]
+mod path_review_fixes;
+
 fn opened(pr: bool) -> EventContext {
     let thread = json!({"id":88,"number":3,"created_at":"2026-10-02T01:00:00Z",
         "user":{"id":5,"login":"alice","type":"User"},"draft":true,
