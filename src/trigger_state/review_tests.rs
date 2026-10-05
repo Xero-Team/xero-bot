@@ -447,3 +447,110 @@ async fn delete_204_is_succeeded_in_a_durable_frame_and_not_repeated() {
     assert_eq!(runtime.store.list(Some(State::Succeeded)).unwrap().len(), 3);
     assert!(runtime.store.list(Some(State::Unknown)).unwrap().is_empty());
 }
+
+/// Retrying the unsent assignment after a successful reviewer request must
+/// preserve the confirmed reviewer response without issuing a second request.
+#[tokio::test]
+async fn audit_reviewer_receipt_survives_partial_command_recovery() {
+    let dir = Dir::new();
+    let runtime = Runtime::open(&dir.0).unwrap();
+    let server = MockServer::start().await;
+    let gh = client(&server);
+    policy(&server, "").await;
+    response(
+        &server,
+        "GET",
+        "/repos/example/project/pulls/3",
+        200,
+        json!({"head":{"sha":"head"},"base":{"sha":"base"}}),
+    )
+    .await;
+    response(
+        &server,
+        "GET",
+        "/repos/example/project/pulls/3/commits",
+        200,
+        json!([]),
+    )
+    .await;
+    Mock::given(method("POST"))
+        .and(path("/repos/example/project/pulls/3/requested_reviewers"))
+        .respond_with(
+            ResponseTemplate::new(201).set_body_json(
+                json!({"requested_reviewers":[{"login":"bob","private":"discard"}]}),
+            ),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    response(
+        &server,
+        "POST",
+        "/repos/example/project/issues/3/assignees",
+        503,
+        json!({"message":"uncertain"}),
+    )
+    .await;
+    response(
+        &server,
+        "POST",
+        "/repos/example/project/issues/3/comments",
+        201,
+        json!({"id":45}),
+    )
+    .await;
+    let mut ctx = context();
+    ctx.is_pr = true;
+    ctx.body = Some("r? @bob".into());
+    let cache = RepositoryConfigCache::default();
+    assert!(runtime.process(&gh, &cfg(), &cache, &ctx).await.is_err());
+    let interrupted = runtime
+        .store
+        .list(Some(State::Unknown))
+        .unwrap()
+        .into_iter()
+        .find(|op| op.spec.request["route"] == "/repos/example/project/issues/3/assignees")
+        .unwrap();
+    runtime
+        .store
+        .administer(
+            &interrupted.spec.key,
+            "confirm-not-sent",
+            "Fixture proxy proves no upstream write",
+            crate::github::chrono_now_secs(),
+        )
+        .unwrap();
+    Mock::given(method("POST"))
+        .and(path("/repos/example/project/issues/3/assignees"))
+        .respond_with(
+            ResponseTemplate::new(201).set_body_json(json!({"assignees":[{"login":"bob"}]})),
+        )
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    runtime.process(&gh, &cfg(), &cache, &ctx).await.unwrap();
+    let requests = server.received_requests().await.unwrap();
+    let reply = requests
+        .iter()
+        .find(|r| r.method == "POST" && r.url.path().ends_with("/comments"))
+        .unwrap();
+    let body = serde_json::from_slice::<Value>(&reply.body).unwrap();
+    assert!(
+        body["body"]
+            .as_str()
+            .unwrap()
+            .contains("✅ Requested a review from @bob."),
+        "{body}"
+    );
+    let receipt = runtime
+        .store
+        .list(None)
+        .unwrap()
+        .into_iter()
+        .find(|op| op.spec.request["route"] == "/repos/example/project/pulls/3/requested_reviewers")
+        .unwrap();
+    assert_eq!(
+        receipt.result.unwrap(),
+        json!({"requested_reviewers":[{"login":"bob"}]})
+    );
+}

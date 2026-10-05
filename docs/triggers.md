@@ -52,6 +52,12 @@ on a PR it requests review. Mention modes never grant repository rights.
 also check the credited user. Self-approval is refused. Revoked or unknown
 permissions cannot be replaced with old session evidence.
 
+Manual `label` / `relabel` cannot add or remove the deployment's queued/testing
+control labels, even when approval commands or the queue are disabled. Use `r+`
+or `r-` for queue changes so their trigger and permission checks apply.
+HTML comments are hidden content and do not supply command or mention evidence;
+comments authored by any GitHub Bot account are ignored before persistence.
+
 ## Sessions and dynamic help
 
 Post a new valid `@bot help` (using the deployment's bot name) after upgrading:
@@ -85,6 +91,9 @@ missed events are recovered at expiry. Configuration is fetched at an immutable
 commit, not from the PR. Only a file 404 after successful repository/default-ref
 reads means absent; 403/429/5xx, transport or malformed responses are failures.
 
+Each command in a combined comment rechecks current policy before it starts,
+including disabled modes, mention requirements and the current session TTL.
+Path labels recheck policy after inventory/snapshot reads and before writing.
 After expiry/invalidation, a failed refresh blocks related actions; an older
 snapshot is **reference only**, never executable. Unknown fields/types or invalid
 TOML reject the whole document. Semantic errors disable the affected domain or

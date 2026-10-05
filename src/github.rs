@@ -796,23 +796,18 @@ impl Client {
 
     /// Is this review or comment one of ours?
     ///
-    /// The marker decides first, and the author only as a fallback. Recognising
-    /// our own output by *content* is what makes it findable at all after
-    /// [`Client::post_review`] degrades to a plain issue comment — that review
-    /// isn't in the reviews list, so identity-by-author lost it entirely and
-    /// the next incremental run re-reported everything it had already said.
+    /// The App author is the trust boundary. The body marker remains part of
+    /// the output format for recovery and human inspection, but it is public
+    /// text and can be copied by any contributor, so it must never authenticate
+    /// a result on its own.
     fn looks_like_ours(v: &Value, slug: &str) -> bool {
-        let body = v.get("body").and_then(|b| b.as_str()).unwrap_or("");
-        if body.contains(REVIEW_MARKER) {
-            return true;
-        }
         if slug.is_empty() {
             return false;
         }
-        v.pointer("/user/login")
-            .and_then(|l| l.as_str())
-            .map(|l| normalize_login(l) == slug)
-            .unwrap_or(false)
+        v["user"]["type"] == "Bot"
+            && v["user"]["login"]
+                .as_str()
+                .is_some_and(|login| login.eq_ignore_ascii_case(&format!("{slug}[bot]")))
     }
 
     /// Previous reviews left by this bot, newest last (incremental review
@@ -833,14 +828,13 @@ impl Client {
         let slug = normalize_login(&self.app_slug);
         if slug.is_empty() {
             tracing::warn!(
-                "app_slug is empty on {repo}#{number}; own reviews are identifiable \
-                 only by their marker"
+                "app_slug is empty on {repo}#{number}; own reviews cannot be identified safely"
             );
         }
         let reviews = self.list_pr_reviews(repo, number).await?;
         let mine: Vec<Value> = reviews
             .into_iter()
-            .filter(|r| Self::looks_like_ours(r, &slug))
+            .filter(|r| Self::looks_like_ours(r, &slug) && r["state"] == "COMMENTED")
             .collect();
         if !mine.is_empty() {
             return Ok(mine);
@@ -851,7 +845,12 @@ impl Client {
             .list_issue_comments(repo, number)
             .await?
             .into_iter()
-            .filter(|c| Self::looks_like_ours(c, &slug))
+            .filter(|c| {
+                Self::looks_like_ours(c, &slug)
+                    && c["body"]
+                        .as_str()
+                        .is_some_and(|body| body.lines().any(|line| line == REVIEW_MARKER))
+            })
             .map(|mut c| {
                 // Hand them back in the shape a review has, so the caller
                 // needn't know which source answered. `submitted_at` is what
@@ -987,7 +986,11 @@ impl Client {
                         .await
                     {
                         Ok(_) => return Ok(ReviewPostMode::InlineDropped),
-                        Err(e) => tracing::warn!("review without inline comments failed too: {e}"),
+                        Err(GhError::Api {
+                            status: 403 | 404 | 422,
+                            ..
+                        }) => {}
+                        Err(e) => return Err(e),
                     }
                 }
             }

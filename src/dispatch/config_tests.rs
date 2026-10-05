@@ -666,3 +666,134 @@ async fn help_after_another_command_revalidates_expired_policy_and_disabled_gate
         }
     }
 }
+
+/// A slow first command expires policy. Every sibling must honor disabled,
+/// stricter mention/session gates and outages, retaining its original source.
+#[tokio::test]
+async fn audit_all_sibling_commands_revalidate_policy() {
+    for (replacement, text, expected, allowed) in [
+        (
+            "cc={mode='disabled'}",
+            "@bot ping; cc @bob",
+            "Disabled",
+            false,
+        ),
+        (
+            "cc={mode='always_mention'}",
+            "@bot ping\ncc @bob",
+            "MentionRequired",
+            false,
+        ),
+        (
+            "cc={mode='mention_once'}",
+            "@bot ping\ncc @bob",
+            "SessionRequired",
+            false,
+        ),
+        (
+            "cc={mode='always_mention'}",
+            "@bot ping; cc @bob",
+            "cc @bob",
+            true,
+        ),
+        (
+            "outage",
+            "@bot ping; cc @bob",
+            "expired reference only",
+            false,
+        ),
+    ] {
+        let f = Fixture::new("").await;
+        let changed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = changed.clone();
+        Mock::given(method("GET")).and(path(format!("/repos/{REPO}/contents/{CONFIG_PATH}")))
+            .respond_with(move |_: &wiremock::Request| {
+                if observed.load(Ordering::SeqCst) && replacement == "outage" {
+                    return ResponseTemplate::new(503);
+                }
+                let text = if observed.load(Ordering::SeqCst) { format!("[command_triggers]\n{replacement}") } else { String::new() };
+                ResponseTemplate::new(200).set_body_json(json!({"type":"file","encoding":"base64","sha":"blob","content":base64::engine::general_purpose::STANDARD.encode(text)}))
+            }).with_priority(1).mount(&f.server).await;
+        let clock = f.clock.clone();
+        Mock::given(method("POST"))
+            .and(path(format!("/repos/{REPO}/issues/1/comments")))
+            .respond_with(move |request: &wiremock::Request| {
+                let body: Value = serde_json::from_slice(&request.body).unwrap();
+                if body["body"].as_str().unwrap().starts_with("pong") {
+                    changed.store(true, Ordering::SeqCst);
+                    clock.0.store(60, Ordering::SeqCst);
+                }
+                ResponseTemplate::new(201).set_body_json(json!({"id":99}))
+            })
+            .with_priority(1)
+            .mount(&f.server)
+            .await;
+        let Routing::Act(mut work) = f.route(text, 1) else {
+            panic!("not routed")
+        };
+        if let Work::Comment { is_pr, .. } = &mut work {
+            *is_pr = false;
+        }
+        let result = execute_comment_with_client(&f.gh, &f.cfg, &f.cache, work).await;
+        assert_eq!(result.is_err(), replacement == "outage");
+        let replies: Vec<_> = f
+            .server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.method == "POST")
+            .map(|r| {
+                serde_json::from_slice::<Value>(&r.body).unwrap()["body"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect();
+        assert_eq!(replies.len(), 2, "{replacement}: {replies:?}");
+        assert!(replies[1].contains(expected), "{replacement}: {replies:?}");
+        assert_eq!(replies[1].starts_with("cc @bob"), allowed);
+    }
+}
+
+/// Custom queue labels accepted by the parser must not let ordinary comments
+/// enqueue or withdraw a PR while approval commands are disabled.
+#[tokio::test]
+async fn audit_manual_labels_cannot_bypass_approval_authority() {
+    for text in [
+        "@bot label +queued",
+        "@bot relabel -TESTING",
+        "@bot label +bug +Queued",
+    ] {
+        let mut f =
+            Fixture::new("[command_triggers]\n'r+'={mode='disabled'}\n'r-'={mode='disabled'}")
+                .await;
+        f.cfg.label_merge_queue_queued = "queued".into();
+        f.cfg.label_merge_queue_testing = "testing".into();
+        f.comment(text, 1).await;
+        assert_eq!(
+            f.server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|r| r.method != "GET")
+                .count(),
+            1
+        );
+        assert!(f
+            .server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .all(|r| r.method == "GET" || r.url.path().ends_with("/comments")));
+        assert!(f
+            .server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .any(|r| String::from_utf8_lossy(&r.body).contains("Merge queue control labels")));
+    }
+}

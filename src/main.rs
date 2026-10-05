@@ -486,6 +486,25 @@ mod trigger_ingress_tests {
         assert!(s.triggers.store.inbox_status().unwrap().is_empty());
     }
 
+    /// Third-party bot output can quote live command examples; it must never
+    /// enter the human-command inbox or start a bot-to-bot loop.
+    #[tokio::test]
+    async fn audit_third_party_bot_comments_do_not_enter_inbox() {
+        let dir = Dir::new();
+        let s = state(&dir);
+        for text in ["claim", "cc @alice", "@bot review", "@bot help", "@bot r+"] {
+            let mut event = payload();
+            event["comment"]["body"] = json!(text);
+            event["comment"]["user"] = json!({"id":99,"login":"review-service[bot]","type":"Bot"});
+            event["comment"]["performed_via_github_app"] = json!({"id":999});
+            let body = serde_json::to_vec(&event).unwrap();
+            let (status, result) = webhook(State(s.clone()), signed(&body), body.into()).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(result.0["ignored"], "bot comment");
+        }
+        assert!(s.triggers.store.inbox_status().unwrap().is_empty());
+    }
+
     /// Opened Issue acknowledgements reflect durable admission; edited and
     /// reopened Issues do not create work or re-run opened subscriptions.
     #[tokio::test]

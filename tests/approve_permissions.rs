@@ -386,3 +386,41 @@ fn help_text_tells_the_truth_about_the_switch() {
         );
     }
 }
+
+/// Direct handler callers also cannot use the App's label rights to bypass
+/// approval policy, for either default or custom queue label spellings.
+#[tokio::test]
+async fn audit_direct_label_handler_refuses_queue_controls() {
+    let server = MockServer::start().await;
+    allow_comments(&server).await;
+    let mut config = test_cfg(false);
+    config.label_merge_queue_queued = "Ärea/Queue".into();
+    config.label_merge_queue_testing = "testing".into();
+    for command in [
+        Command::Label {
+            add: vec!["ärea/queue".into()],
+            remove: vec![],
+        },
+        Command::Label {
+            add: vec!["bug".into()],
+            remove: vec!["TESTING".into()],
+        },
+    ] {
+        assert_eq!(
+            handle_comment(
+                &client_for(&server),
+                &config,
+                &ctx("bob"),
+                vec![command],
+                vec![]
+            )
+            .await,
+            vec!["control-label-denied"]
+        );
+    }
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(requests
+        .iter()
+        .all(|r| r.method == "POST" && r.url.path().ends_with("/comments")));
+}

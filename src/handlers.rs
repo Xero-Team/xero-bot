@@ -264,8 +264,24 @@ async fn handle_one(
             set_status_label(gh, cfg, ctx, cmd).await
         }
         Command::Label { add, remove } => {
-            // permission gate: label changes require at least triage access —
-            // GitHub enforces this API-side; we just try and report.
+            // GitHub authenticates the App, not the commenter. Never let a
+            // general label command bypass approval/withdrawal authorization.
+            if let Err(refusal) = authorize(
+                gh,
+                cfg,
+                ctx,
+                &Command::Label {
+                    add: add.clone(),
+                    remove: remove.clone(),
+                },
+            )
+            .await
+            {
+                let _ = gh
+                    .post_issue_comment(&ctx.repo, ctx.pr_number, &refusal.message)
+                    .await;
+                return refusal.status.into();
+            }
             let mut ok = true;
             if !add.is_empty() {
                 if let Err(e) = gh.add_labels(&ctx.repo, ctx.pr_number, &add).await {

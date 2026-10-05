@@ -42,7 +42,8 @@ async fn require_write(
 }
 
 /// Run before candidate resolution/session creation and again immediately before
-/// the privileged handler. Non-approval commands keep their existing authority.
+/// the privileged handler. General label commands cannot mutate queue control
+/// labels; other non-approval commands keep their existing authority.
 pub(crate) async fn authorize(
     gh: &Client,
     cfg: &Config,
@@ -50,6 +51,24 @@ pub(crate) async fn authorize(
     command: &Command,
 ) -> Result<(), Refusal> {
     let lang = ctx.lang;
+    if let Command::Label { add, remove } = command {
+        if add.iter().chain(remove).any(|label| {
+            [
+                &cfg.label_merge_queue_queued,
+                &cfg.label_merge_queue_testing,
+            ]
+            .iter()
+            .any(|reserved| !reserved.is_empty() && label.to_lowercase() == reserved.to_lowercase())
+        }) {
+            return Err(Refusal {
+                code: ReasonCode::PermissionDenied,
+                status: "control-label-denied",
+                message: t!(lang,
+                    "⚠️ Merge queue control labels cannot be changed with `label`; use the permission-checked `r+` / `r-` commands.",
+                    "⚠️ 不能用 `label` 修改合并队列控制标签；请使用会校验权限的 `r+` / `r-` 指令。"),
+            });
+        }
+    }
     let Command::Approve { on_behalf_of } = command else {
         return if matches!(command, Command::Reject) {
             require_write(gh, ctx, &ctx.commenter, false).await
