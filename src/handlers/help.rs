@@ -127,8 +127,8 @@ fn description(id: CommandId, lang: Lang) -> &'static str {
             "报告与本次改动相关的现有 CodeQL 告警",
         ),
         CommandId::Label => (
-            "`label +a -b`: add/remove labels",
-            "`label +a -b`：添加/移除标签",
+            "`label +a -b`: add/remove labels; queue control labels forbidden",
+            "`label +a -b`：添加/移除标签；禁止修改队列控制标签",
         ),
         CommandId::Assign => ("`assign @user`: assign a user", "`assign @user`：指派用户"),
         CommandId::Author => ("Waiting on author", "等待作者"),

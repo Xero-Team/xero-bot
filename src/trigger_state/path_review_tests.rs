@@ -588,3 +588,50 @@ async fn malformed_complete_diff_records_and_snapshots_never_produce_partial_lab
         3000
     );
 }
+
+/// A push invalidating policy while label inventory is read must veto the
+/// imminent write. Outages stay retryable; disabled rules become superseded.
+#[tokio::test]
+async fn audit_path_labels_recheck_policy_after_inventory() {
+    for outage in [false, true] {
+        let dir = Dir::new();
+        let runtime = Runtime::open(&dir.0).unwrap();
+        let server = MockServer::start().await;
+        path_fixture(&server, path_rules(), json!([{"name":"area/rust"}]), 200).await;
+        let cache = Arc::new(RepositoryConfigCache::default());
+        let invalidator = cache.clone();
+        let changed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let changed_read = changed.clone();
+        Mock::given(method("GET"))
+            .and(path("/repos/example/project/labels"))
+            .respond_with(move |_: &wiremock::Request| {
+                changed.store(true, Ordering::SeqCst);
+                invalidator.invalidate(crate::config::cache::RepositoryKey {
+                    installation_id: 7,
+                    repository_id: 9,
+                });
+                ResponseTemplate::new(200).set_body_json(json!([{"name":"area/rust"}]))
+            })
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET")).and(path("/repos/example/project/contents/.github/xero-bot.toml"))
+            .respond_with(move |_: &wiremock::Request| {
+                let changed = changed_read.load(Ordering::SeqCst);
+                if changed && outage { return ResponseTemplate::new(503); }
+                let text = if changed { "[command_triggers]\nlabel={mode='disabled'}" } else { path_rules() };
+                ResponseTemplate::new(200).set_body_json(json!({"sha":"blob","type":"file","encoding":"base64","content":base64::engine::general_purpose::STANDARD.encode(text)}))
+            }).with_priority(1).mount(&server).await;
+        let result = runtime
+            .process(&client(&server), &cfg(), &cache, &path_sync())
+            .await;
+        assert_eq!(result.is_err(), outage);
+        assert!(
+            writes(&server).await.is_empty(),
+            "revoked or unverified labels were posted"
+        );
+        if !outage {
+            assert_eq!(path_parent(&runtime).state, State::Superseded);
+        }
+    }
+}

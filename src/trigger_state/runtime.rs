@@ -148,11 +148,13 @@ pub(super) fn receipt(value: &Value) -> Value {
             result[key] = v.clone();
         }
     }
-    if let Some(users) = value["assignees"].as_array() {
-        result["assignees"] = json!(users
-            .iter()
-            .map(|u| json!({"login":u["login"]}))
-            .collect::<Vec<_>>());
+    for key in ["assignees", "requested_reviewers"] {
+        if let Some(users) = value[key].as_array() {
+            result[key] = json!(users
+                .iter()
+                .map(|u| json!({"login":u["login"]}))
+                .collect::<Vec<_>>());
+        }
     }
     result
 }
@@ -234,6 +236,19 @@ pub(crate) fn snapshot(config: &str, head: Option<&str>, base: Option<&str>) -> 
             head.map(str::to_owned),
             base.map(str::to_owned),
         );
+    }
+    Ok(())
+}
+
+/// Update the policy identity after a sibling command required revalidation,
+/// retaining the PR snapshot used to fence command recovery.
+pub(crate) fn configuration(config: &str) -> Result<()> {
+    if let Ok(frame) = ACTIVE.try_with(Arc::clone) {
+        frame
+            .snapshot
+            .lock()
+            .map_err(|_| "snapshot mutex poisoned")?
+            .0 = Some(config.into());
     }
     Ok(())
 }

@@ -199,7 +199,7 @@ async fn list_pr_reviews_follows_the_link_header_to_the_last_page() {
         .and(query_param("page", "2"))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_body_json(json!([{"id": 2, "user": {"login": "xero-review[bot]"}}])),
+                .set_body_json(json!([{"id": 2, "state": "COMMENTED", "user": {"login": "xero-review[bot]", "type": "Bot"}}])),
         )
         .expect(2)
         .mount(&server)

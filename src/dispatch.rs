@@ -71,6 +71,12 @@ pub fn route_event(cfg: &Config, event_header: &str, payload: &Value) -> Routing
                 }
             }
 
+            // Review/CI bots quote user content and command examples. Their
+            // output is never a human instruction, even for no_mention modes.
+            if commenter_is_bot {
+                return Routing::Respond(serde_json::json!({"ignored": "bot comment"}));
+            }
+
             // The parser indexes into arbitrary user text. A panic here would kill
             // the webhook response, and GitHub redelivers on failure — so a single
             // bad comment becomes a loop. Contain it at the entry point.
@@ -560,20 +566,11 @@ pub(crate) async fn execute_comment_with_client(
     for (problem, message) in &blocked {
         report_config_problem(gh, cache, key, &repo, pr_number, problem, message).await;
     }
-    let session_commands: Vec<_> = permitted
+    let explicit_commands: Vec<_> = permitted
         .iter()
-        .filter(|candidate| {
-            policy.mode(candidate.id()) == ManualMode::MentionOnce
-                && !candidate.is_explicit()
-                && !permitted
-                    .iter()
-                    .any(|other| other.command == candidate.command && other.is_explicit())
-        })
+        .filter(|candidate| candidate.is_explicit())
         .map(|candidate| candidate.command.clone())
         .collect();
-    let help_explicit = permitted.iter().any(|candidate| {
-        candidate.command == crate::commands::Command::Help && candidate.is_explicit()
-    });
     let commands = resolve_commands(&cfg.bot_name, permitted, &mut diagnostics);
     if commands.is_empty() && diagnostics.is_empty() {
         return Ok(());
@@ -613,74 +610,54 @@ pub(crate) async fn execute_comment_with_client(
     let diagnostics: Vec<String> = diagnostics.iter().map(|d| d.message(lang)).collect();
     let mut results = handle_comment(gh, cfg, &ctx, vec![], diagnostics).await;
     for command in commands {
-        // A preceding review may have run for minutes. Recheck TTL and rights
-        // at execution rather than carrying a cached grant into later commands.
-        if session_commands.contains(&command) {
-            let problem = match session_valid(call.as_ref(), policy.ttl_days) {
-                Ok(true) => None,
-                Ok(false) => Some(Problem::new(ReasonCode::SessionRequired, "session expired")),
-                Err(_) => Some(Problem::new(
+        // Each command starts with current policy, including the first one after
+        // potentially slow permission/PR lookups. A prior command cannot lend
+        // an expired snapshot, old TTL or weaker mention mode to its siblings.
+        let current = cache.load(gh, key, &repo).await;
+        let checked = current.snapshot().and_then(|s| s.config.comments.as_ref());
+        let current_policy = match checked {
+            Ok(policy) => policy,
+            Err(problem) => {
+                let message = current
+                    .diagnostic(lang)
+                    .unwrap_or_else(|| problem.message(lang));
+                report_config_problem(gh, cache, key, &repo, pr_number, problem, &message).await;
+                return Err(format!("configuration unavailable: {problem}"));
+            }
+        };
+        let explicit = explicit_commands.contains(&command);
+        let mut decision = current_policy.gate(command.id(), is_pr, explicit, false);
+        if matches!(&decision, Err(p) if p.code == ReasonCode::SessionRequired) {
+            decision = match session_valid(call.as_ref(), current_policy.ttl_days) {
+                Ok(open) => current_policy.gate(command.id(), is_pr, explicit, open),
+                Err(_) => Err(Problem::new(
                     ReasonCode::SessionUnavailable,
                     "session storage unavailable",
                 )),
             };
-            if let Some(problem) = problem {
-                report_config_problem(
-                    gh,
-                    cache,
-                    key,
-                    &repo,
-                    pr_number,
-                    &problem,
-                    &trigger_message(&problem, command.id().name(), &cfg.bot_name, lang),
-                )
-                .await;
-                continue;
-            }
         }
+        if let Err(problem) = decision {
+            if crate::trigger_state::runtime::active() {
+                crate::trigger_state::runtime::reject_command(&command, &problem.to_string())
+                    .map_err(|error| error.to_string())?;
+            }
+            report_config_problem(
+                gh,
+                cache,
+                key,
+                &repo,
+                pr_number,
+                &problem,
+                &trigger_message(&problem, command.id().name(), &cfg.bot_name, lang),
+            )
+            .await;
+            continue;
+        }
+        crate::trigger_state::runtime::configuration(
+            &current.snapshot().expect("checked above").commit_sha,
+        )
+        .map_err(|error| error.to_string())?;
         if command == crate::commands::Command::Help {
-            // A preceding review can outlive the snapshot. Never call an old
-            // policy effective, or render help after it has been disabled.
-            let current = cache.load(gh, key, &repo).await;
-            let checked = current.snapshot().and_then(|s| s.config.comments.as_ref());
-            let current_policy = match checked {
-                Ok(policy) => policy,
-                Err(problem) => {
-                    let message = current
-                        .diagnostic(lang)
-                        .unwrap_or_else(|| problem.message(lang));
-                    report_config_problem(gh, cache, key, &repo, pr_number, problem, &message)
-                        .await;
-                    return Err(format!("configuration unavailable: {problem}"));
-                }
-            };
-            let mut decision = current_policy.gate(command.id(), is_pr, help_explicit, false);
-            if matches!(&decision, Err(p) if p.code == ReasonCode::SessionRequired) {
-                decision = match session_valid(call.as_ref(), current_policy.ttl_days) {
-                    Ok(open) => current_policy.gate(command.id(), is_pr, help_explicit, open),
-                    Err(_) => Err(Problem::new(
-                        ReasonCode::SessionUnavailable,
-                        "session storage unavailable",
-                    )),
-                };
-            }
-            if let Err(problem) = decision {
-                if crate::trigger_state::runtime::active() {
-                    crate::trigger_state::runtime::reject_command(&command, &problem.to_string())
-                        .map_err(|error| error.to_string())?;
-                }
-                report_config_problem(
-                    gh,
-                    cache,
-                    key,
-                    &repo,
-                    pr_number,
-                    &problem,
-                    &trigger_message(&problem, command.id().name(), &cfg.bot_name, lang),
-                )
-                .await;
-                continue;
-            }
             let status = help_session(call.as_ref(), wake, current_policy.ttl_days);
             let help = crate::handlers::repository_help(
                 current.snapshot().expect("checked above"),
@@ -1098,7 +1075,8 @@ mod tests {
         }
     }
 
-    /// The guard must not swallow humans (or other bots) with similar names.
+    /// Similar humans remain valid callers; other bots are ignored without
+    /// being mistaken for this App's own identity.
     #[test]
     fn similar_login_not_treated_as_self() {
         for (login, kind) in [
@@ -1111,10 +1089,14 @@ mod tests {
                 "user": {"login": login, "type": kind}
             }));
             let r = route_event(&cfg(), "issue_comment", &p);
-            assert!(
-                matches!(r, Routing::Act(_)),
-                "{login} must not be treated as the bot itself, got {r:?}"
-            );
+            if kind == "Bot" {
+                assert_eq!(ignored_reason(&r).as_deref(), Some("bot comment"));
+            } else {
+                assert!(
+                    matches!(r, Routing::Act(_)),
+                    "human {login} was ignored: {r:?}"
+                );
+            }
         }
     }
 

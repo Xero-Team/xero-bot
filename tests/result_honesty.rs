@@ -558,3 +558,38 @@ async fn reject_reports_error_when_every_dismissal_fails() {
         results[0]
     );
 }
+
+/// The retry without inline comments may have succeeded even when its response
+/// is lost. The non-durable CodeQL/legacy path must not post a second report.
+#[tokio::test]
+async fn audit_inline_fallback_stops_after_uncertain_second_review() {
+    for status in [429, 500, 502, 503] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(format!("/repos/{REPO}/pulls/7/reviews")))
+            .and(body_string_contains("src/main.rs"))
+            .respond_with(ResponseTemplate::new(422).set_body_json(json!({"message":"bad line"})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(format!("/repos/{REPO}/pulls/7/reviews")))
+            .and(body_string_contains("\"comments\":[]"))
+            .respond_with(
+                ResponseTemplate::new(status).set_body_json(json!({"message":"uncertain"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(format!("/repos/{REPO}/issues/7/comments")))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({"id":2})))
+            .expect(0)
+            .mount(&server)
+            .await;
+        assert!(client_for(&server)
+            .post_review(REPO, 7, "summary", inline())
+            .await
+            .is_err());
+    }
+}

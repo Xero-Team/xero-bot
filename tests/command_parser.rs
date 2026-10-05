@@ -609,3 +609,30 @@ fn review_cc_accepts_sentence_suffixes_in_all_entry_points() {
         }
     }
 }
+
+/// Invisible HTML comments contain no real mentions and must not execute or
+/// be erased to manufacture an otherwise valid bare instruction block.
+#[test]
+fn audit_html_comments_cannot_inject_commands() {
+    for text in [
+        "<!--\n@bot r+\n-->",
+        "<!-- @bot review -->",
+        "<!--\n?r @alice cc @bob\n-->",
+        "claim<!-- explanation -->",
+        "<!-- unclosed\n@bot help",
+    ] {
+        let parsed = xero_bot::commands::parse_commands("bot", text);
+        assert!(
+            parsed.commands.is_empty(),
+            "hidden command executed: {text:?}"
+        );
+    }
+    let text = "<!-- @bot r+ -->\n@bot ping";
+    let parsed = xero_bot::commands::parse_commands("bot", text);
+    assert_eq!(parsed.commands.len(), 1);
+    assert_eq!(
+        parsed.commands[0].command,
+        xero_bot::commands::Command::Ping
+    );
+    assert_eq!(&text[parsed.commands[0].span.clone()], "ping");
+}

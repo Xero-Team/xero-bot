@@ -794,7 +794,7 @@ async fn execute_path(
     plan: &PathPlan,
     compatible: bool,
 ) -> Result<()> {
-    let labels = execute_path_labels(runtime, gh, cfg, ctx, pr, plan, compatible).await;
+    let labels = execute_path_labels(runtime, gh, cfg, cache, ctx, pr, plan, compatible).await;
     let cc = notifications::execute(runtime, gh, cfg, cache, ctx, plan, compatible).await;
     if let Err(error) = &cc {
         tracing::error!(repo=%ctx.repo, pr=ctx.number, "path notification deferred: {error}");
@@ -803,10 +803,12 @@ async fn execute_path(
 }
 
 /// Execute the one coalesced label action for a matched path snapshot.
+#[allow(clippy::too_many_arguments)]
 async fn execute_path_labels(
     runtime: &Runtime,
     gh: &Client,
     cfg: &Config,
+    cache: &RepositoryConfigCache,
     ctx: &EventContext,
     pr: &serde_json::Value,
     plan: &PathPlan,
@@ -912,6 +914,24 @@ async fn execute_path_labels(
             .get(&format!("/repos/{}/pulls/{}", ctx.repo, ctx.number))
             .await?;
         path_snapshot(&current)? != (plan.head_sha.as_str(), plan.base_sha.as_str())
+    } else {
+        false
+    };
+    // Inventory pagination and snapshot reads may outlive or invalidate the
+    // policy snapshot. Recheck authority after those awaits, before claiming.
+    let compatible = if compatible {
+        let state = cache
+            .load(
+                gh,
+                RepositoryKey {
+                    installation_id: ctx.installation_id,
+                    repository_id: ctx.repository_id,
+                },
+                &ctx.repo,
+            )
+            .await;
+        let (_, paths) = path_policy(&state, &ctx.repo)?;
+        path_plan_compatible(paths, cfg, plan)
     } else {
         false
     };

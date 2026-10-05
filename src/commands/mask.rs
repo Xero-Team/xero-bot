@@ -90,7 +90,25 @@ pub fn mask_noncommand_regions(text: &str) -> String {
         line_start += line.len();
     }
     mask_inline_code(&mut inline_masked, &out[paragraph_start..]);
-    inline_masked
+    mask_html_comments(&inline_masked)
+}
+
+/// Comments are invisible on GitHub and cannot supply explicit mention evidence.
+/// Run after code masking so a literal opener inside code cannot swallow prose.
+fn mask_html_comments(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find("<!--") {
+        out.push_str(&rest[..start]);
+        let comment = &rest[start..];
+        let end = comment[4..]
+            .find("-->")
+            .map_or(comment.len(), |end| end + 7);
+        blank_into(&mut out, &comment[..end]);
+        rest = &comment[end..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// A fence opener/closer: three or more backticks or tildes.
