@@ -492,8 +492,9 @@ async fn assign_membership(ctx: &CommandContext<'_>, target: Option<&str>, add: 
             return;
         }
     };
-    let assignees = issue["assignees"].as_array().and_then(|users| {
-        users
+    let assignees = match issue.get("assignees") {
+        None | Some(serde_json::Value::Null) => Some(Vec::new()),
+        Some(serde_json::Value::Array(users)) => users
             .iter()
             .map(|user| {
                 user["login"]
@@ -501,8 +502,9 @@ async fn assign_membership(ctx: &CommandContext<'_>, target: Option<&str>, add: 
                     .filter(|s| !s.is_empty())
                     .map(str::to_owned)
             })
-            .collect::<Option<Vec<_>>>()
-    });
+            .collect::<Option<Vec<_>>>(),
+        Some(_) => None,
+    };
     let Some(mut assignees) = assignees else {
         let _ = reply_error(
             ctx,
@@ -966,7 +968,7 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/api/v1/repos/team/repo/issues/7"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "number": 7, "assignees": []
+                "number": 7, "assignees": null
             })))
             .expect(1)
             .mount(&server)
