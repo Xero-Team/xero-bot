@@ -14,6 +14,8 @@ FORGEJO_WEBHOOK_SECRET=<random-webhook-secret>
 
 三项全部留空时 Forgejo 路由返回 `503`；只配置一部分时进程拒绝启动；三项齐全时启用 `/webhook/forgejo`。
 
+token 和 webhook secret 至少需要 8 字节，以保证凭据始终被脱敏。远程 Forgejo 必须使用 HTTPS；HTTP 仅允许 localhost / loopback IP，URL 中不得夹带用户名密码。
+
 `FORGEJO_BASE_URL` 可带部署子路径，例如 `https://example.com/forgejo`。客户端会自动追加 `/api/v1`，也接受已经以 `/api/v1` 结尾的地址。
 
 ## Forgejo Webhook
@@ -34,7 +36,7 @@ hex 格式以及兼容代理常见的 `sha256=` 前缀；空 secret、缺失签�
 - token 只放部署环境，不写入仓库的 `.github/xero-bot.toml`。
 - API 请求使用 `Authorization: token <FORGEJO_TOKEN>`。
 - 连接超时 5 秒，整体请求超时 15 秒，响应上限 2 MiB。
-- 写请求不自动重试；超时后的实际状态可能是未知的，交由人工或上层幂等流程处理。
-- 错误只返回状态和经过长度限制的 provider message，不返回 token。
+- 禁止跟随 HTTP 重定向和自动重试（包括协议级重试）；超时后的实际状态可能是未知的，交由人工或上层幂等流程处理。
+- 错误只返回状态和经过脱敏、最多 512 字符的 provider message，不返回 token。
 
 当前变更只建立 provider、验签、事件解析和 HTTP 客户端边界。评论指令执行由 #32 接入，仓库镜像同步由 #33/#34 接入。

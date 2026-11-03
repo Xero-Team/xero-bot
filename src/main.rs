@@ -332,6 +332,15 @@ async fn forgejo_webhook(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> (StatusCode, Json<Value>) {
+    if state.cfg.forgejo_webhook_secret.trim().is_empty()
+        && (!state.cfg.forgejo_base_url.trim().is_empty()
+            || !state.cfg.forgejo_token.trim().is_empty())
+    {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "invalid signature"})),
+        );
+    }
     if !state.cfg.forgejo_ready() {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -362,11 +371,9 @@ async fn forgejo_webhook(
         xero_bot::forgejo::ForgejoEvent::Ignored(reason) => {
             (StatusCode::OK, Json(json!({"ignored": reason})))
         }
-        event => (
+        _ => (
             StatusCode::NOT_IMPLEMENTED,
-            Json(
-                json!({"error": "Forgejo event execution is not enabled", "event": format!("{event:?}")}),
-            ),
+            Json(json!({"error": "Forgejo event execution is not enabled"})),
         ),
     }
 }
@@ -517,6 +524,21 @@ mod trigger_ingress_tests {
         assert_ne!(result.0["accepted"], true);
         assert!(s.triggers.store.list(None).unwrap().is_empty());
     }
+    #[tokio::test]
+    async fn audit_forgejo_empty_secret_is_unauthorized() {
+        let dir = Dir::new();
+        let mut s = state(&dir);
+        s.cfg.forgejo_base_url = "https://forgejo.example".into();
+        s.cfg.forgejo_token = "test-token".into();
+        s.cfg.forgejo_webhook_secret.clear();
+        assert_eq!(
+            forgejo_webhook(State(s), HeaderMap::new(), b"{}".as_slice().into())
+                .await
+                .0,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
     /// Ordinary discussion and self replies must never consume durable inbox space.
     #[tokio::test]
     async fn irrelevant_and_self_comments_are_filtered_before_persistence() {
