@@ -43,7 +43,7 @@ hex 格式以及兼容代理常见的 `sha256=` 前缀；空 secret、缺失签�
 - 写请求的传输失败或无法解析的响应返回 `UnknownWriteOutcome`，明确要求先核对远端状态再考虑重试；读取失败仍返回 `Transport` / `InvalidResponse`。HTTP 拒绝保留 `Api` 状态码，5xx 也不能据此推断写操作没有生效。
 - 错误只返回状态和经过脱敏、最多 512 字符的 provider message，不返回 token。
 
-当前支持独立的 Forgejo webhook、评论指令和持久化恢复。仓库镜像同步由 #33/#34 接入。
+当前支持独立的 Forgejo webhook、评论指令、持久化恢复，以及显式启用的 GitHub → Forgejo 单向镜像同步。
 
 ## 评论指令
 
@@ -114,7 +114,19 @@ GitHub 与 Forgejo 使用同一严格解析器。Forgejo 的 `repository_config`
 - 配置解析失败属于仓库策略错误，同步 fail closed，不会猜测目标。
 
 同步执行只调用 Forgejo `POST /api/v1/repos/{owner}/{repo}/mirror-sync`，方向固定为
-GitHub → Forgejo。GitHub Push 驱动、超时/状态分类和 `/cron` 对账由 #34 接入。
+GitHub → Forgejo。
+
+### 触发与对账
+
+- 每个 GitHub Push（分支、tag、删除）都会在 rebase 检查后读取默认分支策略并触发同步。
+- 未启用、provider 未配置或目标缺失时不发请求。
+- 同一 `FORGEJO_BASE_URL + destination` 的并发同步会串行化；重复触发是安全的
+  mirror-sync 请求，不会向 GitHub 写 ref。
+- `GET /cron` 在已有 sweep 后追加 `forgejo_sync` 摘要。每个进程最多每 15 分钟执行一轮对账，整轮期间拒绝重叠扫描；频繁 cron 不会重复读取配置或请求 mirror-sync。重启后可立即对账。
+- 不自动重放 Forgejo 写请求。401/403/404/409/超时只记录稳定状态，等待下一次
+  Push 或 cron 对账，不猜测目标、不降级为任意 URL 推送。
+- `sync-requested` / `requested` 表示 Forgejo 接受了同步请求，不代表后台镜像拉取已完成。最终结果请查看 Forgejo 的镜像状态。
+- 日志只包含源仓库、目标状态和 HTTP 状态，不包含 `FORGEJO_TOKEN`。
 
 ### 升级顺序
 
