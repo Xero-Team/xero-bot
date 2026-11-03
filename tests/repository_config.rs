@@ -16,7 +16,6 @@ fn defaults_empty_partial_and_idle_only() {
         "[idle_workflows]\nenabled=false",
         include_str!("../examples/idle-workflows.toml"),
         include_str!("../examples/repository-config.toml"),
-        include_str!("../.github/xero-bot.toml"),
         include_str!("../example.toml"),
     ] {
         let cfg = parse(text);
@@ -554,10 +553,15 @@ fn path_actions_cannot_bypass_disabled_commands_or_invalid_comment_policy() {
 /// Shipped files are parsed and semantically validated, including deployment controls.
 #[test]
 fn shipped_defaults_and_opt_in_examples_are_valid_and_separate() {
-    assert_eq!(
-        include_str!("../.github/xero-bot.toml"),
-        include_str!("../examples/repository-config.toml")
-    );
+    let defaults = parse(include_str!("../examples/repository-config.toml"));
+    assert!(!defaults.forgejo.unwrap().enabled);
+
+    let production = parse(include_str!("../.github/xero-bot.toml"));
+    assert!(production.problems().is_empty());
+    let forgejo = production.forgejo.unwrap();
+    assert!(forgejo.enabled);
+    assert_eq!(forgejo.destination.as_deref(), Some("zero-bot/xero-bot"));
+
     let reference = parse(include_str!("../example.toml"));
     assert!(reference.problems().is_empty());
     assert!(reference.idle.unwrap().is_none());
