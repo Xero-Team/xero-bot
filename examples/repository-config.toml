@@ -30,3 +30,12 @@ ttl_days = 30 # 1..365
 # Explicit opt-in examples live in examples/triggers-opt-in.toml.
 # To disable a command, REPLACE its entry above with mode = "disabled".
 # Never configure a canonical name and its alias together.
+# Forgejo 单向仓库镜像 / One-way GitHub -> Forgejo mirror
+# 目标仓库必须已存在，并在 Forgejo 中配置为从本 GitHub 仓库拉取的 pull mirror。
+# bot 只调用 Forgejo 的 mirror-sync，不管理 Forgejo 保存的 GitHub 拉取凭据。
+# destination 必须是严格的 owner/repository；不能写 URL、token、query 或额外字段。
+# 默认关闭；缺失目标时不会猜测或自动创建仓库。
+# 升级所有实例后再取消注释；旧解析器拒绝未知表。
+# [forgejo.mirror]
+# enabled = false
+# destination = "xero-team/xero-bot"

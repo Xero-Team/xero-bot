@@ -30,6 +30,9 @@ fn defaults_empty_partial_and_idle_only() {
         assert!(cfg.events.unwrap().is_empty());
         assert!(cfg.paths.unwrap().rules.is_empty());
         assert!(cfg.idle.is_ok());
+        let forgejo = cfg.forgejo.unwrap();
+        assert!(!forgejo.enabled);
+        assert_eq!(forgejo.destination, None);
     }
     let c = parse("[command_triggers]\nreview={mode='disabled'}\n[command_sessions]\nttl_days=365")
         .comments
@@ -641,4 +644,73 @@ on:
     .unwrap();
     assert!(config.events.unwrap().is_empty());
     assert!(config.paths.unwrap().rules.is_empty());
+}
+
+/// Forgejo mirror declarations are strict: disabled by default, destination
+/// required when enabled, and never interpreted as a URL or credential store.
+#[test]
+fn forgejo_mirror_configuration_is_strict_and_fail_closed() {
+    let enabled = parse("[forgejo.mirror]\nenabled = true\ndestination = \"xero-team/xero-bot\"")
+        .forgejo
+        .unwrap();
+    assert!(enabled.enabled);
+    assert_eq!(enabled.destination.as_deref(), Some("xero-team/xero-bot"));
+
+    let disabled_with_target =
+        parse("[forgejo.mirror]\nenabled = false\ndestination = \"mirror-team/xero-bot\"")
+            .forgejo
+            .unwrap();
+    assert!(!disabled_with_target.enabled);
+    assert_eq!(
+        disabled_with_target.destination.as_deref(),
+        Some("mirror-team/xero-bot")
+    );
+
+    for destination in [
+        "",
+        "owner",
+        "owner/",
+        "/repo",
+        "owner/repo/extra",
+        "owner//repo",
+        " owner/repo",
+        "owner/repo ",
+        "owner/../repo",
+        "./repo",
+        "owner/.",
+        "owner/repo?ref=main",
+        "https://git.example.com/owner/repo",
+        "token@owner/repo",
+        "owner/repo:secret",
+        "ownér/repo",
+    ] {
+        let document = format!("[forgejo.mirror]\nenabled = true\ndestination = {destination:?}");
+        let error = parse(&document).forgejo.unwrap_err();
+        assert_eq!(
+            error.code,
+            ReasonCode::InvalidForgejoSync,
+            "{destination:?}"
+        );
+    }
+
+    let missing = parse("[forgejo.mirror]\nenabled = true")
+        .forgejo
+        .unwrap_err();
+    assert_eq!(missing.code, ReasonCode::InvalidForgejoSync);
+
+    for document in [
+        "[forgejo.mirror]\nenabled = true\ndestination = 'owner/repo'\ntoken = 'secret'",
+        "[forgejo]\nenabled = true",
+        "[forgejo.mirror]\nenabled = true\ndestination = 'owner/repo'\nclone_url = 'https://example.com'",
+    ] {
+        let error = RepositoryConfig::parse(document, REPO).unwrap_err();
+        assert_eq!(error.code, ReasonCode::InvalidDocument, "{document}");
+    }
+}
+
+#[test]
+fn forgejo_explicit_empty_destination_is_invalid_even_when_disabled() {
+    assert!(parse("[forgejo.mirror]\nenabled=false\ndestination='' ")
+        .forgejo
+        .is_err());
 }

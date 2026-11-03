@@ -92,3 +92,33 @@ trigger-state /data forgejo-resolve KEY not-sent '未发出或未生效的外部
 - 评论无响应：确认 webhook 订阅了 `Issue comment` / `Pull request comment`，并检查 token 是否具有仓库读取和
   Issue/PR 写权限。
 - `permission-error`：确认 token 可以读取 collaborator permission，且评论者是仓库协作者。
+
+## GitHub → Forgejo 单向同步配置
+
+在 **GitHub 仓库默认分支** 的 `.github/xero-bot.toml` 增加：
+
+```toml
+[forgejo.mirror]
+enabled = true
+destination = "xero-team/xero-bot"
+```
+
+GitHub 与 Forgejo 使用同一严格解析器。Forgejo 的 `repository_config` 客户端接口在默认分支的固定 commit 上读取并返回完整配置，包括镜像设置和各配置域的校验错误；评论指令只取其中的评论策略。读取 Forgejo 侧配置不会触发镜像同步。
+
+约束：
+
+- `destination` 必须是严格的 `owner/repository`，不能是 URL、凭据、query、fragment 或额外路径。
+- `enabled = true` 时必须提供目标；默认 `false`，缺失该表完全不触发同步。
+- 目标 Forgejo 仓库必须已存在，并已配置为从该 GitHub 仓库拉取的 **pull mirror**。
+- bot 不创建目标仓库，也不保存/更新 Forgejo 侧的 GitHub 拉取凭据。
+- 配置解析失败属于仓库策略错误，同步 fail closed，不会猜测目标。
+
+同步执行只调用 Forgejo `POST /api/v1/repos/{owner}/{repo}/mirror-sync`，方向固定为
+GitHub → Forgejo。GitHub Push 驱动、超时/状态分类和 `/cron` 对账由 #34 接入。
+
+### 升级顺序
+
+先升级所有读取本仓库策略的 xero-bot 实例，再往默认分支的配置文件增加 `[forgejo.mirror]`。
+旧版采用严格未知字段校验，即使 `enabled = false` 也会拒绝该新表，暂停仓库动作。
+因此本仓库的在线 `.github/xero-bot.toml` 及其副本 `examples/repository-config.toml`
+只保留注释示例；完整配置在 `example.toml`。回滚到旧版本前，应先从在线配置移除该表。
