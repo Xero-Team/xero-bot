@@ -25,7 +25,7 @@ token 和 webhook secret 至少需要 8 字节，以保证凭据始终被脱敏�
 - Payload URL：`https://<xero-bot-host>/webhook/forgejo`
 - Content type：`application/json`
 - Secret：与 `FORGEJO_WEBHOOK_SECRET` 完全一致
-- 首期事件：`Issue comment`、`Push`；后续 Issue/PR 管理会继续使用同一入口
+- 事件：`Issue comment`、`Pull request comment`、`Push`
 
 服务读取 `X-Forgejo-Event`（兼容 `X-Gitea-Event`），并校验
 `X-Forgejo-Signature` / `X-Gitea-Signature` 的 HMAC-SHA256。支持 Forgejo 的裸
@@ -43,4 +43,52 @@ hex 格式以及兼容代理常见的 `sha256=` 前缀；空 secret、缺失签�
 - 写请求的传输失败或无法解析的响应返回 `UnknownWriteOutcome`，明确要求先核对远端状态再考虑重试；读取失败仍返回 `Transport` / `InvalidResponse`。HTTP 拒绝保留 `Api` 状态码，5xx 也不能据此推断写操作没有生效。
 - 错误只返回状态和经过脱敏、最多 512 字符的 provider message，不返回 token。
 
-当前变更只建立 provider、验签、事件解析和 HTTP 客户端边界。评论指令执行由 #32 接入，仓库镜像同步由 #33/#34 接入。
+当前支持独立的 Forgejo webhook、评论指令和持久化恢复。仓库镜像同步由 #33/#34 接入。
+
+## 评论指令
+
+Forgejo webhook 的 `issue_comment` / `pull_request_comment` 会复用现有 lexer/parser 和 `.github/xero-bot.toml`
+中的 `command_triggers` / `command_sessions`。当前支持：
+
+- `ping`、`help`
+- `claim` / `take`、`unclaim` / `untake`
+- `label +label -label`、`assign @user`、`cc @user`
+- `ready`、`author`、`blocked`：仅切换状态标签；`ready` 不自动选取或通知审查者，请使用 `r? @user` 请求审查
+- `r? @user`：Issue 上指派，PR 上请求 reviewer
+- `r+`、`r-`：实时检查 write+ 权限；PR 作者不能自我审批；代审批仍受
+  `R_PLUS_ALLOW_ON_BEHALF` 控制
+
+策略读取固定到默认分支的一个 commit；配置文件 404 只有在同一 commit 的父目录列表证明缺失后才使用默认策略。评论策略无效、默认分支不可读或权限无法确认时 fail closed。显式 @ 产生的会话写入现有
+`XERO_DATA_DIR` SQLite，使用 Forgejo 实例 URL 派生的独立命名空间，不会与 GitHub
+installation 的会话混用。
+
+`review`、`codeql`、`queue`、GitHub Checks 和 GitHub 合并队列是 GitHub 专属能力；
+Forgejo 上会明确回复“不支持”，不会静默成功。Forgejo Actions 的 CI 结果与 AI review
+适配属于后续独立工作。
+
+## 持久化与恢复
+
+`202` 表示评论已写入 `XERO_DATA_DIR/forgejo-comments.sqlite`。同一实例、仓库和评论 ID 只入队一次；
+重投不会重复审批或回复。单消费者按源时间、评论 ID 排序处理已入队评论，避免分配列表和会话检查相互竞争。
+晚到的旧状态命令不会覆盖较新的状态命令。缺少会话的裸指令可等待晚到的唤醒，最多检查 5 次。
+
+没有发出写请求的任务在重启后恢复；已经发出写请求但无法确认结果的任务保留为 `unknown`，
+暂停该 Issue/PR 的后续任务。不要盲目重投写请求。先停止服务，再检查：
+
+```sh
+trigger-state /data forgejo-inbox
+trigger-state /data forgejo-resolve KEY done '已在 Forgejo 核实操作结果'
+# 仅在确认该任务的所有写请求均未生效时：
+trigger-state /data forgejo-resolve KEY not-sent '未发出或未生效的外部证据'
+```
+
+`done` 保留去重记录并解除阻塞；`not-sent` 重新排队，重启后会重新检查当前仓库策略和权限。
+这些命令与服务共享排他数据库锁，不支持多个进程同时处理同一数据目录。
+
+## 故障排查
+
+- `401 invalid signature`：检查 Forgejo webhook Secret 与 `FORGEJO_WEBHOOK_SECRET`。
+- `503 Forgejo provider is not configured`：三项环境变量未成组配置。
+- 评论无响应：确认 webhook 订阅了 `Issue comment` / `Pull request comment`，并检查 token 是否具有仓库读取和
+  Issue/PR 写权限。
+- `permission-error`：确认 token 可以读取 collaborator permission，且评论者是仓库协作者。

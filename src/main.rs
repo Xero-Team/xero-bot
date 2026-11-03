@@ -28,6 +28,7 @@ struct AppState {
     cfg: Config,
     idle_workflows: Option<Arc<xero_bot::idle_workflows::Scheduler>>,
     triggers: Arc<xero_bot::trigger_state::Runtime>,
+    forgejo_inbox: Option<Arc<xero_bot::forgejo::inbox::Inbox>>,
 }
 
 /// Validate deployment settings, acquire state ownership, then start workers and HTTP ingress.
@@ -57,6 +58,30 @@ async fn main() {
             std::process::exit(2);
         }
     };
+
+    let forgejo_inbox = if cfg.forgejo_ready() {
+        match xero_bot::forgejo::inbox::Inbox::open(std::path::Path::new(&cfg.data_dir)) {
+            Ok(inbox) => Some(Arc::new(inbox)),
+            Err(error) => {
+                eprintln!("ERROR: cannot own Forgejo inbox: {error}");
+                std::process::exit(2);
+            }
+        }
+    } else {
+        None
+    };
+    if let Some(inbox) = forgejo_inbox.as_ref().map(Arc::clone) {
+        let cfg = cfg.clone();
+        let triggers = Arc::clone(&triggers);
+        tokio::spawn(async move {
+            loop {
+                if let Err(error) = inbox.pump(&cfg, &triggers.store).await {
+                    tracing::error!("Forgejo inbox recovery unavailable: {error}");
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+        });
+    }
 
     let idle_workflows = if cfg.idle_workflows_enabled {
         match xero_bot::idle_workflows::Scheduler::open(
@@ -181,6 +206,7 @@ async fn main() {
         cfg,
         idle_workflows,
         triggers,
+        forgejo_inbox,
     };
 
     let app = Router::new()
@@ -371,9 +397,32 @@ async fn forgejo_webhook(
         xero_bot::forgejo::ForgejoEvent::Ignored(reason) => {
             (StatusCode::OK, Json(json!({"ignored": reason})))
         }
-        _ => (
+        event @ xero_bot::forgejo::ForgejoEvent::IssueComment { .. } => {
+            let Some(inbox) = state.forgejo_inbox.as_ref() else {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({"error":"Forgejo inbox unavailable"})),
+                );
+            };
+            match inbox.enqueue(&state.cfg, &event) {
+                Ok(inserted) => (
+                    StatusCode::ACCEPTED,
+                    Json(
+                        json!({"accepted":true,"persisted":true,"duplicate":!inserted,"provider":"forgejo"}),
+                    ),
+                ),
+                Err(error) => {
+                    tracing::error!("Forgejo comment admission failed: {error}");
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(json!({"error":"Forgejo comment could not be persisted"})),
+                    )
+                }
+            }
+        }
+        xero_bot::forgejo::ForgejoEvent::Push { .. } => (
             StatusCode::NOT_IMPLEMENTED,
-            Json(json!({"error": "Forgejo event execution is not enabled"})),
+            Json(json!({"error": "Forgejo mirror sync is not enabled yet", "issue": 34})),
         ),
     }
 }
@@ -455,6 +504,9 @@ mod trigger_ingress_tests {
         AppState {
             cfg,
             idle_workflows: None,
+            forgejo_inbox: Some(Arc::new(
+                xero_bot::forgejo::inbox::Inbox::open(&dir.0).unwrap(),
+            )),
             triggers: Arc::new(xero_bot::trigger_state::Runtime::open(&dir.0).unwrap()),
         }
     }
@@ -536,6 +588,36 @@ mod trigger_ingress_tests {
                 .await
                 .0,
             StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[tokio::test]
+    async fn forgejo_ingress_persists_both_comment_headers_and_deduplicates() {
+        let dir = Dir::new();
+        let mut s = state(&dir);
+        s.cfg.forgejo_base_url = "https://forgejo.example".into();
+        s.cfg.forgejo_token = "test-token".into();
+        s.cfg.forgejo_webhook_secret = "test-secret".into();
+        let body = serde_json::to_vec(&payload()).unwrap();
+        for (event, duplicate) in [("issue_comment", false), ("pull_request_comment", true)] {
+            let mut headers = HeaderMap::new();
+            let mut mac = xero_bot::forgejo::HmacSha256::new_from_slice(b"test-secret").unwrap();
+            mac.update(&body);
+            headers.insert(
+                "x-gitea-signature",
+                hex::encode(mac.finalize().into_bytes()).parse().unwrap(),
+            );
+            headers.insert("x-gitea-event", event.parse().unwrap());
+            let (status, result) =
+                forgejo_webhook(State(s.clone()), headers, body.clone().into()).await;
+            assert_eq!(status, StatusCode::ACCEPTED);
+            assert_eq!(result.0["persisted"], true);
+            assert_eq!(result.0["duplicate"], duplicate);
+        }
+        assert_eq!(s.forgejo_inbox.as_ref().unwrap().status().unwrap().len(), 1);
+        assert_eq!(
+            s.forgejo_inbox.as_ref().unwrap().status().unwrap()[0]["state"],
+            "pending"
         );
     }
 
