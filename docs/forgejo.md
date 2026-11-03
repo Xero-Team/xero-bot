@@ -131,8 +131,18 @@ Clippy 和测试命令。它是独立文件，因为 Forgejo 不读取 GitHub �
 同一套检查。仓库必须启用 Actions 单元，并且至少有一个在线的 Forgejo Runner：
 
 - Runner 标签：`ubuntu-latest`、`ubuntu-22.04`、`docker`
-- `ubuntu-latest` 后端镜像：`rust:1.99-bookworm`
+- `ubuntu-latest` 后端镜像：`xero-bot-ci:rust-1.99-node20`
 - Runner 使用部署环境的 Docker socket 启动隔离的任务容器
+
+镜像定义在 `.forgejo/runner/Dockerfile`，同时包含 Rust 1.99、Clippy、rustfmt
+以及 `actions/checkout` 需要的 Node 20。部署 Runner 前构建：
+
+```sh
+docker build -f .forgejo/runner/Dockerfile -t xero-bot-ci:rust-1.99-node20 .
+```
+
+Forgejo 测试命令会串行运行 Cargo 测试（`--test-threads=1`）。仓库中的状态机测试
+包含亚秒级并发期限；共享 Runner 在并行构建或测试较多时可能因 CPU 抢占偶发超时。
 
 CI 不依赖 GitHub App、AI key 或 webhook secret。
 
