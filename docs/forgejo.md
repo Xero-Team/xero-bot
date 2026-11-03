@@ -67,3 +67,24 @@ Forgejo 上会明确回复“不支持”，不会静默成功。Forgejo Actions
 - 评论无响应：确认 webhook 订阅了 `Issue comment`，并检查 token 是否具有仓库读取和
   Issue/PR 写权限。
 - `permission-error`：确认 token 可以读取 collaborator permission，且评论者是仓库协作者。
+
+## GitHub → Forgejo 单向同步配置
+
+在 **GitHub 仓库默认分支** 的 `.github/xero-bot.toml` 增加：
+
+```toml
+[forgejo.mirror]
+enabled = true
+destination = "xero-team/xero-bot"
+```
+
+约束：
+
+- `destination` 必须是严格的 `owner/repository`，不能是 URL、凭据、query、fragment 或额外路径。
+- `enabled = true` 时必须提供目标；默认 `false`，缺失该表完全不触发同步。
+- 目标 Forgejo 仓库必须已存在，并已配置为从该 GitHub 仓库拉取的 **pull mirror**。
+- bot 不创建目标仓库，也不保存/更新 Forgejo 侧的 GitHub 拉取凭据。
+- 配置解析失败属于仓库策略错误，同步 fail closed，不会猜测目标。
+
+同步执行只调用 Forgejo `POST /api/v1/repos/{owner}/{repo}/mirror-sync`，方向固定为
+GitHub → Forgejo。GitHub Push 驱动、超时/状态分类和 `/cron` 对账由 #34 接入。

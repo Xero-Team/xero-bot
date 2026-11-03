@@ -134,3 +134,11 @@ retention_days = 7 # 数字
 # 按需订阅 Issue comment、Issues、Pull request、Push；原生审查队列再加 Pull request review。
 # 使用单实例和持久 XERO_DATA_DIR；备份数据库及 WAL，unknown 写入用 trigger-state CLI 核对。
 # GitHub 和 SQLite 不共享事务，不承诺 exactly-once。详情：docs/triggers.zh-CN.md。
+# Forgejo 单向仓库镜像 / One-way GitHub -> Forgejo mirror
+# 目标仓库必须已存在，并在 Forgejo 中配置为从本 GitHub 仓库拉取的 pull mirror。
+# bot 只调用 Forgejo 的 mirror-sync，不管理 Forgejo 保存的 GitHub 拉取凭据。
+# destination 必须是严格的 owner/repository；不能写 URL、token、query 或额外字段。
+# 默认关闭；缺失目标时不会猜测或自动创建仓库。
+[forgejo.mirror]
+enabled = false
+# destination = "xero-team/xero-bot"

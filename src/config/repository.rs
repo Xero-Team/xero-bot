@@ -172,6 +172,7 @@ pub enum ReasonCode {
     InvalidRule,
     DuplicateRuleId,
     InvalidPathSettings,
+    InvalidForgejoSync,
     Unsupported,
     Disabled,
     RequiresPr,
@@ -226,6 +227,7 @@ impl Problem {
             ReasonCode::RelayDisabled => "部署未开启代审批",
             ReasonCode::SelfApproval => "不允许自我审批",
             ReasonCode::InvalidCredited => "代审批目标不是合法的 GitHub 用户名",
+            ReasonCode::InvalidForgejoSync => "Forgejo 镜像同步配置无效",
             ReasonCode::RequiresPr => "该指令仅适用于 PR",
             ReasonCode::Forbidden => "GitHub 拒绝读取配置",
             ReasonCode::RateLimited => "GitHub API 已限流，请稍后重试",
@@ -400,6 +402,25 @@ pub struct RepositoryConfig {
     pub events: Domain<Vec<Rule<EventRule>>>,
     pub paths: Domain<Paths>,
     pub idle: Domain<Option<Rules>>,
+    pub forgejo: Domain<ForgejoMirrorConfig>,
+}
+
+/// Validated one-way GitHub -> Forgejo pull-mirror declaration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForgejoMirrorConfig {
+    pub enabled: bool,
+    /// Canonical `owner/repository`. Present whenever sync is enabled; absent
+    /// when the disabled setting omitted a destination.
+    pub destination: Option<String>,
+}
+
+impl ForgejoMirrorConfig {
+    pub fn disabled() -> Self {
+        Self {
+            enabled: false,
+            destination: None,
+        }
+    }
 }
 
 #[derive(Default, Deserialize)]
@@ -410,6 +431,20 @@ struct Document {
     event_triggers: Vec<RawEventRule>,
     path_triggers: RawPaths,
     idle_workflows: Option<Rules>,
+    forgejo: RawForgejo,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct RawForgejo {
+    mirror: RawForgejoMirror,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct RawForgejoMirror {
+    enabled: bool,
+    destination: String,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -480,6 +515,9 @@ impl RepositoryConfig {
         if let Err(e) = &self.idle {
             problems.push(e);
         }
+        if let Err(e) = &self.forgejo {
+            problems.push(e);
+        }
         match &self.events {
             Err(e) => problems.push(e),
             Ok(rules) => problems.extend(rules.iter().filter_map(|r| r.value.as_ref().err())),
@@ -506,13 +544,63 @@ impl RepositoryConfig {
         let paths = paths(doc.path_triggers, &comments);
         let idle = idle::validate(doc.idle_workflows, repository)
             .map_err(|_| Problem::new(ReasonCode::InvalidIdle, "invalid idle workflow settings"));
+        let forgejo = forgejo(doc.forgejo);
         Ok(Self {
             comments,
             events,
             paths,
             idle,
+            forgejo,
         })
     }
+}
+
+/// Validate the optional one-way mirror declaration. A disabled setting may
+/// omit `destination`, but a destination that is present is always validated so
+/// enabling it later cannot turn a typo into an unintended repository target.
+fn forgejo(raw: RawForgejo) -> Domain<ForgejoMirrorConfig> {
+    let destination = raw.mirror.destination.as_str();
+    if destination.trim() != destination {
+        return Err(Problem::new(
+            ReasonCode::InvalidForgejoSync,
+            "Forgejo mirror destination must not contain surrounding whitespace",
+        ));
+    }
+    if destination.is_empty() {
+        return if raw.mirror.enabled {
+            Err(Problem::new(
+                ReasonCode::InvalidForgejoSync,
+                "enabled Forgejo mirror requires an owner/repository destination",
+            ))
+        } else {
+            Ok(ForgejoMirrorConfig::disabled())
+        };
+    }
+    let Some((owner, repository)) = destination.split_once('/') else {
+        return Err(Problem::new(
+            ReasonCode::InvalidForgejoSync,
+            "Forgejo mirror destination must be owner/repository",
+        ));
+    };
+    if owner.is_empty()
+        || repository.is_empty()
+        || repository.contains('/')
+        || destination.chars().any(char::is_whitespace)
+        || destination.contains("..")
+        || [owner, repository].into_iter().any(|part| {
+            part.chars()
+                .any(|ch| !(ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.')))
+        })
+    {
+        return Err(Problem::new(
+            ReasonCode::InvalidForgejoSync,
+            "Forgejo mirror destination is not a canonical owner/repository",
+        ));
+    }
+    Ok(ForgejoMirrorConfig {
+        enabled: raw.mirror.enabled,
+        destination: Some(destination.to_string()),
+    })
 }
 
 /// Merge manual overrides only after checking TTL, command names and alias uniqueness.
