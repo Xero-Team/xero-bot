@@ -42,4 +42,4 @@ ttl_days = 30 # 1..365
 
 [forgejo.mirror]
 enabled = true
-destination = "zero-bot/xero-bot"
+destination = "xero-team/xero-bot"
