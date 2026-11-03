@@ -379,8 +379,8 @@ async fn forgejo_webhook(
             )
         }
         xero_bot::forgejo::ForgejoEvent::Push { .. } => (
-            StatusCode::NOT_IMPLEMENTED,
-            Json(json!({"error": "Forgejo mirror sync is not enabled yet", "issue": 34})),
+            StatusCode::OK,
+            Json(json!({"ignored": "Forgejo push events never drive GitHub -> Forgejo sync"})),
         ),
     }
 }
@@ -415,10 +415,11 @@ async fn cron_sweep(
         Some(scheduler) => scheduler.pump_all(&state.cfg).await,
         None => "idle workflows disabled".into(),
     };
+    let forgejo_sync_summary = xero_bot::forgejo::sync::sweep(&state.cfg).await;
     (
         StatusCode::OK,
         Json(
-            json!({"ok": true, "summary": summary, "merge_queue": merge_queue_summary, "idle_workflows": idle_workflows_summary}),
+            json!({"ok": true, "summary": summary, "merge_queue": merge_queue_summary, "idle_workflows": idle_workflows_summary, "forgejo_sync": forgejo_sync_summary}),
         ),
     )
 }

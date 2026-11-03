@@ -156,6 +156,7 @@ pub fn route_event(cfg: &Config, event_header: &str, payload: &Value) -> Routing
         }
         WebhookEvent::RepoPush {
             repo,
+            repository_id,
             ref_name,
             installation_id,
         } => {
@@ -165,6 +166,7 @@ pub fn route_event(cfg: &Config, event_header: &str, payload: &Value) -> Routing
             // installation client already exists anyway.
             Routing::Act(Work::BasePushed {
                 repo,
+                repository_id,
                 ref_name,
                 installation_id,
             })
@@ -285,6 +287,7 @@ pub enum Work {
     /// without an event on the PR itself.
     BasePushed {
         repo: String,
+        repository_id: Option<i64>,
         ref_name: String,
         installation_id: i64,
     },
@@ -777,6 +780,7 @@ async fn execute_work_inner(cfg: &Config, work: Work) -> Result<(), String> {
         }
         Work::BasePushed {
             repo,
+            repository_id,
             ref_name,
             installation_id,
         } => {
@@ -784,6 +788,30 @@ async fn execute_work_inner(cfg: &Config, work: Work) -> Result<(), String> {
                 .await
                 .map_err(|e| format!("installation client: {e}"))?;
             crate::rebase::handle_base_push(&gh, cfg, &repo, &ref_name).await;
+            if let Some(repository_id) = repository_id.filter(|id| *id > 0) {
+                let status = crate::forgejo::sync::sync_repository(
+                    &gh,
+                    cfg,
+                    &repo,
+                    crate::config::cache::RepositoryKey {
+                        installation_id,
+                        repository_id,
+                    },
+                )
+                .await;
+                if matches!(
+                    status,
+                    crate::forgejo::sync::SyncOutcome::Synced
+                        | crate::forgejo::sync::SyncOutcome::MirrorDisabled
+                        | crate::forgejo::sync::SyncOutcome::ProviderDisabled
+                ) {
+                    tracing::info!("Forgejo mirror sync {repo}: {status}");
+                } else {
+                    tracing::warn!("Forgejo mirror sync {repo}: {status}");
+                }
+            } else {
+                tracing::warn!("Forgejo mirror sync {repo}: push payload has no repository id");
+            }
             Ok(())
         }
         work @ Work::Codeql {
@@ -1010,16 +1038,18 @@ mod tests {
     fn push_routes_to_base_pushed() {
         let payload = json!({
             "installation": {"id": 42},
-            "repository": {"full_name": "Xero-Team/xero-bot"},
+            "repository": {"id": 9, "full_name": "Xero-Team/xero-bot"},
             "ref": "refs/heads/main",
         });
         match route_event(&cfg(), "push", &payload) {
             Routing::Act(Work::BasePushed {
                 repo,
+                repository_id,
                 ref_name,
                 installation_id,
             }) => {
                 assert_eq!(repo, "Xero-Team/xero-bot");
+                assert_eq!(repository_id, Some(9));
                 assert_eq!(ref_name, "refs/heads/main");
                 assert_eq!(installation_id, 42);
             }

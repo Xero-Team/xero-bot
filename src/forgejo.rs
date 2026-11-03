@@ -11,6 +11,7 @@ use serde_json::Value;
 use sha2::Sha256;
 
 pub mod commands;
+pub mod sync;
 
 pub type HmacSha256 = Hmac<Sha256>;
 
@@ -267,6 +268,14 @@ impl ForgejoClient {
 
     pub async fn repository(&self, repo: &str) -> Result<Value, ForgejoError> {
         self.get(&format!("/repos/{repo}")).await
+    }
+
+    /// Ask an existing Forgejo pull mirror to fetch from its configured origin.
+    /// This endpoint has no body and returns 200 with an empty response.
+    pub async fn trigger_mirror_sync(&self, repo: &str) -> Result<(), ForgejoError> {
+        self.request(Method::POST, &format!("/repos/{repo}/mirror-sync"), None)
+            .await
+            .map(|_| ())
     }
 
     async fn request(

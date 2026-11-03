@@ -100,6 +100,7 @@ pub enum WebhookEvent {
     /// sub-sweep-latency way to notice (and the sweep may be hours away).
     RepoPush {
         repo: String,
+        repository_id: Option<i64>,
         ref_name: String,
         installation_id: i64,
     },
@@ -217,6 +218,7 @@ pub fn classify(event_header: &str, payload: &Value) -> WebhookEvent {
             };
             WebhookEvent::RepoPush {
                 repo: repo.to_string(),
+                repository_id: ji64(payload, &["repository", "id"]),
                 // `ref` is a full ref ("refs/heads/main"); the branch check
                 // happens at dispatch, where the default branch is known.
                 ref_name: jstr_or(payload, &["ref"], "").to_string(),

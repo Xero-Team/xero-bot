@@ -87,4 +87,15 @@ destination = "xero-team/xero-bot"
 - 配置解析失败属于仓库策略错误，同步 fail closed，不会猜测目标。
 
 同步执行只调用 Forgejo `POST /api/v1/repos/{owner}/{repo}/mirror-sync`，方向固定为
-GitHub → Forgejo。GitHub Push 驱动、超时/状态分类和 `/cron` 对账由 #34 接入。
+GitHub → Forgejo。
+
+### 触发与对账
+
+- 每个 GitHub Push（分支、tag、删除）都会在 rebase 检查后读取默认分支策略并触发同步。
+- 未启用、provider 未配置或目标缺失时不发请求。
+- 同一 `FORGEJO_BASE_URL + destination` 的并发同步会串行化；重复触发是安全的
+  mirror-sync 请求，不会向 GitHub 写 ref。
+- `GET /cron` 在已有 sweep 后追加 `forgejo_sync` 摘要，用低频对账补偿丢失的 webhook。
+- 不自动重放 Forgejo 写请求。401/403/404/409/超时只记录稳定状态，等待下一次
+  Push 或 cron 对账，不猜测目标、不降级为任意 URL 推送。
+- 日志只包含源仓库、目标状态和 HTTP 状态，不包含 `FORGEJO_TOKEN`。
