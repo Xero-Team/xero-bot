@@ -223,6 +223,7 @@ mod tests {
             private_key_pem: None,
             webhook_secret: String::new(),
             bot_name: String::new(),
+            forgejo_bot_name: String::new(),
             app_slug: String::new(),
             forgejo_base_url: String::new(),
             forgejo_token: String::new(),

@@ -16,6 +16,8 @@ pub struct Config {
     pub private_key_pem: Option<String>,
     pub webhook_secret: String,
     pub bot_name: String,
+    /// Forgejo command mention/login, independent from the GitHub App identity.
+    pub forgejo_bot_name: String,
     /// Optional override for the App's own login (without `[bot]`). Empty means
     /// resolve it via `GET /app`; set it on serverless to skip that round trip.
     pub app_slug: String,
@@ -234,6 +236,14 @@ impl Config {
             private_key_pem: read_key_pem(),
             webhook_secret: cfg("WEBHOOK_SECRET", ""),
             bot_name: cfg("BOT_NAME", "xero-review"),
+            forgejo_bot_name: {
+                let configured = cfg("FORGEJO_BOT_NAME", "");
+                if configured.trim().is_empty() {
+                    cfg("BOT_NAME", "xero-review")
+                } else {
+                    configured
+                }
+            },
             app_slug: cfg("APP_SLUG", ""),
 
             forgejo_base_url: cfg("FORGEJO_BASE_URL", ""),
@@ -313,6 +323,9 @@ impl Config {
             &self.forgejo_token,
             &self.forgejo_webhook_secret,
         )?;
+        if self.forgejo_ready() && self.forgejo_bot_name.trim().is_empty() {
+            return Err("FORGEJO_BOT_NAME is empty".into());
+        }
 
         // Parse the key now: signing happens on a background task whose errors
         // are only logged, so an unusable key would otherwise surface as a

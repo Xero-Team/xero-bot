@@ -102,14 +102,14 @@ async fn handle_issue_comment_with_client(
         .filter(|login| !login.is_empty())
         .ok_or("Forgejo /user response has no login")?;
     if job.commenter.eq_ignore_ascii_case(bot_login)
-        || job.commenter.eq_ignore_ascii_case(&cfg.bot_name)
+        || job.commenter.eq_ignore_ascii_case(&cfg.forgejo_bot_name)
         || job.commenter.to_ascii_lowercase().ends_with("[bot]")
     {
         return Ok(());
     }
 
     let lang = detect(&job.body).unwrap_or_default();
-    let parsed = parse_commands(&cfg.bot_name, &job.body);
+    let parsed = parse_commands(&cfg.forgejo_bot_name, &job.body);
     if parsed.commands.is_empty() && parsed.diagnostics.is_empty() {
         return Ok(());
     }
@@ -139,7 +139,7 @@ async fn handle_issue_comment_with_client(
 
     for candidate in parsed.commands {
         let self_request = matches!(&candidate.command, Command::Assign { user } | Command::RequestReview { user }
-            if crate::github::normalize_login(user) == crate::github::normalize_login(&cfg.bot_name)
+            if crate::github::normalize_login(user) == crate::github::normalize_login(&cfg.forgejo_bot_name)
                 || user.eq_ignore_ascii_case(bot_login));
         if self_request {
             diagnostics.push(crate::commands::diag::Diagnostic::SelfRequestIgnored {
@@ -206,9 +206,9 @@ async fn handle_issue_comment_with_client(
         }
     }
 
-    let commands = resolve_commands(&cfg.bot_name, permitted, &mut diagnostics);
-    let mut message =
-        crate::commands::diag::render(&diagnostics, &cfg.bot_name, lang).unwrap_or_default();
+    let commands = resolve_commands(&cfg.forgejo_bot_name, permitted, &mut diagnostics);
+    let mut message = crate::commands::diag::render(&diagnostics, &cfg.forgejo_bot_name, lang)
+        .unwrap_or_default();
     if !blocked.is_empty() {
         if !message.is_empty() {
             message.push_str("\n\n");
@@ -411,7 +411,7 @@ async fn handle_one(ctx: &CommandContext<'_>, command: Command) -> &'static str 
             "ping"
         }
         Command::Help => {
-            let text = help_text(&ctx.cfg.bot_name, lang);
+            let text = help_text(&ctx.cfg.forgejo_bot_name, lang);
             let _ = reply(ctx.client, &ctx.job.repo, ctx.job.number, &text).await;
             "help"
         }
@@ -901,7 +901,7 @@ mod tests {
 
     fn cfg() -> Config {
         let mut cfg = Config::from_env();
-        cfg.bot_name = "xero-review".into();
+        cfg.forgejo_bot_name = "xero-review".into();
         cfg.forgejo_base_url = "https://forgejo.invalid".into();
         cfg.forgejo_token = "test-token".into();
         cfg.forgejo_webhook_secret = "webhook-secret".into();
