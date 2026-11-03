@@ -48,10 +48,20 @@ pub async fn sync_repository(
     repo: &str,
     key: RepositoryKey,
 ) -> SyncOutcome {
+    sync_repository_with_cache(gh, cfg, repo, key, RepositoryConfigCache::shared().as_ref()).await
+}
+
+async fn sync_repository_with_cache(
+    gh: &Client,
+    cfg: &Config,
+    repo: &str,
+    key: RepositoryKey,
+    cache: &RepositoryConfigCache,
+) -> SyncOutcome {
     if !cfg.forgejo_ready() {
         return SyncOutcome::ProviderDisabled;
     }
-    let state = RepositoryConfigCache::shared().load(gh, key, repo).await;
+    let state = cache.load(gh, key, repo).await;
     let snapshot = match state.snapshot() {
         Ok(snapshot) => snapshot,
         Err(problem) => {
@@ -289,6 +299,76 @@ mod tests {
             .mount(&server)
             .await;
         let outcome = sync_destination_with(&server.uri(), "token", "mirror-team/xero-bot").await;
+        assert_eq!(outcome, SyncOutcome::Synced);
+    }
+
+    #[tokio::test]
+    async fn repository_policy_gates_the_mirror_request() {
+        use base64::Engine;
+        use wiremock::matchers::query_param;
+
+        let github = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/team/repo"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": 9, "default_branch": "main"
+            })))
+            .mount(&github)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/team/repo/git/ref/heads/main"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "object": {"sha": "a".repeat(40)}
+            })))
+            .mount(&github)
+            .await;
+        let policy = "[forgejo.mirror]\nenabled = true\ndestination = \"mirror-team/xero-bot\"";
+        Mock::given(method("GET"))
+            .and(path("/repos/team/repo/contents/.github/xero-bot.toml"))
+            .and(query_param("ref", "a".repeat(40)))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "type": "file",
+                "encoding": "base64",
+                "sha": "b".repeat(40),
+                "content": base64::engine::general_purpose::STANDARD.encode(policy)
+            })))
+            .mount(&github)
+            .await;
+
+        let forgejo = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/repos/mirror-team/xero-bot/mirror-sync"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&forgejo)
+            .await;
+
+        let crab = crate::github::client_builder()
+            .personal_token("github-token")
+            .base_uri(github.uri())
+            .unwrap()
+            .build()
+            .unwrap();
+        let gh = Client {
+            crab,
+            app_slug: "xero-review".into(),
+        };
+        let mut cfg = Config::from_env();
+        cfg.forgejo_base_url = forgejo.uri();
+        cfg.forgejo_token = "forgejo-token".into();
+        cfg.forgejo_webhook_secret = "webhook-secret".into();
+        let cache = RepositoryConfigCache::default();
+        let outcome = sync_repository_with_cache(
+            &gh,
+            &cfg,
+            "team/repo",
+            RepositoryKey {
+                installation_id: 1,
+                repository_id: 9,
+            },
+            &cache,
+        )
+        .await;
         assert_eq!(outcome, SyncOutcome::Synced);
     }
 
