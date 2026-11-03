@@ -35,6 +35,7 @@ ttl_days = 30 # 1..365
 # bot 只调用 Forgejo 的 mirror-sync，不管理 Forgejo 保存的 GitHub 拉取凭据。
 # destination 必须是严格的 owner/repository；不能写 URL、token、query 或额外字段。
 # 默认关闭；缺失目标时不会猜测或自动创建仓库。
-[forgejo.mirror]
-enabled = false
+# 升级所有实例后再取消注释；旧解析器拒绝未知表。
+# [forgejo.mirror]
+# enabled = false
 # destination = "xero-team/xero-bot"

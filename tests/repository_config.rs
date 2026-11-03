@@ -676,6 +676,8 @@ fn forgejo_mirror_configuration_is_strict_and_fail_closed() {
         " owner/repo",
         "owner/repo ",
         "owner/../repo",
+        "./repo",
+        "owner/.",
         "owner/repo?ref=main",
         "https://git.example.com/owner/repo",
         "token@owner/repo",

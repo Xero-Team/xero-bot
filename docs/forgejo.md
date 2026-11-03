@@ -109,3 +109,10 @@ destination = "xero-team/xero-bot"
 
 同步执行只调用 Forgejo `POST /api/v1/repos/{owner}/{repo}/mirror-sync`，方向固定为
 GitHub → Forgejo。GitHub Push 驱动、超时/状态分类和 `/cron` 对账由 #34 接入。
+
+### 升级顺序
+
+先升级所有读取本仓库策略的 xero-bot 实例，再往默认分支的配置文件增加 `[forgejo.mirror]`。
+旧版采用严格未知字段校验，即使 `enabled = false` 也会拒绝该新表，暂停仓库动作。
+因此本仓库的在线 `.github/xero-bot.toml` 及其副本 `examples/repository-config.toml`
+只保留注释示例；完整配置在 `example.toml`。回滚到旧版本前，应先从在线配置移除该表。
