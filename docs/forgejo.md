@@ -10,7 +10,12 @@ Forgejo 是与 GitHub App 分开的 provider。两者可以同时启用，但不
 FORGEJO_BASE_URL=https://git.example.com
 FORGEJO_TOKEN=<dedicated-bot-access-token>
 FORGEJO_WEBHOOK_SECRET=<random-webhook-secret>
+FORGEJO_BOT_NAME=zero-bot
 ```
+
+`FORGEJO_BOT_NAME` 只影响 Forgejo 的指令解析和 bot 自身识别；留空时继承
+`BOT_NAME`。这样 GitHub App 可以继续使用 `@xero-team-bot`，Forgejo 使用
+`@zero-bot`，两边互不影响。
 
 三项全部留空时 Forgejo 路由返回 `503`；只配置一部分时进程拒绝启动；三项齐全时启用 `/webhook/forgejo`。
 

@@ -24,6 +24,7 @@ impl Drop for Dir {
 fn cfg(url: &str) -> Config {
     let mut cfg = Config::from_env();
     cfg.bot_name = "bot".into();
+    cfg.forgejo_bot_name = "bot".into();
     cfg.forgejo_base_url = url.into();
     cfg.forgejo_token = "test-token".into();
     cfg.forgejo_webhook_secret = "test-secret".into();
