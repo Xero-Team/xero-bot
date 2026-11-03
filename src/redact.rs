@@ -36,7 +36,7 @@ fn store() -> &'static Mutex<Vec<(String, &'static str)>> {
 /// rewrite every innocent occurrence of those characters in a review body. A
 /// secret that short is already unprotectable; mangling the review to pretend
 /// otherwise helps nobody.
-const MIN_SECRET_LEN: usize = 8;
+pub(crate) const MIN_SECRET_LEN: usize = 8;
 
 /// Register a config's secrets as unpublishable. Idempotent; call it as often
 /// as configs are built (`Config::from_env` does).

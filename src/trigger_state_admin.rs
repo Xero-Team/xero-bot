@@ -9,6 +9,21 @@ fn run() -> xero_bot::trigger_state::Result<()> {
         return Err(usage.into());
     }
     let store = Store::open(std::path::Path::new(&args[0]))?;
+    if args[1] == "forgejo-inbox" || args[1] == "forgejo-resolve" {
+        let inbox = xero_bot::forgejo::inbox::Inbox::open(std::path::Path::new(&args[0]))?;
+        if args[1] == "forgejo-inbox" {
+            println!("{}", serde_json::to_string_pretty(&inbox.status()?)?);
+        } else {
+            if args.len() != 5 {
+                return Err(
+                    "usage: trigger-state DATA_DIR forgejo-resolve KEY done|not-sent EVIDENCE"
+                        .into(),
+                );
+            }
+            inbox.resolve(&args[2], &args[3], &args[4])?;
+        }
+        return Ok(());
+    }
     if args[1] == "restore-notification-ledger" {
         if args.len() != 7 {
             return Err(usage.into());

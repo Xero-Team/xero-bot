@@ -138,24 +138,47 @@ async fn handle_issue_comment_with_client(
     let mut blocked = Vec::new();
 
     for candidate in parsed.commands {
+        let self_request = matches!(&candidate.command, Command::Assign { user } | Command::RequestReview { user }
+            if crate::github::normalize_login(user) == crate::github::normalize_login(&cfg.bot_name)
+                || user.eq_ignore_ascii_case(bot_login));
+        if self_request {
+            diagnostics.push(crate::commands::diag::Diagnostic::SelfRequestIgnored {
+                span: candidate.span.clone(),
+            });
+            continue;
+        }
         let mut gate = comments.gate(candidate.id(), job.is_pr, candidate.is_explicit(), false);
         if matches!(&gate, Err(problem) if problem.code == crate::config::repository::ReasonCode::SessionRequired)
         {
             let open = match session.as_ref() {
                 Some(call) => {
-                    let checked = session_allowed.get_or_insert_with(|| {
-                        store
-                            .session_before_at(call, comments.ttl_days, now_ms())
-                            .unwrap_or(None)
-                            .is_some()
-                    });
-                    *checked
+                    if session_allowed.is_none() {
+                        session_allowed = Some(
+                            match store.session_before_at(call, comments.ttl_days, now_ms()) {
+                                Ok(wake) => wake.is_some(),
+                                Err(error) => {
+                                    tracing::error!(repo=%job.repo, "Forgejo session storage unavailable: {error}");
+                                    let _ = reply(client, &job.repo, job.number, lang.pick(
+                                    "⚠️ Session storage is unavailable; no command was executed.",
+                                    "⚠️ 会话存储不可用，未执行任何指令。"
+                                )).await;
+                                    return Err("Forgejo session storage unavailable".into());
+                                }
+                            },
+                        );
+                    }
+                    session_allowed.unwrap_or(false)
                 }
                 None => false,
             };
             gate = comments.gate(candidate.id(), job.is_pr, candidate.is_explicit(), open);
         }
         if let Err(problem) = gate {
+            if problem.code == crate::config::repository::ReasonCode::SessionRequired
+                && super::inbox::can_defer_session()
+            {
+                return Err("waiting for an earlier Forgejo session wake".into());
+            }
             blocked.push(problem.message(lang));
             continue;
         }
@@ -164,11 +187,23 @@ async fn handle_issue_comment_with_client(
             continue;
         }
         if candidate.is_explicit()
+            && !matches!(
+                candidate.command,
+                Command::Review | Command::Codeql | Command::Queue
+            )
             && comments.mode(candidate.id()) != crate::config::repository::ManualMode::AlwaysMention
         {
             wake = true;
         }
         permitted.push(candidate);
+    }
+
+    if wake {
+        if let Some(wake) = session.as_ref() {
+            store
+                .record_wake(wake)
+                .map_err(|error| format!("Forgejo session storage unavailable: {error}"))?;
+        }
     }
 
     let commands = resolve_commands(&cfg.bot_name, permitted, &mut diagnostics);
@@ -183,13 +218,6 @@ async fn handle_issue_comment_with_client(
     }
     if !message.is_empty() {
         let _ = reply(client, &job.repo, job.number, &message).await;
-    }
-    if wake {
-        if let Some(wake) = session.as_ref() {
-            if let Err(error) = store.record_wake(wake) {
-                tracing::warn!(repo = %job.repo, "Forgejo session wake was not recorded: {error}");
-            }
-        }
     }
 
     let ctx = CommandContext {
@@ -220,14 +248,26 @@ async fn load_comments(client: &ForgejoClient, repo: &str) -> Result<Comments, S
         .as_str()
         .filter(|branch| !branch.is_empty())
         .ok_or("Forgejo repository metadata has no default branch")?;
+    let branch_info = client
+        .get(&format!(
+            "/repos/{repo}/branches/{}",
+            crate::github::enc_seg(branch)
+        ))
+        .await
+        .map_err(|e| format!("cannot resolve Forgejo default branch: {e}"))?;
+    let commit = branch_info["commit"]["id"]
+        .as_str()
+        .filter(|sha| matches!(sha.len(), 40 | 64) && sha.bytes().all(|b| b.is_ascii_hexdigit()))
+        .ok_or("Forgejo default branch has no commit identity")?;
     let route = format!(
         "/repos/{repo}/contents/{}?ref={}",
         crate::github::enc_path(CONFIG_PATH),
-        crate::github::enc_seg(branch)
+        crate::github::enc_seg(commit)
     );
     let value = match client.get(&route).await {
         Ok(value) => value,
         Err(ForgejoError::Api { status: 404, .. }) => {
+            confirm_policy_absent(client, repo, commit).await?;
             return RepositoryConfig::parse("", repo)
                 .and_then(|config| config.comments)
                 .map_err(|problem| problem.to_string());
@@ -252,13 +292,51 @@ async fn load_comments(client: &ForgejoClient, repo: &str) -> Result<Comments, S
         .map_err(|problem| problem.to_string())
 }
 
-fn valid_repository(repo: &str) -> bool {
+/// A file 404 can hide missing permissions. Only a readable parent listing at
+/// the same commit can prove absence; a second ambiguous 404 remains closed.
+async fn confirm_policy_absent(
+    client: &ForgejoClient,
+    repo: &str,
+    commit: &str,
+) -> Result<(), String> {
+    let parent = client
+        .get(&format!("/repos/{repo}/contents/.github?ref={commit}"))
+        .await;
+    let (listing, name) = match parent {
+        Ok(listing) => (listing, "xero-bot.toml"),
+        Err(ForgejoError::Api { status: 404, .. }) => (
+            client
+                .get(&format!("/repos/{repo}/contents?ref={commit}"))
+                .await
+                .map_err(|e| format!("cannot verify Forgejo policy absence: {e}"))?,
+            ".github",
+        ),
+        Err(e) => return Err(format!("cannot verify Forgejo policy absence: {e}")),
+    };
+    let entries = listing
+        .as_array()
+        .ok_or("Forgejo policy parent is not a directory listing")?;
+    for entry in entries {
+        let current = entry["name"]
+            .as_str()
+            .ok_or("malformed Forgejo directory listing")?;
+        if current == name {
+            return Err("Forgejo policy exists but its contents are unreadable".into());
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn valid_repository(repo: &str) -> bool {
     let Some((owner, name)) = repo.split_once('/') else {
         return false;
     };
     !owner.is_empty()
         && !name.is_empty()
         && !name.contains('/')
+        && ![owner, name]
+            .into_iter()
+            .any(|part| part == "." || part.contains(".."))
         && [owner, name].into_iter().all(|part| {
             part.chars()
                 .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
@@ -291,7 +369,11 @@ fn session_wake(cfg: &Config, job: &CommentJob) -> Option<SessionWake> {
 }
 
 fn forgejo_namespace(base_url: &str) -> i64 {
-    let digest = Sha256::digest(base_url.trim_end_matches('/').as_bytes());
+    let canonical = reqwest::Url::parse(base_url.trim())
+        .map(|url| url.to_string())
+        .unwrap_or_else(|_| base_url.trim().to_string());
+    let canonical = canonical.trim_end_matches('/').trim_end_matches("/api/v1");
+    let digest = Sha256::digest(format!("forgejo:{canonical}").as_bytes());
     let value =
         u64::from_be_bytes(digest[..8].try_into().expect("sha256 prefix")) & i64::MAX as u64;
     value.max(1) as i64
@@ -331,6 +413,14 @@ async fn authorize(
                         "⚠️ 本部署未开启代他人审批。",
                     )
                     .to_string());
+            }
+            if job.author.trim().is_empty() {
+                return Err(lang
+                    .pick(
+                        "⚠️ Could not verify the PR author; no approval was created.",
+                        "⚠️ 无法确认 PR 作者，未创建审批。",
+                    )
+                    .into());
             }
             let credited = on_behalf_of.as_deref().unwrap_or(&job.commenter);
             if job.commenter.eq_ignore_ascii_case(&job.author)
@@ -482,12 +572,26 @@ async fn assign_membership(ctx: &CommandContext<'_>, target: Option<&str>, add: 
             return;
         }
     };
-    let mut assignees: Vec<String> = issue["assignees"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|user| user["login"].as_str().map(str::to_owned))
-        .collect();
+    let assignees = issue["assignees"].as_array().and_then(|users| {
+        users
+            .iter()
+            .map(|user| {
+                user["login"]
+                    .as_str()
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned)
+            })
+            .collect::<Option<Vec<_>>>()
+    });
+    let Some(mut assignees) = assignees else {
+        let _ = reply_error(
+            ctx,
+            "read issue assignees",
+            &ForgejoError::InvalidResponse("missing or malformed assignee list".into()),
+        )
+        .await;
+        return;
+    };
     if add {
         if !assignees
             .iter()
@@ -533,46 +637,84 @@ async fn assign_membership(ctx: &CommandContext<'_>, target: Option<&str>, add: 
     }
 }
 
-async fn set_labels(ctx: &CommandContext<'_>, add: &[String], remove: &[String]) {
-    let base = format!("/repos/{}/issues/{}", ctx.job.repo, ctx.job.number);
-    let mut failures = Vec::new();
-    if !add.is_empty() {
-        if let Err(error) = ctx
+async fn change_labels(
+    ctx: &CommandContext<'_>,
+    add: &[String],
+    remove: &[String],
+) -> Result<(), ForgejoError> {
+    let mut labels = ctx
+        .client
+        .get_all(&format!("/repos/{}/labels", ctx.job.repo), 50)
+        .await?;
+    // Organization labels may be available without being repository-local.
+    if add
+        .iter()
+        .any(|name| !labels.iter().any(|v| v["name"].as_str() == Some(name)))
+    {
+        let owner = ctx.job.repo.split('/').next().unwrap_or_default();
+        match ctx
             .client
-            .post(&format!("{base}/labels"), json!({"labels": add}))
+            .get_all(&format!("/orgs/{owner}/labels"), 50)
             .await
         {
-            failures.push(format!("add labels: {error}"));
+            Ok(org_labels) => labels.extend(org_labels),
+            Err(ForgejoError::Api { status: 404, .. }) => {}
+            Err(error) => return Err(error),
         }
     }
-    for label in remove {
-        if let Err(ForgejoError::Api { status: 404, .. }) = ctx
-            .client
-            .delete(&format!("{base}/labels/{}", crate::github::enc_seg(label)))
-            .await
-        {
-            continue;
-        } else if let Err(error) = ctx
-            .client
-            .delete(&format!("{base}/labels/{}", crate::github::enc_seg(label)))
-            .await
-        {
-            failures.push(format!("remove {label}: {error}"));
+    let resolve = |name: &str| -> Result<Option<i64>, ForgejoError> {
+        let mut matches = labels.iter().filter(|v| v["name"].as_str() == Some(name));
+        let Some(label) = matches.next() else {
+            return Ok(None);
+        };
+        if matches.next().is_some() {
+            return Err(ForgejoError::InvalidResponse(format!(
+                "ambiguous label: {name}"
+            )));
         }
-    }
-    let body = if failures.is_empty() {
-        ctx.lang
-            .pick("✅ Labels updated.", "✅ 标签已更新。")
-            .to_string()
-    } else {
-        format!(
-            "{} {}",
-            ctx.lang
-                .pick("⚠️ Some label changes failed:", "⚠️ 部分标签修改失败："),
-            failures.join("; ")
-        )
+        label["id"]
+            .as_i64()
+            .filter(|id| *id > 0)
+            .map(Some)
+            .ok_or_else(|| ForgejoError::InvalidResponse("label has no numeric ID".into()))
     };
-    let _ = reply(ctx.client, &ctx.job.repo, ctx.job.number, &body).await;
+    let ids = add
+        .iter()
+        .map(|name| {
+            resolve(name)?.ok_or_else(|| {
+                ForgejoError::InvalidResponse(format!("label does not exist: {name}"))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let removals = remove
+        .iter()
+        .map(|name| resolve(name))
+        .collect::<Result<Vec<_>, _>>()?;
+    let route = format!("/repos/{}/issues/{}/labels", ctx.job.repo, ctx.job.number);
+    if !ids.is_empty() {
+        ctx.client.post(&route, json!({"labels":ids})).await?;
+    }
+    for id in removals.into_iter().flatten() {
+        ctx.client.delete(&format!("{route}/{id}")).await?;
+    }
+    Ok(())
+}
+
+async fn set_labels(ctx: &CommandContext<'_>, add: &[String], remove: &[String]) {
+    match change_labels(ctx, add, remove).await {
+        Ok(()) => {
+            let _ = reply(
+                ctx.client,
+                &ctx.job.repo,
+                ctx.job.number,
+                ctx.lang.pick("✅ Labels updated.", "✅ 标签已更新。"),
+            )
+            .await;
+        }
+        Err(error) => {
+            let _ = reply_error(ctx, "change labels", &error).await;
+        }
+    }
 }
 
 async fn set_status(ctx: &CommandContext<'_>, command: Command) {
@@ -597,27 +739,22 @@ async fn set_status(ctx: &CommandContext<'_>, command: Command) {
     .filter(|candidate| candidate.as_str() != label.as_str())
     .cloned()
     .collect();
-    if let Err(error) = ctx
-        .client
-        .post(
-            &format!("/repos/{}/issues/{}/labels", ctx.job.repo, ctx.job.number),
-            json!({"labels": [label]}),
-        )
-        .await
-    {
-        let _ = reply_error(ctx, "set status label", &error).await;
-        return;
-    }
-    for sibling in siblings {
-        let _ = ctx
-            .client
-            .delete(&format!(
-                "/repos/{}/issues/{}/labels/{}",
-                ctx.job.repo,
-                ctx.job.number,
-                crate::github::enc_seg(&sibling)
-            ))
+    match super::inbox::status_is_current() {
+        Ok(true) => {}
+        Ok(false) => return,
+        Err(error) => {
+            let _ = reply_error(
+                ctx,
+                "check status ordering",
+                &ForgejoError::InvalidResponse(error),
+            )
             .await;
+            return;
+        }
+    }
+    if let Err(error) = change_labels(ctx, std::slice::from_ref(label), &siblings).await {
+        let _ = reply_error(ctx, "set status labels", &error).await;
+        return;
     }
     let body = crate::t!(
         ctx.lang,
@@ -737,7 +874,13 @@ async fn reject(ctx: &CommandContext<'_>) {
             Err(error) => last_error = Some(error),
         }
     }
-    let body = if dismissed > 0 {
+    let body = if let Some(error) = last_error {
+        crate::t!(
+            ctx.lang,
+            "⚠️ Withdrew {dismissed} approval(s), but some withdrawals failed: {error}",
+            "⚠️ 已撤回 {dismissed} 个审批，但部分撤回失败：{error}"
+        )
+    } else if dismissed > 0 {
         crate::t!(
             ctx.lang,
             "✅ Withdrew {dismissed} xero-bot approval(s).",
@@ -748,9 +891,7 @@ async fn reject(ctx: &CommandContext<'_>) {
             "{} {}",
             ctx.lang
                 .pick("❌ Could not withdraw approval:", "❌ 撤回审批失败："),
-            last_error
-                .map(|error| error.to_string())
-                .unwrap_or_else(|| "unknown".into())
+            "unknown"
         )
     };
     let _ = reply(ctx.client, &ctx.job.repo, ctx.job.number, &body).await;
@@ -794,6 +935,7 @@ fn help_text(bot_name: &str, lang: Lang) -> String {
              Mention `@{bot_name}` for commands whose repository policy requires it. \
              `review`, `codeql`, `queue`, GitHub Checks, and the GitHub merge queue are \
              not available on the Forgejo provider.\n\n\
+             `ready` changes status labels only; use `r? @reviewer` to notify a reviewer.\n\n\
              Configuration: `.github/xero-bot.toml` on the Forgejo default branch."
         ),
         Lang::Zh => format!(
@@ -803,6 +945,7 @@ fn help_text(bot_name: &str, lang: Lang) -> String {
              `r+`、`r-`。\n\n\
              仓库策略要求时请显式 @{bot_name}。`review`、`codeql`、`queue`、\
              GitHub Checks 和 GitHub 合并队列暂不适用于 Forgejo provider。\n\n\
+             `ready` 仅修改状态标签；请用 `r? @reviewer` 通知审查者。\n\n\
              配置来源：Forgejo 默认分支上的 `.github/xero-bot.toml`。"
         ),
     }
@@ -838,7 +981,7 @@ mod tests {
     fn cfg() -> Config {
         let mut cfg = Config::from_env();
         cfg.bot_name = "xero-review".into();
-        cfg.forgejo_base_url = "http://forgejo.invalid".into();
+        cfg.forgejo_base_url = "https://forgejo.invalid".into();
         cfg.forgejo_token = "test-token".into();
         cfg.forgejo_webhook_secret = "webhook-secret".into();
         cfg
@@ -872,6 +1015,18 @@ mod tests {
             .respond_with(
                 ResponseTemplate::new(200).set_body_json(json!({"default_branch": "main"})),
             )
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/team/repo/branches/main"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"commit":{"id":"a".repeat(40)}})),
+            )
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/team/repo/contents/.github"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
             .mount(server)
             .await;
         Mock::given(method("GET"))
@@ -1058,4 +1213,5 @@ mod tests {
             .await
             .unwrap();
     }
+    include!("commands_audit_tests.rs");
 }
