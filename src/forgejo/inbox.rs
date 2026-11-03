@@ -259,7 +259,9 @@ pub(super) fn after_write(
     let Err(error) = result else { return Ok(()) };
     let uncertain = matches!(
         error,
-        ForgejoError::Transport(_) | ForgejoError::InvalidResponse(_)
+        ForgejoError::Transport(_)
+            | ForgejoError::InvalidResponse(_)
+            | ForgejoError::UnknownWriteOutcome(_)
     ) || matches!(error,ForgejoError::Api{status,..} if *status>=500);
     ACTIVE.try_with(|a| {
         a.inbox.db()?.execute("UPDATE comments SET failed=1,uncertain=MAX(uncertain,?2),detail=?3 WHERE key=?1",
