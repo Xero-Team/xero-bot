@@ -649,6 +649,7 @@ async fn change_labels(
     // Organization labels may be available without being repository-local.
     if add
         .iter()
+        .chain(remove)
         .any(|name| !labels.iter().any(|v| v["name"].as_str() == Some(name)))
     {
         let owner = ctx.job.repo.split('/').next().unwrap_or_default();

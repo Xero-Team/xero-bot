@@ -124,3 +124,19 @@ async fn audit_actual_bot_identity_cannot_be_assigned_or_wake_a_session() {
     assert!(store.session_before_at(&future,30,future.source_at).unwrap().is_none());
     assert!(server.received_requests().await.unwrap().iter().all(|r|r.method!="PATCH"));
 }
+
+#[tokio::test]
+async fn audit_organization_labels_can_be_removed_by_numeric_id() {
+    let server=MockServer::start().await;
+    Mock::given(method("GET")).and(path("/api/v1/repos/team/repo/labels"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([]))).mount(&server).await;
+    Mock::given(method("GET")).and(path("/api/v1/orgs/team/labels"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([{"id":9,"name":"org-triage"}]))).expect(1).mount(&server).await;
+    Mock::given(method("DELETE")).and(path("/api/v1/repos/team/repo/issues/7/labels/9"))
+        .respond_with(ResponseTemplate::new(204)).expect(1).mount(&server).await;
+    Mock::given(method("POST")).respond_with(ResponseTemplate::new(201).set_body_json(json!({"id":1}))).mount(&server).await;
+    let cfg=cfg();let job=comment_job("@xero-review label -org-triage",false);
+    let client=ForgejoClient::new(&server.uri(),"test-token").unwrap();
+    let ctx=CommandContext{client:&client,cfg:&cfg,job:&job,bot_login:"xero-review",lang:Lang::En};
+    set_labels(&ctx,&[],&["org-triage".into()]).await;
+}
