@@ -68,8 +68,8 @@ Forgejo webhook 的 `issue_comment` / `pull_request_comment` 会复用现有 lex
 installation 的会话混用。
 
 `review`、`codeql`、`queue`、GitHub Checks 和 GitHub 合并队列是 GitHub 专属能力；
-Forgejo 上会明确回复“不支持”，不会静默成功。Forgejo Actions 的 CI 结果与 AI review
-适配属于后续独立工作。
+Forgejo 上会明确回复“不支持”，不会静默成功。Forgejo Actions CI 使用独立的
+`.forgejo/workflows/ci.yml`；AI review 适配仍属于后续独立工作。
 
 ## 持久化与恢复
 
@@ -120,6 +120,21 @@ GitHub 与 Forgejo 使用同一严格解析器。Forgejo 的 `repository_config`
 
 同步执行只调用 Forgejo `POST /api/v1/repos/{owner}/{repo}/mirror-sync`，方向固定为
 GitHub → Forgejo。
+
+### Forgejo Actions CI
+
+Forgejo 侧工作流位于 `.forgejo/workflows/ci.yml`，与 GitHub CI 执行相同的格式、
+Clippy 和测试命令。它是独立文件，因为 Forgejo 不读取 GitHub 的 workflow 目录；
+修改 CI 命令时需要同步更新两份工作流。
+
+镜像同步把 GitHub 的 Push 落到 Forgejo 后，Forgejo Actions 会在该 Push 上再运行一次
+同一套检查。仓库必须启用 Actions 单元，并且至少有一个在线的 Forgejo Runner：
+
+- Runner 标签：`ubuntu-latest`、`ubuntu-22.04`、`docker`
+- `ubuntu-latest` 后端镜像：`rust:1.99-bookworm`
+- Runner 使用部署环境的 Docker socket 启动隔离的任务容器
+
+CI 不依赖 GitHub App、AI key 或 webhook secret。
 
 ### 触发与对账
 

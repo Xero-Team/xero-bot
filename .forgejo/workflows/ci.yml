@@ -1,0 +1,33 @@
+name: CI
+
+# Keep this workflow aligned with .github/workflows/ci.yml. Forgejo jobs run in
+# the Rust image configured on the Forgejo runner, so no toolchain download is
+# needed here.
+on:
+  push:
+    branches: [main, staging]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: "fmt, clippy, test"
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test --locked --all-targets
