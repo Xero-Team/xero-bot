@@ -1,8 +1,9 @@
 //! Self-hosted server (Docker / VPS): axum HTTP server.
 //!
 //! Routes:
-//!   POST /webhook  — GitHub App webhook receiver
-//!   GET  /health   — liveness
+//!   POST /webhook          — GitHub App webhook receiver
+//!   POST /webhook/forgejo  — Forgejo token-provider webhook receiver
+//!   GET  /health           — liveness
 //!   GET  /cron     — rebase sweep (protect with CRON_SECRET, or bind to
 //!                    localhost and drive it with an external cron)
 //!
@@ -186,6 +187,7 @@ async fn main() {
         .route("/", get(health))
         .route("/health", get(health))
         .route("/webhook", post(webhook))
+        .route("/webhook/forgejo", post(forgejo_webhook))
         .route("/cron", get(cron_sweep))
         .with_state(state);
 
@@ -202,7 +204,10 @@ async fn main() {
             std::process::exit(2);
         }
     };
-    println!("xero-bot listening on 0.0.0.0:{port} (POST /webhook, GET /cron) — bot: @{bot_name}");
+    println!(
+        "xero-bot listening on 0.0.0.0:{port} \
+         (POST /webhook, POST /webhook/forgejo, GET /cron) — bot: @{bot_name}"
+    );
 
     if let Err(e) = axum::serve(listener, app).await {
         eprintln!("ERROR: server stopped: {e}");
@@ -316,6 +321,60 @@ async fn webhook(
                 Json(json!({"accepted": true, "persisted": durable.is_some()})),
             )
         }
+    }
+}
+
+/// Forgejo webhook ingress. Provider execution lands in the follow-up command
+/// and mirror-sync issues; this endpoint only establishes the verified trust
+/// boundary and never accepts an unsigned or unconfigured request.
+async fn forgejo_webhook(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> (StatusCode, Json<Value>) {
+    if state.cfg.forgejo_webhook_secret.trim().is_empty()
+        && (!state.cfg.forgejo_base_url.trim().is_empty()
+            || !state.cfg.forgejo_token.trim().is_empty())
+    {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "invalid signature"})),
+        );
+    }
+    if !state.cfg.forgejo_ready() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "Forgejo provider is not configured"})),
+        );
+    }
+    let signature = headers
+        .get("x-forgejo-signature")
+        .or_else(|| headers.get("x-gitea-signature"))
+        .and_then(|value| value.to_str().ok());
+    if !xero_bot::forgejo::verify_signature(&state.cfg.forgejo_webhook_secret, &body, signature) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "invalid signature"})),
+        );
+    }
+    let event_header = headers
+        .get("x-forgejo-event")
+        .or_else(|| headers.get("x-gitea-event"))
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    let payload: Value = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(_) => return (StatusCode::BAD_REQUEST, Json(json!({"error": "bad json"}))),
+    };
+    match xero_bot::forgejo::classify(event_header, &payload) {
+        xero_bot::forgejo::ForgejoEvent::Ping => (StatusCode::OK, Json(json!({"ok": "pong"}))),
+        xero_bot::forgejo::ForgejoEvent::Ignored(reason) => {
+            (StatusCode::OK, Json(json!({"ignored": reason})))
+        }
+        _ => (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(json!({"error": "Forgejo event execution is not enabled"})),
+        ),
     }
 }
 
@@ -465,6 +524,93 @@ mod trigger_ingress_tests {
         assert_ne!(result.0["accepted"], true);
         assert!(s.triggers.store.list(None).unwrap().is_empty());
     }
+    #[tokio::test]
+    async fn audit_forgejo_empty_secret_is_unauthorized() {
+        let dir = Dir::new();
+        let mut s = state(&dir);
+        s.cfg.forgejo_base_url = "https://forgejo.example".into();
+        s.cfg.forgejo_token = "test-token".into();
+        s.cfg.forgejo_webhook_secret.clear();
+        assert_eq!(
+            forgejo_webhook(State(s), HeaderMap::new(), b"{}".as_slice().into())
+                .await
+                .0,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[tokio::test]
+    async fn audit_forgejo_webhook_http_headers_and_signatures() {
+        let dir = Dir::new();
+        let provider = wiremock::MockServer::start().await;
+        let mut s = state(&dir);
+        s.cfg.forgejo_base_url = provider.uri();
+        s.cfg.forgejo_token = "test-token".into();
+        s.cfg.forgejo_webhook_secret = "webhook-secret".into();
+        let app = Router::new()
+            .route("/webhook/forgejo", post(forgejo_webhook))
+            .with_state(s);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/webhook/forgejo", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = reqwest::Client::new();
+        let mut mac = xero_bot::forgejo::HmacSha256::new_from_slice(b"webhook-secret").unwrap();
+        mac.update(b"{}");
+        let signature = hex::encode(mac.finalize().into_bytes());
+        for provider_name in ["forgejo", "gitea"] {
+            for sig in [signature.clone(), format!("sha256={signature}")] {
+                let response = client
+                    .post(&url)
+                    .header(format!("x-{provider_name}-event"), "ping")
+                    .header(format!("x-{provider_name}-signature"), sig)
+                    .body("{}")
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                assert_eq!(response.json::<Value>().await.unwrap()["ok"], "pong");
+            }
+            for sig in [None, Some(""), Some("00"), Some("not-hex")] {
+                let mut request = client
+                    .post(&url)
+                    .header(format!("x-{provider_name}-event"), "ping")
+                    .body("{}");
+                if let Some(sig) = sig {
+                    request = request.header(format!("x-{provider_name}-signature"), sig);
+                }
+                assert_eq!(
+                    request.send().await.unwrap().status(),
+                    StatusCode::UNAUTHORIZED
+                );
+            }
+            let response = client
+                .post(&url)
+                .header(format!("x-{provider_name}-signature"), &signature)
+                .body("{}")
+                .send()
+                .await
+                .unwrap();
+            assert!(response.json::<Value>().await.unwrap()["ignored"].is_string());
+        }
+        server.abort();
+        assert!(provider.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn audit_unconfigured_forgejo_webhook_is_unavailable() {
+        let dir = Dir::new();
+        let mut s = state(&dir);
+        s.cfg.forgejo_base_url.clear();
+        s.cfg.forgejo_token.clear();
+        s.cfg.forgejo_webhook_secret.clear();
+        assert_eq!(
+            forgejo_webhook(State(s), HeaderMap::new(), b"{}".as_slice().into())
+                .await
+                .0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
     /// Ordinary discussion and self replies must never consume durable inbox space.
     #[tokio::test]
     async fn irrelevant_and_self_comments_are_filtered_before_persistence() {
