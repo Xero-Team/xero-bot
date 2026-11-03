@@ -789,7 +789,7 @@ async fn execute_work_inner(cfg: &Config, work: Work) -> Result<(), String> {
                 .map_err(|e| format!("installation client: {e}"))?;
             crate::rebase::handle_base_push(&gh, cfg, &repo, &ref_name).await;
             if let Some(repository_id) = repository_id.filter(|id| *id > 0) {
-                let status = crate::forgejo::sync::sync_repository(
+                crate::forgejo::sync::sync_repository(
                     &gh,
                     cfg,
                     &repo,
@@ -799,16 +799,6 @@ async fn execute_work_inner(cfg: &Config, work: Work) -> Result<(), String> {
                     },
                 )
                 .await;
-                if matches!(
-                    status,
-                    crate::forgejo::sync::SyncOutcome::Requested
-                        | crate::forgejo::sync::SyncOutcome::MirrorDisabled
-                        | crate::forgejo::sync::SyncOutcome::ProviderDisabled
-                ) {
-                    tracing::info!("Forgejo mirror sync {repo}: {status}");
-                } else {
-                    tracing::warn!("Forgejo mirror sync {repo}: {status}");
-                }
             } else {
                 tracing::warn!("Forgejo mirror sync {repo}: push payload has no repository id");
             }

@@ -93,7 +93,17 @@ async fn sync_repository_with_cache(
             return outcome;
         }
     };
-    sync_destination(cfg, destination).await
+    let outcome = sync_destination(cfg, destination).await;
+    let status = match &outcome {
+        SyncOutcome::Rejected(status) => Some(*status),
+        _ => None,
+    };
+    if outcome == SyncOutcome::Requested {
+        tracing::info!(source = repo, destination, result = %outcome, status, "Forgejo mirror sync request completed");
+    } else {
+        tracing::warn!(source = repo, destination, result = %outcome, status, "Forgejo mirror sync request failed");
+    }
+    outcome
 }
 
 fn mirror_destination(mirror: &ForgejoMirrorConfig) -> Result<&str, SyncOutcome> {
@@ -256,7 +266,6 @@ async fn sweep_once(cfg: &Config) -> String {
                 SyncOutcome::Requested => requested += 1,
                 SyncOutcome::ProviderDisabled | SyncOutcome::MirrorDisabled => skipped += 1,
                 _ => {
-                    tracing::warn!(repo, "Forgejo sweep sync failed: {outcome}");
                     errors += 1;
                 }
             }
@@ -330,27 +339,23 @@ mod tests {
         assert_eq!(outcome, SyncOutcome::Requested);
     }
 
-    #[tokio::test]
-    async fn repository_policy_gates_the_mirror_request() {
+    async fn github_policy(github: &MockServer, policy: &str) -> Client {
         use base64::Engine;
         use wiremock::matchers::query_param;
-
-        let github = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/repos/team/repo"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "id": 9, "default_branch": "main"
             })))
-            .mount(&github)
+            .mount(github)
             .await;
         Mock::given(method("GET"))
             .and(path("/repos/team/repo/git/ref/heads/main"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "object": {"sha": "a".repeat(40)}
             })))
-            .mount(&github)
+            .mount(github)
             .await;
-        let policy = "[forgejo.mirror]\nenabled = true\ndestination = \"mirror-team/xero-bot\"";
         Mock::given(method("GET"))
             .and(path("/repos/team/repo/contents/.github/xero-bot.toml"))
             .and(query_param("ref", "a".repeat(40)))
@@ -360,44 +365,163 @@ mod tests {
                 "sha": "b".repeat(40),
                 "content": base64::engine::general_purpose::STANDARD.encode(policy)
             })))
-            .mount(&github)
+            .mount(github)
             .await;
 
-        let forgejo = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/api/v1/repos/mirror-team/xero-bot/mirror-sync"))
-            .respond_with(ResponseTemplate::new(200))
-            .expect(1)
-            .mount(&forgejo)
-            .await;
-
-        let crab = crate::github::client_builder()
-            .personal_token("github-token")
-            .base_uri(github.uri())
-            .unwrap()
-            .build()
-            .unwrap();
-        let gh = Client {
-            crab,
+        Client {
+            crab: crate::github::client_builder()
+                .personal_token("github-token")
+                .base_uri(github.uri())
+                .unwrap()
+                .build()
+                .unwrap(),
             app_slug: "xero-review".into(),
-        };
+        }
+    }
+
+    fn mirror_config(forgejo: &MockServer) -> Config {
         let mut cfg = Config::from_env();
         cfg.forgejo_base_url = forgejo.uri();
         cfg.forgejo_token = "forgejo-token".into();
         cfg.forgejo_webhook_secret = "webhook-secret".into();
-        let cache = RepositoryConfigCache::default();
-        let outcome = sync_repository_with_cache(
-            &gh,
-            &cfg,
-            "team/repo",
-            RepositoryKey {
-                installation_id: 1,
-                repository_id: 9,
-            },
-            &cache,
+        cfg
+    }
+
+    fn repository_key() -> RepositoryKey {
+        RepositoryKey {
+            installation_id: 1,
+            repository_id: 9,
+        }
+    }
+
+    #[tokio::test]
+    async fn repeated_pushes_and_reconciliation_only_write_the_forgejo_mirror_endpoint() {
+        let github = MockServer::start().await;
+        let gh = github_policy(
+            &github,
+            "[forgejo.mirror]\nenabled=true\ndestination='mirror-team/xero-bot'",
         )
         .await;
-        assert_eq!(outcome, SyncOutcome::Requested);
+        let forgejo = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/repos/mirror-team/xero-bot/mirror-sync"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(3)
+            .mount(&forgejo)
+            .await;
+        let cfg = mirror_config(&forgejo);
+        let cache = RepositoryConfigCache::default();
+        for _ in 0..2 {
+            assert_eq!(
+                sync_repository_with_cache(&gh, &cfg, "team/repo", repository_key(), &cache).await,
+                SyncOutcome::Requested
+            );
+        }
+        let gate = tokio::sync::Mutex::new(None);
+        let reconcile = || async {
+            sync_repository_with_cache(&gh, &cfg, "team/repo", repository_key(), &cache)
+                .await
+                .to_string()
+        };
+        assert_eq!(
+            reconcile_with_gate(&gate, reconcile).await,
+            "sync-requested"
+        );
+        assert!(reconcile_with_gate(&gate, reconcile)
+            .await
+            .contains("throttled"));
+        let github_requests = github.received_requests().await.unwrap();
+        assert!(!github_requests.is_empty());
+        assert!(
+            github_requests.iter().all(|r| r.method == "GET"),
+            "GitHub must receive no writes: {github_requests:?}"
+        );
+        let forgejo_requests = forgejo.received_requests().await.unwrap();
+        assert_eq!(forgejo_requests.len(), 3);
+        assert!(forgejo_requests.iter().all(|r| r.method == "POST"
+            && r.url.path() == "/api/v1/repos/mirror-team/xero-bot/mirror-sync"
+            && r.body.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn unavailable_disabled_and_invalid_policies_send_no_mirror_requests() {
+        for (policy, configured, expected) in [
+            ("", false, SyncOutcome::ProviderDisabled),
+            ("", true, SyncOutcome::MirrorDisabled),
+            (
+                "[forgejo.mirror]\nenabled=false\ndestination='mirror-team/xero-bot'",
+                true,
+                SyncOutcome::MirrorDisabled,
+            ),
+            (
+                "[forgejo.mirror]\nenabled=true\ndestination='owner/..'",
+                true,
+                SyncOutcome::InvalidConfiguration,
+            ),
+            (
+                "[forgejo.mirror]\nenabled=true",
+                true,
+                SyncOutcome::InvalidConfiguration,
+            ),
+            (
+                "[forgejo.mirror]\nenabled=false\nsecret='do-not-use'",
+                true,
+                SyncOutcome::InvalidConfiguration,
+            ),
+        ] {
+            let github = MockServer::start().await;
+            let gh = github_policy(&github, policy).await;
+            let forgejo = MockServer::start().await;
+            let mut cfg = mirror_config(&forgejo);
+            if !configured {
+                cfg.forgejo_token.clear();
+            }
+            let outcome = sync_repository_with_cache(
+                &gh,
+                &cfg,
+                "team/repo",
+                repository_key(),
+                &RepositoryConfigCache::default(),
+            )
+            .await;
+            assert_eq!(outcome, expected, "policy: {policy}");
+            assert!(forgejo.received_requests().await.unwrap().is_empty());
+            let requests = github.received_requests().await.unwrap();
+            assert!(requests.iter().all(|r| r.method == "GET"));
+            if !configured {
+                assert!(requests.is_empty());
+            }
+        }
+        let forgejo = MockServer::start().await;
+        for target in ["", "./repo", "owner/..", "https://other.example/repo"] {
+            assert_eq!(
+                sync_destination_with(&forgejo.uri(), "test-token", target).await,
+                SyncOutcome::InvalidConfiguration
+            );
+        }
+        assert!(forgejo.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn mirror_timeout_has_unknown_outcome_and_is_never_replayed() {
+        let forgejo = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/repos/mirror-team/xero-bot/mirror-sync"))
+            .respond_with(ResponseTemplate::new(200).set_delay(super::super::REQUEST_TIMEOUT * 2))
+            .expect(1)
+            .mount(&forgejo)
+            .await;
+        let outcome = tokio::time::timeout(
+            super::super::REQUEST_TIMEOUT + std::time::Duration::from_secs(3),
+            sync_destination_with(&forgejo.uri(), "test-token", "mirror-team/xero-bot"),
+        )
+        .await
+        .expect("mirror request must use the production timeout");
+        assert!(
+            matches!(outcome, SyncOutcome::Transport(ref message) if message.contains("write outcome is unknown")),
+            "{outcome}"
+        );
+        assert_eq!(forgejo.received_requests().await.unwrap().len(), 1);
     }
 
     #[tokio::test]
