@@ -30,4 +30,7 @@ jobs:
         run: cargo clippy --locked --all-targets -- -D warnings
 
       - name: cargo test
-        run: cargo test --locked --all-targets
+        # The state-machine tests include sub-second concurrency deadlines.
+        # Forgejo's shared runner serializes Cargo's test harness to avoid
+        # starving those deadlines when the host is busy.
+        run: cargo test --locked --all-targets -- --test-threads=1
