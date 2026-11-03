@@ -560,7 +560,7 @@ fn shipped_defaults_and_opt_in_examples_are_valid_and_separate() {
     assert!(production.problems().is_empty());
     let forgejo = production.forgejo.unwrap();
     assert!(forgejo.enabled);
-    assert_eq!(forgejo.destination.as_deref(), Some("zero-bot/xero-bot"));
+    assert_eq!(forgejo.destination.as_deref(), Some("xero-team/xero-bot"));
 
     let reference = parse(include_str!("../example.toml"));
     assert!(reference.problems().is_empty());
