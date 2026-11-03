@@ -274,3 +274,30 @@ async fn audit_interrupted_review_is_retained_without_replay_after_restart() {
         .unwrap();
     assert_eq!(inbox.status().unwrap()[0]["state"], "succeeded");
 }
+
+#[tokio::test]
+async fn unreadable_write_response_blocks_replay_and_following_thread_commands() {
+    let server = MockServer::start().await;
+    policy(&server, "").await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/repos/team/repo/issues/7/comments"))
+        .respond_with(ResponseTemplate::new(201).set_body_string("invalid JSON"))
+        .with_priority(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    let dir = Dir::new();
+    let cfg = cfg(&server.uri());
+    let store = Store::open(&dir.0).unwrap();
+    let inbox = Arc::new(Inbox::open(&dir.0).unwrap());
+    let job = event(10, "@bot ping");
+    inbox.enqueue(&cfg, &job).unwrap();
+    assert_eq!(inbox.pump(&cfg, &store).await.unwrap(), 1);
+    assert_eq!(inbox.status().unwrap()[0]["state"], "unknown");
+    assert!(!inbox.enqueue(&cfg, &job).unwrap());
+    inbox.enqueue(&cfg, &event(11, "@bot ping")).unwrap();
+    assert_eq!(inbox.pump(&cfg, &store).await.unwrap(), 0);
+    drop(inbox);
+    let inbox = Arc::new(Inbox::open(&dir.0).unwrap());
+    assert_eq!(inbox.pump(&cfg, &store).await.unwrap(), 0);
+}
