@@ -14,6 +14,10 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # Forgejo injects FORGEJO_TOKEN into every job. Supply the other two provider
+  # values so config-validation tests do not see a deliberately incomplete set.
+  FORGEJO_BASE_URL: http://localhost:3000
+  FORGEJO_WEBHOOK_SECRET: forgejo-ci-test-secret
 
 jobs:
   check:
