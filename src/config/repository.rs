@@ -444,7 +444,7 @@ struct RawForgejo {
 #[serde(default, deny_unknown_fields)]
 struct RawForgejoMirror {
     enabled: bool,
-    destination: String,
+    destination: Option<String>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -559,14 +559,7 @@ impl RepositoryConfig {
 /// omit `destination`, but a destination that is present is always validated so
 /// enabling it later cannot turn a typo into an unintended repository target.
 fn forgejo(raw: RawForgejo) -> Domain<ForgejoMirrorConfig> {
-    let destination = raw.mirror.destination.as_str();
-    if destination.trim() != destination {
-        return Err(Problem::new(
-            ReasonCode::InvalidForgejoSync,
-            "Forgejo mirror destination must not contain surrounding whitespace",
-        ));
-    }
-    if destination.is_empty() {
+    let Some(destination) = raw.mirror.destination.as_deref() else {
         return if raw.mirror.enabled {
             Err(Problem::new(
                 ReasonCode::InvalidForgejoSync,
@@ -575,6 +568,12 @@ fn forgejo(raw: RawForgejo) -> Domain<ForgejoMirrorConfig> {
         } else {
             Ok(ForgejoMirrorConfig::disabled())
         };
+    };
+    if destination.is_empty() || destination.trim() != destination {
+        return Err(Problem::new(
+            ReasonCode::InvalidForgejoSync,
+            "Forgejo mirror destination must be nonempty without surrounding whitespace",
+        ));
     }
     let Some((owner, repository)) = destination.split_once('/') else {
         return Err(Problem::new(

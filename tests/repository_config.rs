@@ -707,3 +707,10 @@ fn forgejo_mirror_configuration_is_strict_and_fail_closed() {
         assert_eq!(error.code, ReasonCode::InvalidDocument, "{document}");
     }
 }
+
+#[test]
+fn forgejo_explicit_empty_destination_is_invalid_even_when_disabled() {
+    assert!(parse("[forgejo.mirror]\nenabled=false\ndestination='' ")
+        .forgejo
+        .is_err());
+}
