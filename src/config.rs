@@ -20,6 +20,11 @@ pub struct Config {
     /// resolve it via `GET /app`; set it on serverless to skip that round trip.
     pub app_slug: String,
 
+    // Forgejo provider (independent token API + webhook secret)
+    pub forgejo_base_url: String,
+    pub forgejo_token: String,
+    pub forgejo_webhook_secret: String,
+
     // AI provider (builtin engine)
     pub ai_base_url: String,
     pub ai_api_key: String,
@@ -231,6 +236,10 @@ impl Config {
             bot_name: cfg("BOT_NAME", "xero-review"),
             app_slug: cfg("APP_SLUG", ""),
 
+            forgejo_base_url: cfg("FORGEJO_BASE_URL", ""),
+            forgejo_token: cfg("FORGEJO_TOKEN", ""),
+            forgejo_webhook_secret: cfg("FORGEJO_WEBHOOK_SECRET", ""),
+
             ai_base_url: cfg("AI_BASE_URL", ""),
             ai_api_key: cfg("AI_API_KEY", ""),
             ai_model: cfg("AI_MODEL", ""),
@@ -299,6 +308,11 @@ impl Config {
         if !missing.is_empty() {
             return Err(format!("missing required env vars: {}", missing.join(", ")));
         }
+        validate_forgejo_values(
+            &self.forgejo_base_url,
+            &self.forgejo_token,
+            &self.forgejo_webhook_secret,
+        )?;
 
         // Parse the key now: signing happens on a background task whose errors
         // are only logged, so an unusable key would otherwise surface as a
@@ -347,6 +361,14 @@ impl Config {
         Ok(())
     }
 
+    /// Forgejo is opt-in at deployment level. All three values are required
+    /// together so an incomplete setup cannot silently downgrade security.
+    pub fn forgejo_ready(&self) -> bool {
+        !self.forgejo_base_url.trim().is_empty()
+            && !self.forgejo_token.trim().is_empty()
+            && !self.forgejo_webhook_secret.trim().is_empty()
+    }
+
     /// AI config is only needed when a review actually runs; check lazily.
     pub fn ai_ready(&self) -> bool {
         !self.ai_base_url.is_empty() && !self.ai_api_key.is_empty() && !self.ai_model.is_empty()
@@ -356,5 +378,59 @@ impl Config {
         self.private_key_pem
             .as_deref()
             .ok_or_else(|| "GitHub App private key not configured".to_string())
+    }
+}
+
+/// Validate the optional Forgejo deployment triple without echoing secrets.
+fn validate_forgejo_values(
+    base_url: &str,
+    token: &str,
+    webhook_secret: &str,
+) -> Result<(), String> {
+    let supplied = [base_url, token, webhook_secret]
+        .into_iter()
+        .filter(|value| !value.trim().is_empty())
+        .count();
+    if supplied == 0 {
+        return Ok(());
+    }
+    let missing: Vec<_> = [
+        ("FORGEJO_BASE_URL", base_url),
+        ("FORGEJO_TOKEN", token),
+        ("FORGEJO_WEBHOOK_SECRET", webhook_secret),
+    ]
+    .into_iter()
+    .filter_map(|(name, value)| value.trim().is_empty().then_some(name))
+    .collect();
+    if !missing.is_empty() {
+        return Err(format!(
+            "Forgejo configuration is incomplete; missing: {}",
+            missing.join(", ")
+        ));
+    }
+    let url = reqwest::Url::parse(base_url.trim())
+        .map_err(|_| "FORGEJO_BASE_URL is not a valid absolute URL".to_string())?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        return Err("FORGEJO_BASE_URL must be an absolute http(s) URL".into());
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err("FORGEJO_BASE_URL must not contain a query or fragment".into());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod forgejo_config_tests {
+    use super::validate_forgejo_values;
+
+    #[test]
+    fn forgejo_configuration_is_optional_or_complete() {
+        assert!(validate_forgejo_values("", "", "").is_ok());
+        assert!(validate_forgejo_values("https://git.example.com", "", "").is_err());
+        assert!(validate_forgejo_values("https://git.example.com", "token", "secret").is_ok());
+        assert!(validate_forgejo_values("git.example.com", "token", "secret").is_err());
+        assert!(
+            validate_forgejo_values("https://git.example.com/base?x=1", "token", "secret").is_err()
+        );
     }
 }

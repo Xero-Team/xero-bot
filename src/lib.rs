@@ -4,6 +4,7 @@ pub mod commands;
 pub mod config;
 pub mod dispatch;
 pub mod engines_subproc;
+pub mod forgejo;
 pub mod github;
 pub mod handlers;
 pub mod idle_workflows;

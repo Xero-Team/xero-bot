@@ -46,6 +46,22 @@ pub fn register(cfg: &Config) {
         (cfg.ai_api_key.trim().to_string(), "<AI_API_KEY>"),
         (cfg.webhook_secret.trim().to_string(), "<WEBHOOK_SECRET>"),
         (cfg.cron_secret.trim().to_string(), "<CRON_SECRET>"),
+        (cfg.forgejo_token.trim().to_string(), "<FORGEJO_TOKEN>"),
+        (
+            cfg.forgejo_webhook_secret.trim().to_string(),
+            "<FORGEJO_WEBHOOK_SECRET>",
+        ),
+        (
+            cfg.forgejo_base_url
+                .trim()
+                .trim_end_matches('/')
+                .to_string(),
+            "<FORGEJO_ENDPOINT>",
+        ),
+        (
+            host_of(cfg.forgejo_base_url.trim()).to_string(),
+            "<FORGEJO_ENDPOINT>",
+        ),
         // The full base URL and its host are registered separately: an error
         // may quote either, and the host alone still identifies the provider.
         (base.to_string(), "<AI_ENDPOINT>"),
@@ -208,6 +224,9 @@ mod tests {
             webhook_secret: String::new(),
             bot_name: String::new(),
             app_slug: String::new(),
+            forgejo_base_url: String::new(),
+            forgejo_token: String::new(),
+            forgejo_webhook_secret: String::new(),
             ai_base_url: String::new(),
             ai_api_key: String::new(),
             ai_model: String::new(),

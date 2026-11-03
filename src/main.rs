@@ -1,8 +1,9 @@
 //! Self-hosted server (Docker / VPS): axum HTTP server.
 //!
 //! Routes:
-//!   POST /webhook  — GitHub App webhook receiver
-//!   GET  /health   — liveness
+//!   POST /webhook          — GitHub App webhook receiver
+//!   POST /webhook/forgejo  — Forgejo token-provider webhook receiver
+//!   GET  /health           — liveness
 //!   GET  /cron     — rebase sweep (protect with CRON_SECRET, or bind to
 //!                    localhost and drive it with an external cron)
 //!
@@ -186,6 +187,7 @@ async fn main() {
         .route("/", get(health))
         .route("/health", get(health))
         .route("/webhook", post(webhook))
+        .route("/webhook/forgejo", post(forgejo_webhook))
         .route("/cron", get(cron_sweep))
         .with_state(state);
 
@@ -202,7 +204,10 @@ async fn main() {
             std::process::exit(2);
         }
     };
-    println!("xero-bot listening on 0.0.0.0:{port} (POST /webhook, GET /cron) — bot: @{bot_name}");
+    println!(
+        "xero-bot listening on 0.0.0.0:{port} \
+         (POST /webhook, POST /webhook/forgejo, GET /cron) — bot: @{bot_name}"
+    );
 
     if let Err(e) = axum::serve(listener, app).await {
         eprintln!("ERROR: server stopped: {e}");
@@ -316,6 +321,53 @@ async fn webhook(
                 Json(json!({"accepted": true, "persisted": durable.is_some()})),
             )
         }
+    }
+}
+
+/// Forgejo webhook ingress. Provider execution lands in the follow-up command
+/// and mirror-sync issues; this endpoint only establishes the verified trust
+/// boundary and never accepts an unsigned or unconfigured request.
+async fn forgejo_webhook(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> (StatusCode, Json<Value>) {
+    if !state.cfg.forgejo_ready() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "Forgejo provider is not configured"})),
+        );
+    }
+    let signature = headers
+        .get("x-forgejo-signature")
+        .or_else(|| headers.get("x-gitea-signature"))
+        .and_then(|value| value.to_str().ok());
+    if !xero_bot::forgejo::verify_signature(&state.cfg.forgejo_webhook_secret, &body, signature) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "invalid signature"})),
+        );
+    }
+    let event_header = headers
+        .get("x-forgejo-event")
+        .or_else(|| headers.get("x-gitea-event"))
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    let payload: Value = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(_) => return (StatusCode::BAD_REQUEST, Json(json!({"error": "bad json"}))),
+    };
+    match xero_bot::forgejo::classify(event_header, &payload) {
+        xero_bot::forgejo::ForgejoEvent::Ping => (StatusCode::OK, Json(json!({"ok": "pong"}))),
+        xero_bot::forgejo::ForgejoEvent::Ignored(reason) => {
+            (StatusCode::OK, Json(json!({"ignored": reason})))
+        }
+        event => (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(
+                json!({"error": "Forgejo event execution is not enabled", "event": format!("{event:?}")}),
+            ),
+        ),
     }
 }
 
