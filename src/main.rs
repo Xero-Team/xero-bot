@@ -622,6 +622,78 @@ mod trigger_ingress_tests {
         );
     }
 
+    #[tokio::test]
+    async fn audit_forgejo_webhook_http_headers_and_signatures() {
+        let dir = Dir::new();
+        let provider = wiremock::MockServer::start().await;
+        let mut s = state(&dir);
+        s.cfg.forgejo_base_url = provider.uri();
+        s.cfg.forgejo_token = "test-token".into();
+        s.cfg.forgejo_webhook_secret = "webhook-secret".into();
+        let app = Router::new()
+            .route("/webhook/forgejo", post(forgejo_webhook))
+            .with_state(s);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/webhook/forgejo", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = reqwest::Client::new();
+        let mut mac = xero_bot::forgejo::HmacSha256::new_from_slice(b"webhook-secret").unwrap();
+        mac.update(b"{}");
+        let signature = hex::encode(mac.finalize().into_bytes());
+        for provider_name in ["forgejo", "gitea"] {
+            for sig in [signature.clone(), format!("sha256={signature}")] {
+                let response = client
+                    .post(&url)
+                    .header(format!("x-{provider_name}-event"), "ping")
+                    .header(format!("x-{provider_name}-signature"), sig)
+                    .body("{}")
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                assert_eq!(response.json::<Value>().await.unwrap()["ok"], "pong");
+            }
+            for sig in [None, Some(""), Some("00"), Some("not-hex")] {
+                let mut request = client
+                    .post(&url)
+                    .header(format!("x-{provider_name}-event"), "ping")
+                    .body("{}");
+                if let Some(sig) = sig {
+                    request = request.header(format!("x-{provider_name}-signature"), sig);
+                }
+                assert_eq!(
+                    request.send().await.unwrap().status(),
+                    StatusCode::UNAUTHORIZED
+                );
+            }
+            let response = client
+                .post(&url)
+                .header(format!("x-{provider_name}-signature"), &signature)
+                .body("{}")
+                .send()
+                .await
+                .unwrap();
+            assert!(response.json::<Value>().await.unwrap()["ignored"].is_string());
+        }
+        server.abort();
+        assert!(provider.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn audit_unconfigured_forgejo_webhook_is_unavailable() {
+        let dir = Dir::new();
+        let mut s = state(&dir);
+        s.cfg.forgejo_base_url.clear();
+        s.cfg.forgejo_token.clear();
+        s.cfg.forgejo_webhook_secret.clear();
+        assert_eq!(
+            forgejo_webhook(State(s), HeaderMap::new(), b"{}".as_slice().into())
+                .await
+                .0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
     /// Ordinary discussion and self replies must never consume durable inbox space.
     #[tokio::test]
     async fn irrelevant_and_self_comments_are_filtered_before_persistence() {

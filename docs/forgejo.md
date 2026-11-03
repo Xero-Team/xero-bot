@@ -33,10 +33,14 @@ hex 格式以及兼容代理常见的 `sha256=` 前缀；空 secret、缺失签�
 
 ## Token 与失败语义
 
+- 使用专用 bot 账号，在其 Applications 设置创建 access token。评论指令需要 `read:user`（读取 bot 身份）、`write:issue`（评论、标签、assignee）和 `write:repository`（仓库配置、PR、reviewer、review）；组织标签还需要 `read:organization`。镜像同步本身需要 `write:repository`。
+- token scope 不会提升账号本身的仓库权限。账号必须能读取默认分支配置，并拥有对应仓库功能的写权限；审批指令还要能查询 collaborator permission，部署时确认该接口对 bot 可用（通常需要仓库管理员权限）。不需要站点级 `admin` scope。
+- 参考 [Forgejo token scope 文档](https://forgejo.org/docs/v15.0/user/authentication/token-scope/)。该版本的 Specific repositories token 不允许 `read:user` / `read:organization`，不能用于当前完整评论指令流程；仅镜像同步可按部署版本选择这种限制。访问私有仓库时不要选择 Public only。
 - token 只放部署环境，不写入仓库的 `.github/xero-bot.toml`。
 - API 请求使用 `Authorization: token <FORGEJO_TOKEN>`。
 - 连接超时 5 秒，整体请求超时 15 秒，响应上限 2 MiB。
 - 禁止跟随 HTTP 重定向和自动重试（包括协议级重试）；超时后的实际状态可能是未知的，交由人工或上层幂等流程处理。
+- 写请求的传输失败或无法解析的响应返回 `UnknownWriteOutcome`，明确要求先核对远端状态再考虑重试；读取失败仍返回 `Transport` / `InvalidResponse`。HTTP 拒绝保留 `Api` 状态码，5xx 也不能据此推断写操作没有生效。
 - 错误只返回状态和经过脱敏、最多 512 字符的 provider message，不返回 token。
 
 当前支持独立的 Forgejo webhook、评论指令、持久化恢复，以及显式启用的 GitHub → Forgejo 单向镜像同步。
@@ -98,6 +102,8 @@ trigger-state /data forgejo-resolve KEY not-sent '未发出或未生效的外部
 enabled = true
 destination = "xero-team/xero-bot"
 ```
+
+GitHub 与 Forgejo 使用同一严格解析器。Forgejo 的 `repository_config` 客户端接口在默认分支的固定 commit 上读取并返回完整配置，包括镜像设置和各配置域的校验错误；评论指令只取其中的评论策略。读取 Forgejo 侧配置不会触发镜像同步。
 
 约束：
 

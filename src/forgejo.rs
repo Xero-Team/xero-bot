@@ -12,6 +12,7 @@ use sha2::Sha256;
 
 pub mod commands;
 pub mod inbox;
+mod repository_config;
 pub mod sync;
 
 pub type HmacSha256 = Hmac<Sha256>;
@@ -146,6 +147,8 @@ pub enum ForgejoError {
     Config(String),
     #[error("Forgejo request failed: {0}")]
     Transport(String),
+    #[error("Forgejo write outcome is unknown; reconcile before retrying: {0}")]
+    UnknownWriteOutcome(String),
     #[error("Forgejo API returned {status}: {message}")]
     Api { status: u16, message: String },
     #[error("invalid Forgejo response: {0}")]
@@ -342,9 +345,17 @@ impl ForgejoClient {
         }
         let result = match request.send().await {
             Ok(response) => decode_response(response).await,
-            Err(e) => Err(ForgejoError::Transport(crate::redact::scrub(
-                &e.without_url().to_string(),
+            Err(error) => Err(ForgejoError::Transport(crate::redact::scrub(
+                &error.without_url().to_string(),
             ))),
+        };
+        let result = match result {
+            Err(error @ (ForgejoError::Transport(_) | ForgejoError::InvalidResponse(_)))
+                if write =>
+            {
+                Err(ForgejoError::UnknownWriteOutcome(error.to_string()))
+            }
+            result => result,
         };
         if write {
             inbox::after_write(&result)?;
@@ -524,6 +535,60 @@ mod audit_tests {
     use serde_json::json;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn audit_timeouts_distinguish_unknown_writes_without_replaying() {
+        let server = MockServer::start().await;
+        Mock::given(path("/api/v1/slow"))
+            .respond_with(ResponseTemplate::new(200).set_delay(REQUEST_TIMEOUT * 2))
+            .expect(5)
+            .mount(&server)
+            .await;
+        let client = ForgejoClient::new(&server.uri(), "test-token").unwrap();
+        let requests = [
+            Method::GET,
+            Method::POST,
+            Method::PATCH,
+            Method::PUT,
+            Method::DELETE,
+        ];
+        let results = tokio::time::timeout(
+            REQUEST_TIMEOUT + std::time::Duration::from_secs(3),
+            futures::future::join_all(requests.iter().map(|method| {
+                client.request(method.clone(), "/slow", Some(json!({"body": "test"})))
+            })),
+        )
+        .await
+        .expect("the production request deadline must be enforced");
+        for (method, result) in requests.iter().zip(results) {
+            let error = result.expect_err("delayed response must time out");
+            if method == Method::GET {
+                assert!(matches!(error, ForgejoError::Transport(_)));
+            } else {
+                assert!(
+                    error.to_string().contains("write outcome is unknown"),
+                    "{method}: {error}"
+                );
+            }
+        }
+        assert_eq!(server.received_requests().await.unwrap().len(), 5);
+    }
+
+    #[tokio::test]
+    async fn audit_unreadable_write_response_is_an_unknown_outcome() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("not JSON"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = ForgejoClient::new(&server.uri(), "test-token").unwrap();
+        let error = client.post("/write", json!({})).await.unwrap_err();
+        assert!(
+            error.to_string().contains("write outcome is unknown"),
+            "{error}"
+        );
+    }
 
     #[test]
     fn audit_rejects_insecure_urls_credentials_and_short_tokens() {
