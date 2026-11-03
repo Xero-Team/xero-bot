@@ -72,7 +72,7 @@ pub(crate) fn enc_seg(s: &str) -> String {
 /// `http::Uri` accepts high bytes, so `文档/说明.md` reached the wire as raw
 /// UTF-8 in the request line. That isn't valid HTTP and only worked because
 /// the server tolerated it; encoding makes it correct rather than lucky.
-fn enc_path(s: &str) -> String {
+pub(crate) fn enc_path(s: &str) -> String {
     percent_encoding::utf8_percent_encode(s, UNRESERVED_PATH).to_string()
 }
 

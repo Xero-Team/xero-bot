@@ -10,6 +10,8 @@ use reqwest::{Method, Response};
 use serde_json::Value;
 use sha2::Sha256;
 
+pub mod commands;
+
 pub type HmacSha256 = Hmac<Sha256>;
 
 const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
@@ -46,6 +48,7 @@ pub enum ForgejoEvent {
     IssueComment {
         repo: String,
         number: i64,
+        repository_id: Option<i64>,
         issue_id: Option<i64>,
         comment_id: Option<i64>,
         user_id: Option<i64>,
@@ -120,6 +123,7 @@ pub fn classify(event_header: &str, payload: &Value) -> ForgejoEvent {
             ForgejoEvent::IssueComment {
                 repo: repo.to_string(),
                 number,
+                repository_id: ji64(payload, &["repository", "id"]),
                 issue_id: ji64(payload, &["issue", "id"]),
                 comment_id: ji64(payload, &["comment", "id"]),
                 user_id: ji64(payload, &["comment", "user", "id"]),
@@ -151,6 +155,7 @@ pub enum ForgejoError {
 /// The client intentionally does not retry writes. A transport failure after a
 /// request was sent has an unknown outcome; replaying it can duplicate comments,
 /// reviews, or state changes.
+#[derive(Clone)]
 pub struct ForgejoClient {
     http: reqwest::Client,
     api_base: reqwest::Url,
@@ -230,6 +235,38 @@ impl ForgejoClient {
 
     pub async fn delete(&self, route: &str) -> Result<Value, ForgejoError> {
         self.request(Method::DELETE, route, None).await
+    }
+
+    /// Fetch every page of a Forgejo list endpoint. Forgejo uses `page` and
+    /// `limit`, unlike GitHub's `per_page` and Link-header pagination.
+    pub async fn get_all(&self, route: &str, limit: u32) -> Result<Vec<Value>, ForgejoError> {
+        let limit = limit.clamp(1, 50);
+        let mut all = Vec::new();
+        for page in 1..=100 {
+            let separator = if route.contains('?') { '&' } else { '?' };
+            let page = self
+                .get(&format!("{route}{separator}page={page}&limit={limit}"))
+                .await?;
+            let page = page.as_array().ok_or_else(|| {
+                ForgejoError::InvalidResponse("expected a JSON array in list response".into())
+            })?;
+            let count = page.len();
+            all.extend(page.iter().cloned());
+            if count < limit as usize {
+                return Ok(all);
+            }
+        }
+        Err(ForgejoError::InvalidResponse(
+            "list endpoint exceeded 100 pages".into(),
+        ))
+    }
+
+    pub async fn current_user(&self) -> Result<Value, ForgejoError> {
+        self.get("/user").await
+    }
+
+    pub async fn repository(&self, repo: &str) -> Result<Value, ForgejoError> {
+        self.get(&format!("/repos/{repo}")).await
     }
 
     async fn request(

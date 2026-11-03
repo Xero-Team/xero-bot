@@ -38,3 +38,32 @@ hex 格式以及兼容代理常见的 `sha256=` 前缀；空 secret、缺失签�
 - 错误只返回状态和经过长度限制的 provider message，不返回 token。
 
 当前变更只建立 provider、验签、事件解析和 HTTP 客户端边界。评论指令执行由 #32 接入，仓库镜像同步由 #33/#34 接入。
+
+## 评论指令
+
+Forgejo webhook 的 `issue_comment` 会复用现有 lexer/parser 和 `.github/xero-bot.toml`
+中的 `command_triggers` / `command_sessions`。当前支持：
+
+- `ping`、`help`
+- `claim` / `take`、`unclaim` / `untake`
+- `label +label -label`、`assign @user`、`cc @user`
+- `ready`、`author`、`blocked`
+- `r? @user`：Issue 上指派，PR 上请求 reviewer
+- `r+`、`r-`：实时检查 write+ 权限；PR 作者不能自我审批；代审批仍受
+  `R_PLUS_ALLOW_ON_BEHALF` 控制
+
+评论策略无效、默认分支不可读或权限无法确认时 fail closed。显式 @ 产生的会话写入现有
+`XERO_DATA_DIR` SQLite，使用 Forgejo 实例 URL 派生的独立命名空间，不会与 GitHub
+installation 的会话混用。
+
+`review`、`codeql`、`queue`、GitHub Checks 和 GitHub 合并队列是 GitHub 专属能力；
+Forgejo 上会明确回复“不支持”，不会静默成功。Forgejo Actions 的 CI 结果与 AI review
+适配属于后续独立工作。
+
+## 故障排查
+
+- `401 invalid signature`：检查 Forgejo webhook Secret 与 `FORGEJO_WEBHOOK_SECRET`。
+- `503 Forgejo provider is not configured`：三项环境变量未成组配置。
+- 评论无响应：确认 webhook 订阅了 `Issue comment`，并检查 token 是否具有仓库读取和
+  Issue/PR 写权限。
+- `permission-error`：确认 token 可以读取 collaborator permission，且评论者是仓库协作者。

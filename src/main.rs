@@ -362,11 +362,25 @@ async fn forgejo_webhook(
         xero_bot::forgejo::ForgejoEvent::Ignored(reason) => {
             (StatusCode::OK, Json(json!({"ignored": reason})))
         }
-        event => (
+        event @ xero_bot::forgejo::ForgejoEvent::IssueComment { .. } => {
+            let cfg = state.cfg.clone();
+            let triggers = Arc::clone(&state.triggers);
+            tokio::spawn(async move {
+                if let Err(error) =
+                    xero_bot::forgejo::commands::handle_issue_comment(&cfg, &triggers.store, event)
+                        .await
+                {
+                    tracing::error!("Forgejo comment command failed: {error}");
+                }
+            });
+            (
+                StatusCode::ACCEPTED,
+                Json(json!({"accepted": true, "provider": "forgejo"})),
+            )
+        }
+        xero_bot::forgejo::ForgejoEvent::Push { .. } => (
             StatusCode::NOT_IMPLEMENTED,
-            Json(
-                json!({"error": "Forgejo event execution is not enabled", "event": format!("{event:?}")}),
-            ),
+            Json(json!({"error": "Forgejo mirror sync is not enabled yet", "issue": 34})),
         ),
     }
 }
