@@ -21,7 +21,7 @@ pub enum SyncOutcome {
     MirrorDisabled,
     MissingDestination,
     InvalidConfiguration,
-    Synced,
+    Requested,
     Rejected(u16),
     Transport(String),
 }
@@ -33,7 +33,7 @@ impl std::fmt::Display for SyncOutcome {
             Self::MirrorDisabled => f.write_str("mirror-disabled"),
             Self::MissingDestination => f.write_str("missing-destination"),
             Self::InvalidConfiguration => f.write_str("invalid-configuration"),
-            Self::Synced => f.write_str("synced"),
+            Self::Requested => f.write_str("sync-requested"),
             Self::Rejected(status) => write!(f, "rejected-{status}"),
             Self::Transport(message) => write!(f, "transport-error: {message}"),
         }
@@ -119,11 +119,11 @@ async fn sync_destination_with(base_url: &str, token: &str, destination: &str) -
         Ok(client) => client,
         Err(error) => return SyncOutcome::Transport(error.to_string()),
     };
-    let lock_key = format!("{}|{destination}", base_url.trim_end_matches('/'));
+    let lock_key = format!("{}|{}", client.api_base, destination.to_ascii_lowercase());
     let lock = target_lock(&lock_key);
     let _guard = lock.lock().await;
     match client.trigger_mirror_sync(destination).await {
-        Ok(()) => SyncOutcome::Synced,
+        Ok(()) => SyncOutcome::Requested,
         Err(ForgejoError::Api { status, .. }) => SyncOutcome::Rejected(status),
         Err(error) => SyncOutcome::Transport(error.to_string()),
     }
@@ -148,23 +148,48 @@ fn target_lock(key: &str) -> Arc<tokio::sync::Mutex<()>> {
 }
 
 fn valid_destination(destination: &str) -> bool {
-    let Some((owner, repo)) = destination.split_once('/') else {
-        return false;
+    super::commands::valid_repository(destination)
+}
+
+const RECONCILE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+/// One deployment-wide gate, held for the entire scan. Frequent or overlapping
+/// cron calls must not rescan GitHub or enqueue another full round of fetches.
+pub async fn sweep(cfg: &Config) -> String {
+    if !cfg.forgejo_ready() {
+        return "forgejo provider disabled".into();
+    }
+    static GATE: OnceLock<tokio::sync::Mutex<Option<tokio::time::Instant>>> = OnceLock::new();
+    reconcile_with_gate(GATE.get_or_init(|| tokio::sync::Mutex::new(None)), || {
+        sweep_once(cfg)
+    })
+    .await
+}
+
+async fn reconcile_with_gate<F, Fut>(
+    gate: &tokio::sync::Mutex<Option<tokio::time::Instant>>,
+    run: F,
+) -> String
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = String>,
+{
+    let Ok(mut next) = gate.try_lock() else {
+        return "reconciliation already running".into();
     };
-    !owner.is_empty()
-        && !repo.is_empty()
-        && !repo.contains('/')
-        && !destination.contains("..")
-        && [owner, repo].into_iter().all(|part| {
-            !part
-                .chars()
-                .any(|ch| !(ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.')))
-        })
+    if next.is_some_and(|at| tokio::time::Instant::now() < at) {
+        return "reconciliation throttled (15 minute interval)".into();
+    }
+    // Reserve before any network I/O, including cancellation/error paths.
+    *next = Some(tokio::time::Instant::now() + RECONCILE_INTERVAL);
+    let result = run().await;
+    *next = Some(tokio::time::Instant::now() + RECONCILE_INTERVAL);
+    result
 }
 
 /// Periodic reconciliation. The webhook path is primary; this covers a missed
 /// delivery or a process restart by re-reading every opted-in repository.
-pub async fn sweep(cfg: &Config) -> String {
+async fn sweep_once(cfg: &Config) -> String {
     if !cfg.forgejo_ready() {
         return "forgejo provider disabled".into();
     }
@@ -177,7 +202,7 @@ pub async fn sweep(cfg: &Config) -> String {
             Ok(items) => items,
             Err(error) => return format!("installations-error: {error}"),
         };
-    let mut synced = 0usize;
+    let mut requested = 0usize;
     let mut skipped = 0usize;
     let mut errors = 0usize;
     for installation in installations {
@@ -228,7 +253,7 @@ pub async fn sweep(cfg: &Config) -> String {
             )
             .await;
             match outcome {
-                SyncOutcome::Synced => synced += 1,
+                SyncOutcome::Requested => requested += 1,
                 SyncOutcome::ProviderDisabled | SyncOutcome::MirrorDisabled => skipped += 1,
                 _ => {
                     tracing::warn!(repo, "Forgejo sweep sync failed: {outcome}");
@@ -237,7 +262,7 @@ pub async fn sweep(cfg: &Config) -> String {
             }
         }
     }
-    format!("{synced} synced, {skipped} skipped, {errors} errors")
+    format!("{requested} requested, {skipped} skipped, {errors} errors")
 }
 
 #[cfg(test)]
@@ -280,6 +305,8 @@ mod tests {
             "/repo",
             "owner/repo/extra",
             "owner/../repo",
+            "./repo",
+            "owner/.",
             "owner/repo?ref=main",
             "https://git.example.com/owner/repo",
             "token@owner/repo",
@@ -298,8 +325,9 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
-        let outcome = sync_destination_with(&server.uri(), "token", "mirror-team/xero-bot").await;
-        assert_eq!(outcome, SyncOutcome::Synced);
+        let outcome =
+            sync_destination_with(&server.uri(), "test-token", "mirror-team/xero-bot").await;
+        assert_eq!(outcome, SyncOutcome::Requested);
     }
 
     #[tokio::test]
@@ -369,7 +397,7 @@ mod tests {
             &cache,
         )
         .await;
-        assert_eq!(outcome, SyncOutcome::Synced);
+        assert_eq!(outcome, SyncOutcome::Requested);
     }
 
     #[tokio::test]
@@ -388,7 +416,7 @@ mod tests {
                 .mount(&server)
                 .await;
             assert_eq!(
-                sync_destination_with(&server.uri(), "token", &target).await,
+                sync_destination_with(&server.uri(), "test-token", &target).await,
                 SyncOutcome::Rejected(status)
             );
         }
@@ -401,5 +429,49 @@ mod tests {
         let other = target_lock("https://git.example.com|team/other");
         assert!(Arc::ptr_eq(&first, &second));
         assert!(!Arc::ptr_eq(&first, &other));
+    }
+    #[tokio::test(start_paused = true)]
+    async fn audit_cron_reconciliation_is_throttled_before_any_api_reads() {
+        let gate = tokio::sync::Mutex::new(None);
+        let scans = std::sync::atomic::AtomicUsize::new(0);
+        let scan = || async {
+            scans.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            "1 requested".to_string()
+        };
+        assert_eq!(reconcile_with_gate(&gate, scan).await, "1 requested");
+        assert!(reconcile_with_gate(&gate, scan).await.contains("throttled"));
+        tokio::time::advance(RECONCILE_INTERVAL).await;
+        assert_eq!(reconcile_with_gate(&gate, scan).await, "1 requested");
+        assert_eq!(scans.load(std::sync::atomic::Ordering::SeqCst), 2);
+        let _held = gate.lock().await;
+        assert!(reconcile_with_gate(&gate, scan)
+            .await
+            .contains("already running"));
+        assert_eq!(scans.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn audit_equivalent_destinations_serialize_actual_mirror_requests() {
+        let server = MockServer::start().await;
+        let arrivals = Arc::new(Mutex::new(Vec::new()));
+        let received = Arc::clone(&arrivals);
+        Mock::given(method("POST"))
+            .respond_with(move |_: &wiremock::Request| {
+                received.lock().unwrap().push(std::time::Instant::now());
+                ResponseTemplate::new(200).set_delay(std::time::Duration::from_millis(80))
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+        let url = server.uri();
+        let prefixed = format!("{url}/api/v1/");
+        let (a, b) = tokio::join!(
+            sync_destination_with(&url, "test-token", "Team/Repo"),
+            sync_destination_with(&prefixed, "test-token", "team/repo")
+        );
+        assert_eq!(a, SyncOutcome::Requested);
+        assert_eq!(b, SyncOutcome::Requested);
+        let arrivals = arrivals.lock().unwrap();
+        assert!(arrivals[1].duration_since(arrivals[0]) >= std::time::Duration::from_millis(70));
     }
 }

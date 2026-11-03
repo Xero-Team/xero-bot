@@ -588,8 +588,10 @@ fn forgejo(raw: RawForgejo) -> Domain<ForgejoMirrorConfig> {
         || destination.chars().any(char::is_whitespace)
         || destination.contains("..")
         || [owner, repository].into_iter().any(|part| {
-            part.chars()
-                .any(|ch| !(ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.')))
+            part == "."
+                || part
+                    .chars()
+                    .any(|ch| !(ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.')))
         })
     {
         return Err(Problem::new(

@@ -408,14 +408,10 @@ fn validate_forgejo_values(
             missing.join(", ")
         ));
     }
-    let url = reqwest::Url::parse(base_url.trim())
-        .map_err(|_| "FORGEJO_BASE_URL is not a valid absolute URL".to_string())?;
-    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
-        return Err("FORGEJO_BASE_URL must be an absolute http(s) URL".into());
-    }
-    if url.query().is_some() || url.fragment().is_some() {
-        return Err("FORGEJO_BASE_URL must not contain a query or fragment".into());
-    }
+    crate::forgejo::validated_base_url(base_url).map_err(|e| e.to_string())?;
+    crate::forgejo::validate_credential("FORGEJO_TOKEN", token).map_err(|e| e.to_string())?;
+    crate::forgejo::validate_credential("FORGEJO_WEBHOOK_SECRET", webhook_secret)
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -427,10 +423,27 @@ mod forgejo_config_tests {
     fn forgejo_configuration_is_optional_or_complete() {
         assert!(validate_forgejo_values("", "", "").is_ok());
         assert!(validate_forgejo_values("https://git.example.com", "", "").is_err());
-        assert!(validate_forgejo_values("https://git.example.com", "token", "secret").is_ok());
-        assert!(validate_forgejo_values("git.example.com", "token", "secret").is_err());
         assert!(
-            validate_forgejo_values("https://git.example.com/base?x=1", "token", "secret").is_err()
+            validate_forgejo_values("https://git.example.com", "test-token", "test-secret").is_ok()
+        );
+        assert!(validate_forgejo_values("git.example.com", "test-token", "test-secret").is_err());
+        assert!(validate_forgejo_values(
+            "https://git.example.com/base?x=1",
+            "test-token",
+            "test-secret"
+        )
+        .is_err());
+    }
+}
+
+#[cfg(test)]
+mod forgejo_audit_config_tests {
+    use super::*;
+    #[test]
+    fn audit_forgejo_deployment_rejects_short_secrets_and_plaintext() {
+        assert!(validate_forgejo_values("https://forgejo.example", "test-token", "short").is_err());
+        assert!(
+            validate_forgejo_values("http://forgejo.example", "test-token", "long-secret").is_err()
         );
     }
 }

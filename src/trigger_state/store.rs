@@ -913,3 +913,13 @@ impl Store {
         self.session_before_at(call, ttl_days, call.source_at)
     }
 }
+
+#[cfg(test)]
+impl Store {
+    pub(crate) fn inject_session_read_failure(&self) {
+        self.db()
+            .unwrap()
+            .execute_batch("DROP TABLE sessions;")
+            .unwrap();
+    }
+}

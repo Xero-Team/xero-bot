@@ -11,6 +11,7 @@ use serde_json::Value;
 use sha2::Sha256;
 
 pub mod commands;
+pub mod inbox;
 pub mod sync;
 
 pub type HmacSha256 = Hmac<Sha256>;
@@ -41,7 +42,7 @@ pub fn verify_signature(secret: &str, body: &[u8], signature_header: Option<&str
     mac.verify_slice(&expected).is_ok()
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ForgejoEvent {
     Ping,
     /// A newly created issue/PR comment. Forgejo numbers issues and PRs from
@@ -98,7 +99,7 @@ pub fn classify(event_header: &str, payload: &Value) -> ForgejoEvent {
                 ref_name: ref_name.to_string(),
             }
         }
-        "issue_comment" => {
+        "issue_comment" | "pull_request_comment" => {
             if jstr(payload, &["action"]) != Some("created") {
                 return ForgejoEvent::Ignored("action != created".into());
             }
@@ -151,6 +152,48 @@ pub enum ForgejoError {
     InvalidResponse(String),
 }
 
+/// Share deployment and client validation, including direct library callers.
+pub(crate) fn validate_credential(name: &str, value: &str) -> Result<(), ForgejoError> {
+    if value.trim().len() < crate::redact::MIN_SECRET_LEN {
+        return Err(ForgejoError::Config(format!(
+            "{name} must contain at least 8 bytes"
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn validated_base_url(base: &str) -> Result<reqwest::Url, ForgejoError> {
+    let url = reqwest::Url::parse(base.trim())
+        .map_err(|_| ForgejoError::Config("FORGEJO_BASE_URL is not a valid absolute URL".into()))?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        return Err(ForgejoError::Config(
+            "FORGEJO_BASE_URL must be an absolute http(s) URL".into(),
+        ));
+    }
+    let loopback = url.host_str().is_some_and(|host| {
+        host == "localhost"
+            || host
+                .trim_matches(['[', ']'])
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback())
+    });
+    if url.scheme() == "http" && !loopback {
+        return Err(ForgejoError::Config(
+            "FORGEJO_BASE_URL requires HTTPS except on loopback".into(),
+        ));
+    }
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(ForgejoError::Config(
+            "FORGEJO_BASE_URL must not contain credentials, a query or fragment".into(),
+        ));
+    }
+    Ok(url)
+}
+
 /// Minimal token-authenticated Forgejo API transport.
 ///
 /// The client intentionally does not retry writes. A transport failure after a
@@ -165,26 +208,9 @@ pub struct ForgejoClient {
 
 impl ForgejoClient {
     pub fn new(base_url: &str, token: &str) -> Result<Self, ForgejoError> {
-        let base_url = base_url.trim();
+        validate_credential("FORGEJO_TOKEN", token)?;
         let token = token.trim();
-        if base_url.is_empty() {
-            return Err(ForgejoError::Config("FORGEJO_BASE_URL is empty".into()));
-        }
-        if token.is_empty() {
-            return Err(ForgejoError::Config("FORGEJO_TOKEN is empty".into()));
-        }
-        let mut url = reqwest::Url::parse(base_url)
-            .map_err(|_| ForgejoError::Config("FORGEJO_BASE_URL is not a URL".into()))?;
-        if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
-            return Err(ForgejoError::Config(
-                "FORGEJO_BASE_URL must be an absolute http(s) URL".into(),
-            ));
-        }
-        if url.query().is_some() || url.fragment().is_some() {
-            return Err(ForgejoError::Config(
-                "FORGEJO_BASE_URL must not contain a query or fragment".into(),
-            ));
-        }
+        let mut url = validated_base_url(base_url)?;
         let path = url.path().trim_end_matches('/');
         let path = if path.ends_with("/api/v1") {
             path.to_string()
@@ -198,6 +224,8 @@ impl ForgejoClient {
         url.set_fragment(None);
 
         let http = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
             .connect_timeout(std::time::Duration::from_secs(5))
             .timeout(REQUEST_TIMEOUT)
             .build()
@@ -210,12 +238,23 @@ impl ForgejoClient {
     }
 
     fn endpoint(&self, route: &str) -> Result<reqwest::Url, ForgejoError> {
-        if !route.starts_with('/') {
-            return Err(ForgejoError::Config("API route must start with /".into()));
+        let relative = route
+            .strip_prefix('/')
+            .filter(|p| !p.starts_with('/'))
+            .ok_or_else(|| ForgejoError::Config("API route must start with one /".into()))?;
+        let url = self
+            .api_base
+            .join(relative)
+            .map_err(|_| ForgejoError::Config("invalid Forgejo API route".into()))?;
+        if url.origin() != self.api_base.origin()
+            || !url.path().starts_with(self.api_base.path())
+            || url.fragment().is_some()
+        {
+            return Err(ForgejoError::Config(
+                "API route escapes Forgejo API base".into(),
+            ));
         }
-        self.api_base
-            .join(route.trim_start_matches('/'))
-            .map_err(|_| ForgejoError::Config("invalid Forgejo API route".into()))
+        Ok(url)
     }
 
     pub async fn get(&self, route: &str) -> Result<Value, ForgejoError> {
@@ -285,6 +324,10 @@ impl ForgejoClient {
         body: Option<Value>,
     ) -> Result<Value, ForgejoError> {
         let url = self.endpoint(route)?;
+        let write = method != Method::GET && method != Method::HEAD;
+        if write {
+            inbox::before_write()?;
+        }
         let mut request = self
             .http
             .request(method, url)
@@ -297,11 +340,16 @@ impl ForgejoClient {
         if let Some(body) = body {
             request = request.json(&body);
         }
-        let response = request
-            .send()
-            .await
-            .map_err(|e| ForgejoError::Transport(e.to_string()))?;
-        decode_response(response).await
+        let result = match request.send().await {
+            Ok(response) => decode_response(response).await,
+            Err(e) => Err(ForgejoError::Transport(crate::redact::scrub(
+                &e.without_url().to_string(),
+            ))),
+        };
+        if write {
+            inbox::after_write(&result)?;
+        }
+        result
     }
 }
 
@@ -312,7 +360,7 @@ async fn decode_response(response: Response) -> Result<Value, ForgejoError> {
     while let Some(chunk) = response
         .chunk()
         .await
-        .map_err(|e| ForgejoError::Transport(e.to_string()))?
+        .map_err(|e| ForgejoError::Transport(crate::redact::scrub(&e.without_url().to_string())))?
     {
         if bytes.len().saturating_add(chunk.len()) > MAX_RESPONSE_BYTES {
             return Err(ForgejoError::InvalidResponse(
@@ -330,11 +378,11 @@ async fn decode_response(response: Response) -> Result<Value, ForgejoError> {
                 .or_else(|| value.get("error").and_then(Value::as_str))
                 .unwrap_or("request rejected")
                 .to_string(),
-            Err(_) => String::from_utf8_lossy(&bytes)
-                .chars()
-                .take(512)
-                .collect::<String>(),
+            Err(_) => String::from_utf8_lossy(&bytes).into_owned(),
         };
+        // Scrub before truncation so a secret crossing the boundary is not
+        // published as an unrecognizable credential prefix.
+        let message = crate::redact::scrub(&message).chars().take(512).collect();
         return Err(ForgejoError::Api { status, message });
     }
 
@@ -467,5 +515,94 @@ mod tests {
             err,
             ForgejoError::Api { status: 403, ref message } if message == "repository is archived"
         ));
+    }
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+    use serde_json::json;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[test]
+    fn audit_rejects_insecure_urls_credentials_and_short_tokens() {
+        for url in [
+            "http://forgejo.example",
+            "http://192.0.2.1",
+            "https://user:pass@forgejo.example",
+        ] {
+            assert!(
+                ForgejoClient::new(url, "test-token").is_err(),
+                "accepted {url}"
+            );
+        }
+        assert!(ForgejoClient::new("https://forgejo.example", "short").is_err());
+        for url in [
+            "https://forgejo.example/subpath",
+            "http://127.0.0.1",
+            "http://[::1]",
+            "http://localhost",
+        ] {
+            assert!(
+                ForgejoClient::new(url, "test-token").is_ok(),
+                "rejected {url}"
+            );
+        }
+    }
+
+    #[test]
+    fn audit_routes_cannot_escape_api_base() {
+        let client = ForgejoClient::new("https://forgejo.example/subpath", "test-token").unwrap();
+        for route in [
+            "/https://attacker.example/steal",
+            "/../user",
+            "/%2e%2e/user",
+            "//attacker.example/steal",
+        ] {
+            assert!(client.endpoint(route).is_err(), "accepted {route}");
+        }
+    }
+
+    #[tokio::test]
+    async fn audit_write_redirects_are_not_replayed() {
+        let server = MockServer::start().await;
+        let client = ForgejoClient::new(&server.uri(), "test-token").unwrap();
+        for status in [301, 302, 303, 307, 308] {
+            Mock::given(path(format!("/api/v1/redirect-{status}")))
+                .respond_with(
+                    ResponseTemplate::new(status).insert_header("Location", "/api/v1/replayed"),
+                )
+                .mount(&server)
+                .await;
+            for verb in [Method::POST, Method::PATCH, Method::PUT, Method::DELETE] {
+                let result = client
+                    .request(verb, &format!("/redirect-{status}"), Some(json!({"x":1})))
+                    .await;
+                assert!(matches!(result, Err(ForgejoError::Api { status: s, .. }) if s == status));
+            }
+        }
+        assert!(server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .all(|r| r.url.path() != "/api/v1/replayed"));
+    }
+
+    #[tokio::test]
+    async fn audit_json_error_messages_are_bounded() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(403).set_body_json(json!({"message":"错".repeat(900)})),
+            )
+            .mount(&server)
+            .await;
+        let client = ForgejoClient::new(&server.uri(), "test-token").unwrap();
+        let Err(ForgejoError::Api { message, .. }) = client.get("/user").await else {
+            panic!("expected API error")
+        };
+        assert_eq!(message.chars().count(), 512);
     }
 }

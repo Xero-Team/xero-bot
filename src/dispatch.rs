@@ -801,7 +801,7 @@ async fn execute_work_inner(cfg: &Config, work: Work) -> Result<(), String> {
                 .await;
                 if matches!(
                     status,
-                    crate::forgejo::sync::SyncOutcome::Synced
+                    crate::forgejo::sync::SyncOutcome::Requested
                         | crate::forgejo::sync::SyncOutcome::MirrorDisabled
                         | crate::forgejo::sync::SyncOutcome::ProviderDisabled
                 ) {
