@@ -12,6 +12,7 @@ use sha2::Sha256;
 
 pub mod commands;
 pub mod inbox;
+mod repository_config;
 
 pub type HmacSha256 = Hmac<Sha256>;
 

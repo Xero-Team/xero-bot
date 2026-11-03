@@ -99,6 +99,8 @@ enabled = true
 destination = "xero-team/xero-bot"
 ```
 
+GitHub 与 Forgejo 使用同一严格解析器。Forgejo 的 `repository_config` 客户端接口在默认分支的固定 commit 上读取并返回完整配置，包括镜像设置和各配置域的校验错误；评论指令只取其中的评论策略。读取 Forgejo 侧配置不会触发镜像同步。
+
 约束：
 
 - `destination` 必须是严格的 `owner/repository`，不能是 URL、凭据、query、fragment 或额外路径。
