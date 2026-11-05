@@ -4,6 +4,42 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use wiremock::matchers::{body_partial_json, method, path, query_param};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
+#[test]
+fn ordinary_repositories_require_matching_pinned_identities_on_both_sides() {
+    let policy = crate::config::repository::RepositoryConfig::parse("[forgejo.bridge]\nenabled=true\ndestination='dest/repo'\nissues=true\npull_requests=true\nsync_refs=true\ngithub_repository='Source/Repo'\ngithub_repository_id=123\nforgejo_repository_id=456", "source/repo").unwrap().forgejo_bridge.unwrap();
+    let metadata = json!({"id":456,"mirror":false});
+    assert_eq!(validate_source(&metadata, &policy), Ok(()));
+    assert_eq!(
+        source_repository(&metadata, &policy).unwrap(),
+        "source/repo"
+    );
+    assert_eq!(
+        matching_identities(&policy, &policy, "SOURCE/REPO", 123, 456),
+        Ok(())
+    );
+    assert!(validate_source(&json!({"id":457,"mirror":false}), &policy).is_err());
+    assert!(matching_identities(&policy, &policy, "source/repo", 124, 456).is_err());
+    assert!(matching_identities(
+        &policy,
+        &ForgejoBridgeConfig::disabled(),
+        "source/repo",
+        123,
+        456
+    )
+    .is_err());
+    assert!(validate_source(&metadata, &ForgejoBridgeConfig::disabled()).is_err());
+    // Scope remains the same after native mirror conversion.
+    let fj = ForgejoClient::new("https://forgejo.example", "test-token").unwrap();
+    let key = RepositoryKey {
+        installation_id: 7,
+        repository_id: 123,
+    };
+    assert_eq!(
+        bridge_scope(&fj, key, 456, "Source/Repo", "Dest/Repo"),
+        "[\"https://forgejo.example/api/v1/\",7,123,456,\"source/repo\",\"dest/repo\"]"
+    );
+}
+
 struct Dir(PathBuf);
 impl Dir {
     fn new() -> Self {
@@ -178,6 +214,30 @@ async fn both_providers_issue_and_pr_lifecycle_deduplicate_and_reopen() {
                 .filter(|r| r.method == "PATCH")
                 .map(|r| serde_json::from_slice::<Value>(&r.body).unwrap())
                 .collect::<Vec<_>>();
+            let base_patches = patches
+                .iter()
+                .filter(|p| p.get("base").is_some())
+                .collect::<Vec<_>>();
+            if is_pr {
+                assert_eq!(base_patches.len(), 2);
+                assert!(base_patches.iter().all(|p| p["base"] == "main"));
+                assert!(patches
+                    .iter()
+                    .filter(|p| p["state"] == "closed")
+                    .all(|p| p.get("base").is_none()));
+                if target == Target::GitHub {
+                    for (index, patch) in patches.iter().enumerate() {
+                        if patch.get("base").is_some() {
+                            assert!(index > 0 && patches[index - 1]["state"] == "open");
+                            assert!(patch.get("state").is_none());
+                        }
+                    }
+                }
+            }
+            let patches = patches
+                .iter()
+                .filter(|p| p.get("state").is_some())
+                .collect::<Vec<_>>();
             assert_eq!(patches.len(), 3);
             assert_eq!(patches[1]["state"], "closed");
             assert_eq!(patches[2]["state"], "open");
@@ -199,9 +259,6 @@ async fn both_providers_issue_and_pr_lifecycle_deduplicate_and_reopen() {
                 }
             );
             assert_eq!(puts[2]["labels"], json!([]));
-            if is_pr {
-                assert_eq!(patches[2]["base"], "main");
-            }
             // Equal canonical content on the peer is an echo, even with a different number.
             let mut echoed = live.lock().unwrap().clone();
             echoed["number"] = json!(93);
@@ -880,6 +937,79 @@ fn inbox_restarts_deduplicates_blocks_only_the_failed_thread_and_prunes_bodies()
     assert_eq!(text, "{}");
 }
 
+#[test]
+fn delayed_queue_survives_restart_preserves_order_and_never_retries_unknown_writes() {
+    let dir = Dir::new();
+    let store = Store::open(&dir.0).unwrap();
+    for (key, lane) in [("limited", "a"), ("later", "a"), ("independent", "b")] {
+        store
+            .bridge_enqueue(key, lane, &json!({"key":key}))
+            .unwrap();
+    }
+    assert_eq!(store.bridge_claim_delivery().unwrap().unwrap().0, "limited");
+    inbox::finish_outcome(&store, "limited", &BridgeOutcome::RetryAfter(3600)).unwrap();
+    let rows = store.bridge_deliveries().unwrap();
+    let retry_at = rows[0]["retry_at"].as_i64().unwrap();
+    assert_eq!(rows[0]["state"], "waiting");
+    assert!(retry_at >= crate::github::chrono_now_secs() + 3599);
+    assert_eq!(
+        store
+            .bridge_claim_delivery_at(retry_at - 1)
+            .unwrap()
+            .unwrap()
+            .0,
+        "independent"
+    );
+    inbox::finish_outcome(&store, "independent", &BridgeOutcome::Synced).unwrap();
+    assert!(store
+        .bridge_claim_delivery_at(retry_at - 1)
+        .unwrap()
+        .is_none());
+    drop(store);
+    let store = Store::open(&dir.0).unwrap();
+    assert!(store
+        .bridge_claim_delivery_at(retry_at - 1)
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        store.bridge_claim_delivery_at(retry_at).unwrap().unwrap().0,
+        "limited"
+    );
+    inbox::finish_outcome(&store, "limited", &BridgeOutcome::Synced).unwrap();
+    assert_eq!(
+        store.bridge_claim_delivery_at(retry_at).unwrap().unwrap().0,
+        "later"
+    );
+    inbox::finish_outcome(&store, "later", &BridgeOutcome::NeedsReconciliation).unwrap();
+    assert!(store
+        .bridge_claim_delivery_at(retry_at + 86_400)
+        .unwrap()
+        .is_none());
+    assert_eq!(store.bridge_deliveries().unwrap()[0]["state"], "blocked");
+}
+
+#[test]
+fn old_policy_blocks_resume_but_unknown_writes_stay_blocked() {
+    let dir = Dir::new();
+    let store = Store::open(&dir.0).unwrap();
+    store.bridge_enqueue("policy", "a", &json!({})).unwrap();
+    store.bridge_claim_delivery().unwrap().unwrap();
+    store
+        .bridge_finish_delivery("policy", false, "policy-unavailable")
+        .unwrap();
+    store.bridge_enqueue("unknown", "b", &json!({})).unwrap();
+    store.bridge_claim_delivery().unwrap().unwrap();
+    store
+        .bridge_finish_delivery("unknown", false, "needs-reconciliation")
+        .unwrap();
+    drop(store);
+    let store = Store::open(&dir.0).unwrap();
+    assert_eq!(store.bridge_claim_delivery().unwrap().unwrap().0, "policy");
+    inbox::finish_outcome(&store, "policy", &BridgeOutcome::PolicyUnavailable).unwrap();
+    assert!(store.bridge_claim_delivery().unwrap().is_none());
+    assert_eq!(store.bridge_deliveries().unwrap()[1]["state"], "blocked");
+}
+
 #[tokio::test]
 async fn admission_discards_envelope_secrets_and_keeps_distinct_forgejo_revisions() {
     let forgejo = MockServer::start().await;
@@ -927,17 +1057,18 @@ fn classifier_and_origin_validation_cover_supported_events_only() {
         crate::forgejo::classify("pull_request_label", &payload),
         ForgejoEvent::PullRequest { number: 5, .. }
     ));
-    for action in [
-        "deleted",
-        "assigned",
-        "review_requested",
-        "synchronized",
-        "synchronize",
-    ] {
+    for action in ["deleted", "assigned", "review_requested"] {
         let mut payload = payload.clone();
         payload["action"] = json!(action);
         assert!(github_item("issues", &payload).is_none());
         assert!(forgejo_item(&crate::forgejo::classify("pull_request", &payload)).is_none());
+    }
+    for action in ["synchronize", "synchronized"] {
+        let mut update = payload.clone();
+        update["action"] = json!(action);
+        assert!(github_item("issues", &update).is_none());
+        assert!(github_item("pull_request", &update).is_some());
+        assert!(forgejo_item(&crate::forgejo::classify("pull_request_sync", &update)).is_some());
     }
     assert!(github_comment(
         &json!({"action":"edited","issue":{"number":1},"comment":{"id":2,"body":"edited"}})
@@ -953,4 +1084,42 @@ fn classifier_and_origin_validation_cover_supported_events_only() {
     ] {
         assert!(parse_github_origin(bad).is_none(), "{bad}");
     }
+}
+
+#[test]
+fn transient_read_failures_wait_but_identical_write_failures_remain_blocked() {
+    for status in [408, 429, 500, 502, 503, 504] {
+        let error = || ForgejoError::Api {
+            status,
+            message: "temporary".into(),
+        };
+        assert_eq!(forgejo_read_error(error()), BridgeOutcome::RetryAfter(60));
+        assert_eq!(forgejo_error(error()), BridgeOutcome::Rejected(status));
+        let gh = || GhError::Api {
+            status,
+            message: "temporary".into(),
+        };
+        assert_eq!(github_read_error(gh()), BridgeOutcome::RetryAfter(60));
+        assert_eq!(github_error(gh()), BridgeOutcome::Rejected(status));
+    }
+    assert_eq!(
+        github_read_error(GhError::Api {
+            status: 403,
+            message: "API rate limit exceeded".into()
+        }),
+        BridgeOutcome::RetryAfter(60)
+    );
+    for status in [401, 403, 404, 422] {
+        assert_eq!(
+            forgejo_read_error(ForgejoError::Api {
+                status,
+                message: "denied".into()
+            }),
+            BridgeOutcome::Rejected(status)
+        );
+    }
+    assert!(matches!(
+        forgejo_read_error(ForgejoError::UnknownWriteOutcome("lost response".into())),
+        BridgeOutcome::Transport(_)
+    ));
 }

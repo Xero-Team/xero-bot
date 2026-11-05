@@ -198,7 +198,7 @@ pub async fn pump(cfg: &Config, store: &Store) -> Result<()> {
                         from_github(&gh, cfg, store, &repo, identity, &event, &payload).await
                     }
                 }
-                Err(error) => github_error(error),
+                Err(error) => github_read_error(error),
             },
             Ok(Delivery::Forgejo {
                 repo,
@@ -219,8 +219,29 @@ pub async fn pump(cfg: &Config, store: &Store) -> Result<()> {
             }
             Err(_) => BridgeOutcome::InvalidPayload("invalid persisted bridge delivery".into()),
         };
-        let done = outcome.is_skip() || outcome == BridgeOutcome::Synced;
-        store.bridge_finish_delivery(&key, done, &outcome.to_string())?;
+        finish_outcome(store, &key, &outcome)?;
+    }
+    Ok(())
+}
+
+pub(super) fn finish_outcome(store: &Store, key: &str, outcome: &BridgeOutcome) -> Result<()> {
+    let delay = match outcome {
+        BridgeOutcome::RetryAfter(seconds) => Some(*seconds),
+        // Forgejo policy transport currently has no typed Retry-After. These
+        // reads happen before side effects and use bounded exponential backoff.
+        BridgeOutcome::PolicyUnavailable => Some(60),
+        _ => None,
+    };
+    if let Some(delay) = delay {
+        store.bridge_defer_delivery(key, delay, &outcome.to_string())?;
+        tracing::info!(
+            key,
+            retry_after_secs = delay,
+            "bridge queued for retry: {outcome}"
+        );
+    } else {
+        let done = outcome.is_skip() || *outcome == BridgeOutcome::Synced;
+        store.bridge_finish_delivery(key, done, &outcome.to_string())?;
         if done {
             tracing::debug!(key, "bridge: {outcome}");
         } else {

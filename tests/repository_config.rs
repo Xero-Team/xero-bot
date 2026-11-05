@@ -2,6 +2,17 @@ use xero_bot::commands::parse_commands;
 use xero_bot::config::repository::*;
 
 const REPO: &str = "example/project";
+
+#[test]
+fn ordinary_bridge_binding_is_complete_positive_and_explicit() {
+    let base = "[forgejo.bridge]\nenabled=true\ndestination='dest/repo'\nissues=true\n";
+    for partial in ["sync_refs=true", "github_repository='source/repo'", "github_repository_id=12\nforgejo_repository_id=34", "github_repository='https://github.com/source/repo'\ngithub_repository_id=12\nforgejo_repository_id=34", "github_repository='source/repo'\ngithub_repository_id=-1\nforgejo_repository_id=34"] {
+        assert!(parse(&format!("{base}{partial}")).forgejo_bridge.is_err(), "{partial}");
+    }
+    let c = parse(&format!("{base}github_repository='Source/Repo'\ngithub_repository_id=12\nforgejo_repository_id=34\nsync_refs=true")).forgejo_bridge.unwrap();
+    assert_eq!(c.github_repository.as_deref(), Some("source/repo"));
+    assert!(c.sync_refs);
+}
 /// Parse one test document and require structural validity before inspecting its domains.
 fn parse(text: &str) -> RepositoryConfig {
     RepositoryConfig::parse(text, REPO).unwrap()

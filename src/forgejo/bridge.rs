@@ -1,15 +1,16 @@
 //! Two-way Issue/PR metadata and comment bridge between GitHub and Forgejo.
 //!
-//! Git refs and code are intentionally absent: the existing pull mirror owns
-//! those. Object identity lives in a durable scoped mapping; every relayed body
+//! Explicit ordinary-repository bindings may opt into conservative Git ref
+//! transport before PR updates. Object identity lives in a durable scoped
+//! mapping; every relayed body
 //! also carries an HMAC-authenticated hidden marker. Mappings are authoritative:
 //! editable markers never authorize a new mapping. Uncertain creates/comments
 //! are reserved durably and require an operator-verified receipt before replay.
 //!
 //! Only `opened` creates a peer. Later edits and comments require a valid mapping
 //! in SQLite. No provider's webhook-supplied repository ID is trusted as
-//! a destination identity; Forgejo mirrors are bound through their configured
-//! Git origin and the GitHub App installation inventory.
+//! a destination identity; ordinary repositories require bilateral pinned IDs,
+//! while legacy mirrors use their Git origin and the App installation inventory.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -20,7 +21,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use super::{ForgejoClient, ForgejoError, ForgejoEvent, ForgejoLabel};
-use crate::config::cache::{RepositoryConfigCache, RepositoryKey};
+use crate::config::cache::{ConfigState, RepositoryConfigCache, RepositoryKey};
 use crate::config::repository::ForgejoBridgeConfig;
 use crate::config::Config;
 use crate::github::{Client, GhError};
@@ -105,6 +106,7 @@ pub enum BridgeOutcome {
     BridgeDisabled,
     InvalidConfiguration,
     PolicyUnavailable,
+    RetryAfter(u64),
     MissingDestination,
     Ignored(&'static str),
     Synced,
@@ -124,6 +126,7 @@ impl std::fmt::Display for BridgeOutcome {
             Self::BridgeDisabled => f.write_str("bridge-disabled"),
             Self::InvalidConfiguration => f.write_str("invalid-configuration"),
             Self::PolicyUnavailable => f.write_str("policy-unavailable"),
+            Self::RetryAfter(seconds) => write!(f, "read-retry-after-{seconds}s"),
             Self::MissingDestination => f.write_str("missing-destination"),
             Self::Ignored(reason) => write!(f, "ignored-{reason}"),
             Self::Synced => f.write_str("synced"),
@@ -373,14 +376,20 @@ fn gate<'a>(cfg: &'a Config, policy: &'a ForgejoBridgeConfig) -> Result<&'a str,
 
 fn forgejo_error(error: ForgejoError) -> BridgeOutcome {
     match error {
-        ForgejoError::Api { status, .. } => BridgeOutcome::Rejected(status),
+        ForgejoError::Api { status, message } => {
+            tracing::warn!(status, detail = %crate::redact::scrub(&message), "Forgejo bridge API request failed");
+            BridgeOutcome::Rejected(status)
+        }
         other => BridgeOutcome::Transport(other.to_string()),
     }
 }
 
 fn github_error(error: GhError) -> BridgeOutcome {
     match error {
-        GhError::Api { status, .. } => BridgeOutcome::Rejected(status),
+        GhError::Api { status, message } => {
+            tracing::warn!(status, detail = %crate::redact::scrub(&message), "GitHub bridge API request failed");
+            BridgeOutcome::Rejected(status)
+        }
         other => BridgeOutcome::Transport(other.to_string()),
     }
 }
@@ -388,10 +397,51 @@ fn github_error(error: GhError) -> BridgeOutcome {
 fn octocrab_error(error: octocrab::Error) -> BridgeOutcome {
     match error {
         octocrab::Error::GitHub { source, .. } => {
+            tracing::warn!(status = source.status_code.as_u16(), detail = %crate::redact::scrub(&source.message), "GitHub bridge API request failed");
             BridgeOutcome::Rejected(source.status_code.as_u16())
         }
         other => BridgeOutcome::Transport(other.to_string()),
     }
+}
+
+// Only GET/identity lookups use these classifiers. Write failures retain their
+// existing blocked/unknown treatment and must never enter automatic retries.
+fn retry_read(outcome: BridgeOutcome) -> BridgeOutcome {
+    match outcome {
+        BridgeOutcome::Rejected(408 | 429 | 500..=599) | BridgeOutcome::Transport(_) => {
+            tracing::info!(result = %outcome, "temporary bridge read failure");
+            BridgeOutcome::RetryAfter(60)
+        }
+        other => other,
+    }
+}
+
+fn forgejo_read_error(error: ForgejoError) -> BridgeOutcome {
+    match error {
+        ForgejoError::Config(_) | ForgejoError::UnknownWriteOutcome(_) => forgejo_error(error),
+        other => retry_read(forgejo_error(other)),
+    }
+}
+
+fn github_read_error(error: GhError) -> BridgeOutcome {
+    match error {
+        GhError::Api {
+            status: 403,
+            ref message,
+        } if message.to_ascii_lowercase().contains("rate limit") => BridgeOutcome::RetryAfter(60),
+        other => retry_read(github_error(other)),
+    }
+}
+
+fn octocrab_read_error(error: octocrab::Error) -> BridgeOutcome {
+    if let octocrab::Error::GitHub { source, .. } = &error {
+        if source.status_code.as_u16() == 403
+            && source.message.to_ascii_lowercase().contains("rate limit")
+        {
+            return BridgeOutcome::RetryAfter(60);
+        }
+    }
+    retry_read(octocrab_error(error))
 }
 
 /// Relay a verified GitHub `issues` or `pull_request` webhook. Policy is read
@@ -421,7 +471,7 @@ pub async fn from_github(
     let state = RepositoryConfigCache::shared().load(gh, key, repo).await;
     let snapshot = match state.snapshot() {
         Ok(snapshot) => snapshot,
-        Err(_) => return BridgeOutcome::PolicyUnavailable,
+        Err(_) => return policy_wait(&state),
     };
     let policy = match &snapshot.config.forgejo_bridge {
         Ok(policy) => policy,
@@ -437,19 +487,26 @@ pub async fn from_github(
     match gh.repo_info(repo).await {
         Ok(value) if value["id"].as_i64() == Some(key.repository_id) => {}
         Ok(_) => return BridgeOutcome::Ignored("github-repository-identity-mismatch"),
-        Err(error) => return github_error(error),
+        Err(error) => return github_read_error(error),
     }
     let client = match ForgejoClient::new(&cfg.forgejo_base_url, &cfg.forgejo_token) {
         Ok(client) => client,
-        Err(error) => return forgejo_error(error),
+        Err(error) => return forgejo_read_error(error),
     };
-    let (forgejo_id, remote_policy) = match authorize_forgejo(&client, cfg, destination, repo).await
-    {
-        Ok(value) => value,
-        Err(outcome) => return outcome,
-    };
+    let (forgejo_id, remote_policy) =
+        match authorize_forgejo(&client, cfg, destination, repo, key.repository_id, policy).await {
+            Ok(value) => value,
+            Err(outcome) => return outcome,
+        };
     if (item.is_pr && !remote_policy.pull_requests) || (!item.is_pr && !remote_policy.issues) {
         return BridgeOutcome::Ignored("peer-kind-disabled");
+    }
+    if item.is_pr && policy.sync_refs && remote_policy.sync_refs {
+        if let Err(outcome) =
+            prepare_refs(gh, &client, cfg, key, repo, destination, item.number, false).await
+        {
+            return outcome;
+        }
     }
     let scope = bridge_scope(&client, key, forgejo_id, repo, destination);
     match forward_item(
@@ -500,7 +557,7 @@ pub async fn comment_from_github(
     let state = RepositoryConfigCache::shared().load(gh, key, repo).await;
     let snapshot = match state.snapshot() {
         Ok(snapshot) => snapshot,
-        Err(_) => return BridgeOutcome::PolicyUnavailable,
+        Err(_) => return policy_wait(&state),
     };
     let policy = match &snapshot.config.forgejo_bridge {
         Ok(policy) => policy,
@@ -516,17 +573,17 @@ pub async fn comment_from_github(
     match gh.repo_info(repo).await {
         Ok(value) if value["id"].as_i64() == Some(key.repository_id) => {}
         Ok(_) => return BridgeOutcome::Ignored("github-repository-identity-mismatch"),
-        Err(error) => return github_error(error),
+        Err(error) => return github_read_error(error),
     }
     let client = match ForgejoClient::new(&cfg.forgejo_base_url, &cfg.forgejo_token) {
         Ok(client) => client,
-        Err(error) => return forgejo_error(error),
+        Err(error) => return forgejo_read_error(error),
     };
-    let (forgejo_id, remote_policy) = match authorize_forgejo(&client, cfg, destination, repo).await
-    {
-        Ok(value) => value,
-        Err(outcome) => return outcome,
-    };
+    let (forgejo_id, remote_policy) =
+        match authorize_forgejo(&client, cfg, destination, repo, key.repository_id, policy).await {
+            Ok(value) => value,
+            Err(outcome) => return outcome,
+        };
     if !remote_policy.comments {
         return BridgeOutcome::Ignored("peer-comments-disabled");
     }
@@ -579,7 +636,7 @@ pub async fn from_forgejo(
     };
     let client = match ForgejoClient::new(&cfg.forgejo_base_url, &cfg.forgejo_token) {
         Ok(client) => client,
-        Err(error) => return forgejo_error(error),
+        Err(error) => return forgejo_read_error(error),
     };
     let sender = match event {
         ForgejoEvent::Issue { sender, .. } | ForgejoEvent::PullRequest { sender, .. } => sender,
@@ -590,7 +647,7 @@ pub async fn from_forgejo(
     }
     let bot = match client.current_user().await {
         Ok(bot) => bot,
-        Err(error) => return forgejo_error(error),
+        Err(error) => return forgejo_read_error(error),
     };
     let Some(login) = bot["login"].as_str().filter(|s| !s.is_empty()) else {
         return BridgeOutcome::PolicyUnavailable;
@@ -619,7 +676,7 @@ pub async fn from_forgejo(
     if (item.is_pr && !policy.pull_requests) || (!item.is_pr && !policy.issues) {
         return BridgeOutcome::Ignored("kind-disabled");
     }
-    let binding = match resolve_binding(&client, cfg, forgejo_repo).await {
+    let binding = match resolve_binding(&client, cfg, forgejo_repo, policy).await {
         Ok(binding) => binding,
         Err(outcome) => return outcome,
     };
@@ -634,11 +691,11 @@ pub async fn from_forgejo(
     }
     let gh = match Client::installation_resolved(cfg, binding.installation_id).await {
         Ok(client) => client,
-        Err(error) => return github_error(error),
+        Err(error) => return github_read_error(error),
     };
     let metadata = match gh.repo_info(&binding.github_repo).await {
         Ok(metadata) => metadata,
-        Err(error) => return github_error(error),
+        Err(error) => return github_read_error(error),
     };
     if metadata["id"].as_i64() != Some(binding.repository_id) {
         return BridgeOutcome::Ignored("github-repository-identity-mismatch");
@@ -655,6 +712,15 @@ pub async fn from_forgejo(
     if (item.is_pr && !remote_policy.pull_requests) || (!item.is_pr && !remote_policy.issues) {
         return BridgeOutcome::Ignored("peer-kind-disabled");
     }
+    if let Err(outcome) = matching_identities(
+        policy,
+        &remote_policy,
+        &binding.github_repo,
+        binding.repository_id,
+        binding.forgejo_repository_id,
+    ) {
+        return outcome;
+    }
     let scope = bridge_scope(
         &client,
         key,
@@ -662,6 +728,22 @@ pub async fn from_forgejo(
         &binding.github_repo,
         forgejo_repo,
     );
+    if item.is_pr && policy.sync_refs && remote_policy.sync_refs {
+        if let Err(outcome) = prepare_refs(
+            &gh,
+            &client,
+            cfg,
+            key,
+            &binding.github_repo,
+            forgejo_repo,
+            item.number,
+            true,
+        )
+        .await
+        {
+            return outcome;
+        }
+    }
     match forward_item(
         &gh.crab,
         &client,
@@ -703,11 +785,11 @@ pub async fn comment_from_forgejo(
     };
     let client = match ForgejoClient::new(&cfg.forgejo_base_url, &cfg.forgejo_token) {
         Ok(client) => client,
-        Err(error) => return forgejo_error(error),
+        Err(error) => return forgejo_read_error(error),
     };
     let bot = match client.current_user().await {
         Ok(bot) => bot,
-        Err(error) => return forgejo_error(error),
+        Err(error) => return forgejo_read_error(error),
     };
     let Some(login) = bot["login"].as_str().filter(|s| !s.is_empty()) else {
         return BridgeOutcome::PolicyUnavailable;
@@ -736,7 +818,7 @@ pub async fn comment_from_forgejo(
     if !configured.eq_ignore_ascii_case(forgejo_repo) || !policy.comments {
         return BridgeOutcome::Ignored("comments-disabled");
     }
-    let binding = match resolve_binding(&client, cfg, forgejo_repo).await {
+    let binding = match resolve_binding(&client, cfg, forgejo_repo, policy).await {
         Ok(binding) => binding,
         Err(outcome) => return outcome,
     };
@@ -751,11 +833,11 @@ pub async fn comment_from_forgejo(
     }
     let gh = match Client::installation_resolved(cfg, binding.installation_id).await {
         Ok(client) => client,
-        Err(error) => return github_error(error),
+        Err(error) => return github_read_error(error),
     };
     let metadata = match gh.repo_info(&binding.github_repo).await {
         Ok(metadata) => metadata,
-        Err(error) => return github_error(error),
+        Err(error) => return github_read_error(error),
     };
     if metadata["id"].as_i64() != Some(binding.repository_id) {
         return BridgeOutcome::Ignored("github-repository-identity-mismatch");
@@ -771,6 +853,15 @@ pub async fn comment_from_forgejo(
     };
     if !remote_policy.comments {
         return BridgeOutcome::Ignored("peer-kind-disabled");
+    }
+    if let Err(outcome) = matching_identities(
+        policy,
+        &remote_policy,
+        &binding.github_repo,
+        binding.repository_id,
+        binding.forgejo_repository_id,
+    ) {
+        return outcome;
     }
     let scope = bridge_scope(
         &client,
@@ -804,6 +895,59 @@ pub async fn comment_from_forgejo(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn prepare_refs(
+    gh: &Client,
+    forgejo: &ForgejoClient,
+    cfg: &Config,
+    key: RepositoryKey,
+    github_repo: &str,
+    forgejo_repo: &str,
+    number: i64,
+    from_forgejo: bool,
+) -> Result<(), BridgeOutcome> {
+    let source_repo = if from_forgejo {
+        forgejo_repo
+    } else {
+        github_repo
+    };
+    let route = format!("/repos/{source_repo}/pulls/{number}");
+    let live = if from_forgejo {
+        forgejo.get(&route).await.map_err(forgejo_read_error)?
+    } else {
+        gh.get(&route).await.map_err(github_read_error)?
+    };
+    if live["state"].as_str() == Some("closed") {
+        return Ok(());
+    }
+    if !live["head"]["repo"]["full_name"]
+        .as_str()
+        .is_some_and(|r| r.eq_ignore_ascii_case(source_repo))
+    {
+        return Err(BridgeOutcome::Ignored("fork-pr-not-mirrored"));
+    }
+    let head = live["head"]["ref"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .ok_or(BridgeOutcome::Ignored("missing-pr-branches"))?;
+    let base = live["base"]["ref"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .ok_or(BridgeOutcome::Ignored("missing-pr-branches"))?;
+    super::refs::sync_pr(
+        gh,
+        cfg,
+        key.installation_id,
+        github_repo,
+        forgejo_repo,
+        head,
+        base,
+        from_forgejo,
+    )
+    .await
+    .map_err(BridgeOutcome::Transport)
+}
+
 fn github_self(gh: &Client, user: &Value) -> bool {
     user["login"].as_str().is_some_and(|login| {
         !gh.app_slug.is_empty()
@@ -822,9 +966,7 @@ async fn github_policy(
     forgejo_repo: &str,
 ) -> Result<ForgejoBridgeConfig, BridgeOutcome> {
     let state = RepositoryConfigCache::shared().load(gh, key, repo).await;
-    let snapshot = state
-        .snapshot()
-        .map_err(|_| BridgeOutcome::PolicyUnavailable)?;
+    let snapshot = state.snapshot().map_err(|_| policy_wait(&state))?;
     let policy = snapshot
         .config
         .forgejo_bridge
@@ -836,22 +978,24 @@ async fn github_policy(
     Ok(policy.clone())
 }
 
-async fn authorize_forgejo(
+fn policy_wait(state: &ConfigState) -> BridgeOutcome {
+    match state {
+        ConfigState::Unavailable {
+            retry_after_secs, ..
+        } => BridgeOutcome::RetryAfter((*retry_after_secs).max(15)),
+        ConfigState::Ready(_) => BridgeOutcome::PolicyUnavailable,
+    }
+}
+
+pub(super) async fn authorize_forgejo(
     client: &ForgejoClient,
     cfg: &Config,
     repo: &str,
     github_repo: &str,
+    github_id: i64,
+    local_policy: &ForgejoBridgeConfig,
 ) -> Result<(i64, ForgejoBridgeConfig), BridgeOutcome> {
-    let metadata = client.repository(repo).await.map_err(forgejo_error)?;
-    if metadata["mirror"].as_bool() != Some(true)
-        || metadata["original_url"]
-            .as_str()
-            .and_then(parse_github_origin)
-            .as_deref()
-            != Some(&github_repo.to_ascii_lowercase())
-    {
-        return Err(BridgeOutcome::Ignored("mirror-origin-mismatch"));
-    }
+    let metadata = client.repository(repo).await.map_err(forgejo_read_error)?;
     let id = metadata["id"]
         .as_i64()
         .filter(|id| *id > 0)
@@ -865,41 +1009,41 @@ async fn authorize_forgejo(
     if !gate(cfg, &policy)?.eq_ignore_ascii_case(repo) {
         return Err(BridgeOutcome::Ignored("destination-mismatch"));
     }
+    validate_source(&metadata, &policy)?;
+    if source_repository(&metadata, &policy)?.as_str() != github_repo.to_ascii_lowercase() {
+        return Err(BridgeOutcome::Ignored("mirror-origin-mismatch"));
+    }
+    matching_identities(local_policy, &policy, github_repo, github_id, id)?;
     Ok((id, policy))
 }
 
-/// Resolve a Forgejo mirror's configured Git origin to one App installation and
+/// Resolve an explicitly pinned pair or a legacy mirror origin to one App installation and
 /// repository ID. Results are cached briefly to keep comment relays cheap.
 async fn resolve_binding(
     forgejo: &ForgejoClient,
     cfg: &Config,
     forgejo_repo: &str,
+    policy: &ForgejoBridgeConfig,
 ) -> Result<Binding, BridgeOutcome> {
     static CACHE: OnceLock<tokio::sync::Mutex<HashMap<String, (Instant, Binding)>>> =
         OnceLock::new();
     let metadata = forgejo
         .repository(forgejo_repo)
         .await
-        .map_err(forgejo_error)?;
-    if metadata["mirror"].as_bool() != Some(true) {
-        return Err(BridgeOutcome::Ignored("not-a-pull-mirror"));
-    }
+        .map_err(forgejo_read_error)?;
+    validate_source(&metadata, policy)?;
     let forgejo_repository_id = metadata["id"]
         .as_i64()
         .filter(|id| *id > 0)
         .ok_or_else(|| BridgeOutcome::InvalidPayload("Forgejo repository has no id".into()))?;
-    let original = metadata["original_url"]
-        .as_str()
-        .filter(|url| !url.is_empty())
-        .ok_or(BridgeOutcome::Ignored("mirror-origin-missing"))?;
-    let github_repo =
-        parse_github_origin(original).ok_or(BridgeOutcome::Ignored("mirror-origin-not-github"))?;
+    let github_repo = source_repository(&metadata, policy)?;
     let key = format!(
-        "{}|{}|{}|{}",
+        "{}|{}|{}|{}|{:?}",
         forgejo.api_base,
         cfg.app_id,
         forgejo_repository_id,
-        github_repo.to_ascii_lowercase()
+        github_repo.to_ascii_lowercase(),
+        policy.github_repository_id
     );
     let cache = CACHE.get_or_init(|| tokio::sync::Mutex::new(HashMap::new()));
     {
@@ -911,10 +1055,10 @@ async fn resolve_binding(
         }
     }
 
-    let app = Client::app_client(cfg).map_err(github_error)?;
+    let app = Client::app_client(cfg).map_err(github_read_error)?;
     let installations = crate::github::paginate(&app, "/app/installations?per_page=100")
         .await
-        .map_err(github_error)?;
+        .map_err(github_read_error)?;
     let mut found = None;
     let mut lookup_error = None;
     for installation in installations {
@@ -924,7 +1068,7 @@ async fn resolve_binding(
         let client = match Client::installation_resolved(cfg, installation_id).await {
             Ok(client) => client,
             Err(error) => {
-                lookup_error = Some(github_error(error));
+                lookup_error = Some(github_read_error(error));
                 continue;
             }
         };
@@ -934,7 +1078,7 @@ async fn resolve_binding(
             {
                 Ok(repos) => repos,
                 Err(error) => {
-                    lookup_error = Some(github_error(error));
+                    lookup_error = Some(github_read_error(error));
                     continue;
                 }
             };
@@ -946,6 +1090,14 @@ async fn resolve_binding(
             let Some(repository_id) = repository["id"].as_i64().filter(|id| *id > 0) else {
                 continue;
             };
+            if policy
+                .github_repository_id
+                .is_some_and(|id| id != repository_id)
+            {
+                return Err(BridgeOutcome::Ignored(
+                    "github-repository-identity-mismatch",
+                ));
+            }
             found = Some(Binding {
                 github_repo: repository["full_name"]
                     .as_str()
@@ -965,6 +1117,65 @@ async fn resolve_binding(
     cache.retain(|_, (at, _)| at.elapsed() < BINDING_TTL);
     cache.insert(key, (Instant::now(), binding.clone()));
     Ok(binding)
+}
+
+fn validate_source(metadata: &Value, policy: &ForgejoBridgeConfig) -> Result<(), BridgeOutcome> {
+    if metadata["mirror"].as_bool().is_none() {
+        return Err(BridgeOutcome::InvalidPayload(
+            "Forgejo repository type missing".into(),
+        ));
+    }
+    if policy
+        .forgejo_repository_id
+        .is_some_and(|id| metadata["id"].as_i64() != Some(id))
+    {
+        return Err(BridgeOutcome::Ignored(
+            "forgejo-repository-identity-mismatch",
+        ));
+    }
+    if metadata["mirror"].as_bool() != Some(true) && policy.github_repository.is_none() {
+        return Err(BridgeOutcome::Ignored(
+            "ordinary-repository-needs-explicit-binding",
+        ));
+    }
+    Ok(())
+}
+
+fn source_repository(
+    metadata: &Value,
+    policy: &ForgejoBridgeConfig,
+) -> Result<String, BridgeOutcome> {
+    if let Some(repo) = &policy.github_repository {
+        return Ok(repo.to_ascii_lowercase());
+    }
+    metadata["original_url"]
+        .as_str()
+        .and_then(parse_github_origin)
+        .ok_or(BridgeOutcome::Ignored("mirror-origin-not-github"))
+}
+
+fn matching_identities(
+    a: &ForgejoBridgeConfig,
+    b: &ForgejoBridgeConfig,
+    github_repo: &str,
+    github_id: i64,
+    forgejo_id: i64,
+) -> Result<(), BridgeOutcome> {
+    if a.github_repository.is_none() && b.github_repository.is_none() {
+        return Ok(());
+    }
+    for policy in [a, b] {
+        if !policy
+            .github_repository
+            .as_deref()
+            .is_some_and(|r| r.eq_ignore_ascii_case(github_repo))
+            || policy.github_repository_id != Some(github_id)
+            || policy.forgejo_repository_id != Some(forgejo_id)
+        {
+            return Err(BridgeOutcome::Ignored("explicit-binding-mismatch"));
+        }
+    }
+    Ok(())
 }
 
 fn parse_github_origin(value: &str) -> Option<String> {
@@ -1001,6 +1212,8 @@ pub(super) fn supported_action(action: &str) -> bool {
             | "unlabeled"
             | "label_updated"
             | "label_cleared"
+            | "synchronize"
+            | "synchronized"
     )
 }
 
@@ -1012,9 +1225,10 @@ fn github_item(event: &str, payload: &Value) -> Option<Item> {
     };
     let number = source["number"].as_i64().filter(|number| *number > 0)?;
     let action = payload["action"].as_str().unwrap_or("");
-    // Code movement is owned by the pull mirror. Review requests do not map to
+    // Ref updates may be transported by the opt-in ordinary-repository mode.
+    // Review requests do not map to
     // Forgejo without an account directory and would create noisy edits.
-    if !supported_action(action) {
+    if !supported_action(action) || (!is_pr && matches!(action, "synchronize" | "synchronized")) {
         return None;
     }
     let (head, base, peer_repo) = if is_pr {
@@ -1197,8 +1411,8 @@ async fn forward_item(
         Target::Forgejo => github
             .get(&route, None::<&()>)
             .await
-            .map_err(octocrab_error)?,
-        Target::GitHub => forgejo.get(&route).await.map_err(forgejo_error)?,
+            .map_err(octocrab_read_error)?,
+        Target::GitHub => forgejo.get(&route).await.map_err(forgejo_read_error)?,
     };
     if !event_item.is_pr && live.get("pull_request").is_some_and(|pr| !pr.is_null()) {
         return Ok(BridgeOutcome::Ignored("source-kind-mismatch"));
@@ -1401,10 +1615,13 @@ async fn update_peer(
     if !reserved_labels.is_empty() {
         let route = format!("/repos/{destination}/issues/{peer}/labels");
         let labels = match target {
-            Target::Forgejo => forgejo.get_all(&route, 50).await.map_err(forgejo_error)?,
+            Target::Forgejo => forgejo
+                .get_all(&route, 50)
+                .await
+                .map_err(forgejo_read_error)?,
             Target::GitHub => crate::github::paginate(github, &format!("{route}?per_page=100"))
                 .await
-                .map_err(github_error)?,
+                .map_err(github_read_error)?,
         };
         labeled
             .labels
@@ -1419,7 +1636,7 @@ async fn update_peer(
             );
     }
     let mut payload = json!({"title": item.title, "body": marker_body(secret, scope, item, item.number, kind, revision), "state": item.state});
-    if item.is_pr {
+    if item.is_pr && target == Target::Forgejo && item.state == "open" {
         payload["base"] = json!(item.base);
     }
     match target {
@@ -1440,6 +1657,16 @@ async fn update_peer(
                 payload,
             )
             .await?;
+            // GitHub rejects any base parameter while a PR is closed, even
+            // when unchanged. Reopen first; only then synchronize its base.
+            if item.is_pr && item.state == "open" {
+                github_patch(
+                    github,
+                    &object_route(destination, peer, true),
+                    json!({"base":item.base}),
+                )
+                .await?;
+            }
             apply_github_labels(github, destination, peer, &labeled).await?;
         }
     }
@@ -1525,7 +1752,7 @@ async fn ensure_forgejo_labels(
     let mut existing = client
         .get_all(&format!("/repos/{repo}/labels"), 50)
         .await
-        .map_err(forgejo_error)?;
+        .map_err(forgejo_read_error)?;
     let mut ids = Vec::new();
     for label in labels {
         let found = existing.iter().find(|current| {
@@ -1582,7 +1809,7 @@ async fn ensure_github_labels(
     }
     let existing = crate::github::paginate(github, &format!("/repos/{repo}/labels?per_page=100"))
         .await
-        .map_err(github_error)?;
+        .map_err(github_read_error)?;
     for label in labels {
         if existing.iter().any(|current| {
             current["name"]

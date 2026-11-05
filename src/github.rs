@@ -450,6 +450,7 @@ impl Client {
                 "https://api.github.com/app/installations/{installation_id}/access_tokens"
             ))
             .bearer_auth(&jwt)
+            .header("User-Agent", "xero-bot")
             .header("Accept", "application/vnd.github+json")
             .header("X-GitHub-Api-Version", "2022-11-28")
             .send()
@@ -459,7 +460,7 @@ impl Client {
         let v: Value = resp
             .json()
             .await
-            .map_err(|e| GhError::BadShape(e.to_string()))?;
+            .map_err(|e| GhError::BadShape(format!("installation token HTTP {status}: {e}")))?;
         if !(200..300).contains(&status) {
             return Err(GhError::Api {
                 status,
