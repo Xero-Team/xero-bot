@@ -270,10 +270,15 @@ impl Store {
         )? == 1)
     }
     pub fn bridge_claim_delivery(&self) -> Result<Option<(String, Value)>> {
+        self.bridge_claim_delivery_at(crate::github::chrono_now_secs())
+    }
+    pub(crate) fn bridge_claim_delivery_at(&self, now: i64) -> Result<Option<(String, Value)>> {
         let mut db = self.db()?;
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let row: Option<(String,String)> = tx.query_row("SELECT key,payload FROM forgejo_bridge_deliveries d WHERE state='pending' AND NOT EXISTS(SELECT 1 FROM forgejo_bridge_deliveries b WHERE b.lane=d.lane AND b.state IN ('blocked','running')) ORDER BY rowid LIMIT 1",[], |r| Ok((r.get(0)?,r.get(1)?))).optional()?;
+        tx.execute("UPDATE forgejo_bridge_deliveries SET state='pending' WHERE state='waiting' AND key IN (SELECT key FROM forgejo_bridge_waits WHERE retry_at<=?1)", [now])?;
+        let row: Option<(String,String)> = tx.query_row("SELECT key,payload FROM forgejo_bridge_deliveries d WHERE state='pending' AND NOT EXISTS(SELECT 1 FROM forgejo_bridge_deliveries b WHERE b.lane=d.lane AND (b.state IN ('blocked','running') OR (b.state IN ('waiting','pending') AND b.rowid<d.rowid))) ORDER BY rowid LIMIT 1",[], |r| Ok((r.get(0)?,r.get(1)?))).optional()?;
         let Some((key, payload)) = row else {
+            tx.commit()?;
             return Ok(None);
         };
         let value = serde_json::from_str(&payload)?;
@@ -284,6 +289,29 @@ impl Store {
         tx.commit()?;
         Ok(Some((key, value)))
     }
+    /// Persist a cooldown without losing the payload or allowing later lane
+    /// events to overtake it. Unknown writes never enter this path.
+    pub fn bridge_defer_delivery(&self, key: &str, after_secs: u64, detail: &str) -> Result<()> {
+        let mut db = self.db()?;
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let attempts: u32 = tx
+            .query_row(
+                "SELECT attempts FROM forgejo_bridge_waits WHERE key=?1",
+                [key],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or(0);
+        let backoff = 15u64.saturating_mul(1u64 << attempts.min(6)).min(900);
+        let delay = i64::try_from(after_secs.max(backoff)).unwrap_or(i64::MAX);
+        let retry_at = crate::github::chrono_now_secs().saturating_add(delay);
+        if tx.execute("UPDATE forgejo_bridge_deliveries SET state='waiting',detail=?2 WHERE key=?1 AND state='running'",params![key,crate::redact::scrub(detail)])? != 1 {
+            return Err("bridge delivery is not running".into());
+        }
+        tx.execute("INSERT INTO forgejo_bridge_waits(key,retry_at,attempts) VALUES(?1,?2,?3) ON CONFLICT(key) DO UPDATE SET retry_at=excluded.retry_at,attempts=excluded.attempts",params![key,retry_at,attempts.saturating_add(1)])?;
+        tx.commit()?;
+        Ok(())
+    }
     pub fn bridge_finish_delivery(&self, key: &str, done: bool, detail: &str) -> Result<()> {
         let changed = self.db()?.execute("UPDATE forgejo_bridge_deliveries SET state=?2,detail=?3,payload=CASE WHEN ?2='done' THEN '{}' ELSE payload END WHERE key=?1 AND state='running'",params![key,if done {"done"} else {"blocked"},crate::redact::scrub(detail)])?;
         if changed != 1 {
@@ -293,13 +321,13 @@ impl Store {
     }
     pub fn bridge_deliveries(&self) -> Result<Vec<Value>> {
         let db = self.db()?;
-        let mut stmt = db.prepare("SELECT key,lane,state,detail FROM forgejo_bridge_deliveries WHERE state != 'done' ORDER BY rowid")?;
-        let rows = stmt.query_map([], |r| Ok(serde_json::json!({"key":r.get::<_,String>(0)?,"lane":r.get::<_,String>(1)?,"state":r.get::<_,String>(2)?,"detail":r.get::<_,String>(3)?})))?;
+        let mut stmt = db.prepare("SELECT d.key,d.lane,d.state,d.detail,w.retry_at,w.attempts FROM forgejo_bridge_deliveries d LEFT JOIN forgejo_bridge_waits w ON w.key=d.key WHERE d.state != 'done' ORDER BY d.rowid")?;
+        let rows = stmt.query_map([], |r| Ok(serde_json::json!({"key":r.get::<_,String>(0)?,"lane":r.get::<_,String>(1)?,"state":r.get::<_,String>(2)?,"detail":r.get::<_,String>(3)?,"retry_at":r.get::<_,Option<i64>>(4)?,"attempts":r.get::<_,Option<u32>>(5)?})))?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
     pub fn bridge_retry_delivery(&self, key: &str) -> Result<()> {
         let changed = self.db()?.execute(
-            "UPDATE forgejo_bridge_deliveries SET state='pending' WHERE key=?1 AND state='blocked'",
+            "UPDATE forgejo_bridge_deliveries SET state='pending' WHERE key=?1 AND state IN ('blocked','waiting')",
             [key],
         )?;
         if changed != 1 {

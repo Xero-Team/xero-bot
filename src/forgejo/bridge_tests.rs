@@ -916,6 +916,79 @@ fn inbox_restarts_deduplicates_blocks_only_the_failed_thread_and_prunes_bodies()
     assert_eq!(text, "{}");
 }
 
+#[test]
+fn delayed_queue_survives_restart_preserves_order_and_never_retries_unknown_writes() {
+    let dir = Dir::new();
+    let store = Store::open(&dir.0).unwrap();
+    for (key, lane) in [("limited", "a"), ("later", "a"), ("independent", "b")] {
+        store
+            .bridge_enqueue(key, lane, &json!({"key":key}))
+            .unwrap();
+    }
+    assert_eq!(store.bridge_claim_delivery().unwrap().unwrap().0, "limited");
+    inbox::finish_outcome(&store, "limited", &BridgeOutcome::RetryAfter(3600)).unwrap();
+    let rows = store.bridge_deliveries().unwrap();
+    let retry_at = rows[0]["retry_at"].as_i64().unwrap();
+    assert_eq!(rows[0]["state"], "waiting");
+    assert!(retry_at >= crate::github::chrono_now_secs() + 3599);
+    assert_eq!(
+        store
+            .bridge_claim_delivery_at(retry_at - 1)
+            .unwrap()
+            .unwrap()
+            .0,
+        "independent"
+    );
+    inbox::finish_outcome(&store, "independent", &BridgeOutcome::Synced).unwrap();
+    assert!(store
+        .bridge_claim_delivery_at(retry_at - 1)
+        .unwrap()
+        .is_none());
+    drop(store);
+    let store = Store::open(&dir.0).unwrap();
+    assert!(store
+        .bridge_claim_delivery_at(retry_at - 1)
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        store.bridge_claim_delivery_at(retry_at).unwrap().unwrap().0,
+        "limited"
+    );
+    inbox::finish_outcome(&store, "limited", &BridgeOutcome::Synced).unwrap();
+    assert_eq!(
+        store.bridge_claim_delivery_at(retry_at).unwrap().unwrap().0,
+        "later"
+    );
+    inbox::finish_outcome(&store, "later", &BridgeOutcome::NeedsReconciliation).unwrap();
+    assert!(store
+        .bridge_claim_delivery_at(retry_at + 86_400)
+        .unwrap()
+        .is_none());
+    assert_eq!(store.bridge_deliveries().unwrap()[0]["state"], "blocked");
+}
+
+#[test]
+fn old_policy_blocks_resume_but_unknown_writes_stay_blocked() {
+    let dir = Dir::new();
+    let store = Store::open(&dir.0).unwrap();
+    store.bridge_enqueue("policy", "a", &json!({})).unwrap();
+    store.bridge_claim_delivery().unwrap().unwrap();
+    store
+        .bridge_finish_delivery("policy", false, "policy-unavailable")
+        .unwrap();
+    store.bridge_enqueue("unknown", "b", &json!({})).unwrap();
+    store.bridge_claim_delivery().unwrap().unwrap();
+    store
+        .bridge_finish_delivery("unknown", false, "needs-reconciliation")
+        .unwrap();
+    drop(store);
+    let store = Store::open(&dir.0).unwrap();
+    assert_eq!(store.bridge_claim_delivery().unwrap().unwrap().0, "policy");
+    inbox::finish_outcome(&store, "policy", &BridgeOutcome::PolicyUnavailable).unwrap();
+    assert!(store.bridge_claim_delivery().unwrap().is_none());
+    assert_eq!(store.bridge_deliveries().unwrap()[1]["state"], "blocked");
+}
+
 #[tokio::test]
 async fn admission_discards_envelope_secrets_and_keeps_distinct_forgejo_revisions() {
     let forgejo = MockServer::start().await;

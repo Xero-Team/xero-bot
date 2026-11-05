@@ -21,7 +21,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use super::{ForgejoClient, ForgejoError, ForgejoEvent, ForgejoLabel};
-use crate::config::cache::{RepositoryConfigCache, RepositoryKey};
+use crate::config::cache::{ConfigState, RepositoryConfigCache, RepositoryKey};
 use crate::config::repository::ForgejoBridgeConfig;
 use crate::config::Config;
 use crate::github::{Client, GhError};
@@ -106,6 +106,7 @@ pub enum BridgeOutcome {
     BridgeDisabled,
     InvalidConfiguration,
     PolicyUnavailable,
+    RetryAfter(u64),
     MissingDestination,
     Ignored(&'static str),
     Synced,
@@ -125,6 +126,7 @@ impl std::fmt::Display for BridgeOutcome {
             Self::BridgeDisabled => f.write_str("bridge-disabled"),
             Self::InvalidConfiguration => f.write_str("invalid-configuration"),
             Self::PolicyUnavailable => f.write_str("policy-unavailable"),
+            Self::RetryAfter(seconds) => write!(f, "policy-retry-after-{seconds}s"),
             Self::MissingDestination => f.write_str("missing-destination"),
             Self::Ignored(reason) => write!(f, "ignored-{reason}"),
             Self::Synced => f.write_str("synced"),
@@ -422,7 +424,7 @@ pub async fn from_github(
     let state = RepositoryConfigCache::shared().load(gh, key, repo).await;
     let snapshot = match state.snapshot() {
         Ok(snapshot) => snapshot,
-        Err(_) => return BridgeOutcome::PolicyUnavailable,
+        Err(_) => return policy_wait(&state),
     };
     let policy = match &snapshot.config.forgejo_bridge {
         Ok(policy) => policy,
@@ -508,7 +510,7 @@ pub async fn comment_from_github(
     let state = RepositoryConfigCache::shared().load(gh, key, repo).await;
     let snapshot = match state.snapshot() {
         Ok(snapshot) => snapshot,
-        Err(_) => return BridgeOutcome::PolicyUnavailable,
+        Err(_) => return policy_wait(&state),
     };
     let policy = match &snapshot.config.forgejo_bridge {
         Ok(policy) => policy,
@@ -917,9 +919,7 @@ async fn github_policy(
     forgejo_repo: &str,
 ) -> Result<ForgejoBridgeConfig, BridgeOutcome> {
     let state = RepositoryConfigCache::shared().load(gh, key, repo).await;
-    let snapshot = state
-        .snapshot()
-        .map_err(|_| BridgeOutcome::PolicyUnavailable)?;
+    let snapshot = state.snapshot().map_err(|_| policy_wait(&state))?;
     let policy = snapshot
         .config
         .forgejo_bridge
@@ -929,6 +929,15 @@ async fn github_policy(
         return Err(BridgeOutcome::Ignored("destination-mismatch"));
     }
     Ok(policy.clone())
+}
+
+fn policy_wait(state: &ConfigState) -> BridgeOutcome {
+    match state {
+        ConfigState::Unavailable {
+            retry_after_secs, ..
+        } => BridgeOutcome::RetryAfter((*retry_after_secs).max(15)),
+        ConfigState::Ready(_) => BridgeOutcome::PolicyUnavailable,
+    }
 }
 
 pub(super) async fn authorize_forgejo(

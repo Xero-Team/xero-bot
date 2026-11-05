@@ -148,7 +148,11 @@ impl Store {
                 state TEXT NOT NULL DEFAULT 'pending', detail TEXT NOT NULL DEFAULT ''
             );
             CREATE INDEX IF NOT EXISTS bridge_delivery_lane ON forgejo_bridge_deliveries(lane,state);
+            CREATE TABLE IF NOT EXISTS forgejo_bridge_waits(
+                key TEXT PRIMARY KEY, retry_at INTEGER NOT NULL, attempts INTEGER NOT NULL
+            );
             UPDATE forgejo_bridge_deliveries SET state='pending' WHERE state='running';
+            UPDATE forgejo_bridge_deliveries SET state='pending' WHERE state='blocked' AND detail='policy-unavailable';
             CREATE TABLE IF NOT EXISTS forgejo_bridge_creates(
                 scope TEXT NOT NULL, kind TEXT NOT NULL, side TEXT NOT NULL, number INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL, PRIMARY KEY(scope,kind,side,number)

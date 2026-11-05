@@ -280,8 +280,14 @@ Git 分叉保留失败事件，修复并核实远端状态后可恢复。
 后续元数据步骤失败，可沿已有映射恢复，不再新建对象。已完成任务清除存储的正文，
 保留去重键和对象映射。SQLite 与外部 API 不共享事务，不承诺 exactly-once。
 
-失败事件进入 `blocked`，暂停同一来源 Issue / PR 的后续桥接事件，其他对象继续。
-不会在后台不断重试写请求。停止服务后可以使用：
+临时配置读取失败进入持久化 `waiting` 队列：GitHub 限流遵守 `Retry-After` /
+限额重置时间；无明确恢复时间时使用退避。到期后后台自动重试，重启保留等待时间。
+同一来源 Issue / PR 后续事件等待队首完成，其他对象继续处理。`bridge-deliveries`
+显示 `retry_at`（UTC Unix 秒）和 `attempts`。旧版因 `policy-unavailable` 阻塞的事件
+在升级启动时自动恢复排队。
+
+不确定的创建/评论、API 写入拒绝及 refs 冲突仍进入 `blocked`，不会盲目重放写入。
+停止服务后可以使用：
 
 ```sh
 trigger-state /data bridge-deliveries # 待处理/阻塞事件的 KEY、lane、原因
