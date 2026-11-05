@@ -376,14 +376,20 @@ fn gate<'a>(cfg: &'a Config, policy: &'a ForgejoBridgeConfig) -> Result<&'a str,
 
 fn forgejo_error(error: ForgejoError) -> BridgeOutcome {
     match error {
-        ForgejoError::Api { status, .. } => BridgeOutcome::Rejected(status),
+        ForgejoError::Api { status, message } => {
+            tracing::warn!(status, detail = %crate::redact::scrub(&message), "Forgejo bridge API request failed");
+            BridgeOutcome::Rejected(status)
+        }
         other => BridgeOutcome::Transport(other.to_string()),
     }
 }
 
 fn github_error(error: GhError) -> BridgeOutcome {
     match error {
-        GhError::Api { status, .. } => BridgeOutcome::Rejected(status),
+        GhError::Api { status, message } => {
+            tracing::warn!(status, detail = %crate::redact::scrub(&message), "GitHub bridge API request failed");
+            BridgeOutcome::Rejected(status)
+        }
         other => BridgeOutcome::Transport(other.to_string()),
     }
 }
@@ -391,6 +397,7 @@ fn github_error(error: GhError) -> BridgeOutcome {
 fn octocrab_error(error: octocrab::Error) -> BridgeOutcome {
     match error {
         octocrab::Error::GitHub { source, .. } => {
+            tracing::warn!(status = source.status_code.as_u16(), detail = %crate::redact::scrub(&source.message), "GitHub bridge API request failed");
             BridgeOutcome::Rejected(source.status_code.as_u16())
         }
         other => BridgeOutcome::Transport(other.to_string()),
@@ -1629,7 +1636,7 @@ async fn update_peer(
             );
     }
     let mut payload = json!({"title": item.title, "body": marker_body(secret, scope, item, item.number, kind, revision), "state": item.state});
-    if item.is_pr {
+    if item.is_pr && target == Target::Forgejo && item.state == "open" {
         payload["base"] = json!(item.base);
     }
     match target {
@@ -1650,6 +1657,16 @@ async fn update_peer(
                 payload,
             )
             .await?;
+            // GitHub rejects any base parameter while a PR is closed, even
+            // when unchanged. Reopen first; only then synchronize its base.
+            if item.is_pr && item.state == "open" {
+                github_patch(
+                    github,
+                    &object_route(destination, peer, true),
+                    json!({"base":item.base}),
+                )
+                .await?;
+            }
             apply_github_labels(github, destination, peer, &labeled).await?;
         }
     }

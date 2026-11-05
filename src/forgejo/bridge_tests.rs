@@ -214,6 +214,30 @@ async fn both_providers_issue_and_pr_lifecycle_deduplicate_and_reopen() {
                 .filter(|r| r.method == "PATCH")
                 .map(|r| serde_json::from_slice::<Value>(&r.body).unwrap())
                 .collect::<Vec<_>>();
+            let base_patches = patches
+                .iter()
+                .filter(|p| p.get("base").is_some())
+                .collect::<Vec<_>>();
+            if is_pr {
+                assert_eq!(base_patches.len(), 2);
+                assert!(base_patches.iter().all(|p| p["base"] == "main"));
+                assert!(patches
+                    .iter()
+                    .filter(|p| p["state"] == "closed")
+                    .all(|p| p.get("base").is_none()));
+                if target == Target::GitHub {
+                    for (index, patch) in patches.iter().enumerate() {
+                        if patch.get("base").is_some() {
+                            assert!(index > 0 && patches[index - 1]["state"] == "open");
+                            assert!(patch.get("state").is_none());
+                        }
+                    }
+                }
+            }
+            let patches = patches
+                .iter()
+                .filter(|p| p.get("state").is_some())
+                .collect::<Vec<_>>();
             assert_eq!(patches.len(), 3);
             assert_eq!(patches[1]["state"], "closed");
             assert_eq!(patches[2]["state"], "open");
@@ -235,9 +259,6 @@ async fn both_providers_issue_and_pr_lifecycle_deduplicate_and_reopen() {
                 }
             );
             assert_eq!(puts[2]["labels"], json!([]));
-            if is_pr {
-                assert_eq!(patches[2]["base"], "main");
-            }
             // Equal canonical content on the peer is an echo, even with a different number.
             let mut echoed = live.lock().unwrap().clone();
             echoed["number"] = json!(93);
