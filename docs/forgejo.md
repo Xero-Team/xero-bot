@@ -167,60 +167,79 @@ CI 不依赖 GitHub App、AI key 或 webhook secret。
 
 ## Forgejo ↔ GitHub Issue / PR 消息桥
 
-消息桥同步协作内容，代码继续由现有 GitHub → Forgejo pull mirror 复制。
-它与 `[forgejo.mirror]` 分别启用；默认关闭。目标仓库必须已存在，且 Forgejo
-仓库的 `original_url` 是本 GitHub 仓库的 HTTPS 地址，例如
-`https://github.com/xero-team/xero-bot.git`。暂不接受 SSH、带凭据的 origin
-或 GitHub Enterprise。GitHub App 必须安装在该 GitHub 仓库上。
+消息桥同步 Issue、PR 和普通评论。Forgejo 原生 pull mirror 禁止 PR，因此完整
+PR 桥接使用**普通仓库 + 显式双边身份绑定 + 可选 Git refs 同步**。旧的 pull mirror
+模式继续支持 Issue 和评论，不能开启 PR。GitHub App 必须安装在来源仓库上。
 
-**实机限制（Forgejo 17.0.1）：当前部署仅支持 Issue 和普通评论。**
-Forgejo 的 `CanEnablePulls()` 要求仓库不是 mirror；PR API 的 `MustAllowPulls`
-会对镜像仓库返回 404，即使 API 显示 `has_pull_requests = true` 且账号有管理权限。
-参见官方 [仓库判定](https://codeberg.org/forgejo/forgejo/src/tag/v17.0.1/models/repo/repo.go#L634-L637)
-和 [PR API 权限检查](https://codeberg.org/forgejo/forgejo/src/tag/v17.0.1/routers/api/v1/permissions/must_allow_pulls.go)。
-当前 bridge 又依赖 pull mirror 绑定来源，所以生产配置必须保持 `pull_requests = false`。
-PR 代码路径的模拟 API 测试不代表真实 Forgejo 镜像支持 PR；普通仓库身份绑定和独立
-Git refs 同步需要后续设计，见 [#54](https://github.com/Xero-Team/xero-bot/issues/54)。
-不要转换现有镜像或直接修改 Forgejo 数据库来规避此限制。
+### 普通仓库配置
 
-### 启用
-
-先部署支持消息桥的 bot，再在 **GitHub 默认分支** 的 `.github/xero-bot.toml` 加入：
+先部署支持以下字段的 bot，再在双方默认分支放置一致的绑定：
 
 ```toml
 [forgejo.bridge]
 enabled = true
-destination = "xero-team/xero-bot" # Forgejo 的 owner/repository
+destination = "xero-team/xero-bot" # Forgejo owner/repository
+# 从两端 API 实际读取；示例 ID 仅适用于本项目的现有仓库。
+github_repository = "Xero-Team/xero-bot"
+github_repository_id = 1351057454
+forgejo_repository_id = 2
 issues = true
-pull_requests = false # Forgejo pull mirror 不支持 PR，见上方实机限制
+pull_requests = true
 comments = true
+sync_refs = true
+
+[forgejo.mirror]
+enabled = false # 普通仓库不能使用原生 mirror-sync
 ```
 
-三个内容开关默认都为 `false`，启用时至少选一个。仅开启 `comments` 时只能为
-已有持久映射的对象转发评论，不会创建 Issue / PR。`destination` 始终填写
-Forgejo 仓库名，即使 GitHub 仓库名与它不同也不改变含义。
+三个身份字段必须同时设置且 ID 必须为正数。两个方向都核对双方默认分支策略、
+真实仓库 ID、GitHub App 安装清单和目标名称；不会信任 webhook 声明的目标。
+仓库删除后同名重建会有新 ID，不能继承旧绑定。旧镜像配置可以不填写这三个字段，
+此时仍要求 pull mirror 的 `original_url` 是该 GitHub 仓库的 HTTPS 地址。
 
-等待 pull mirror 把这份默认分支配置同步到 Forgejo，再启用双方 webhook。
-两个方向都会检查双方默认分支策略：配置错误、读取失败、目标不匹配时不写入。
-Forgejo → GitHub 的目标从 mirror origin 和 GitHub App 安装清单解析，并核对
-实际仓库 ID；不会使用 webhook 中声明的目标地址。
+`sync_refs` 默认关闭，且两端都开启时才传输代码：
 
-- GitHub App 仓库权限：Metadata / Contents 读，Issues / Pull requests 写。
-- GitHub webhook：`Issues`、`Pull request`、`Issue comment`。
-- Forgejo token：`read:user`、`write:issue`、`write:repository`，账号本身需具备仓库相应权限。
-- Forgejo webhook：Issue、Pull request、Issue comment、Pull request comment，
-  以及 Issue / Pull request 的标签事件。兼容 `issue_label` / `pull_request_label`
-  事件名和 `label_updated` / `label_cleared` 动作。
-- Forgejo 镜像仓库需启用 Issues 单元；开启 Pull Requests 单元不能解除镜像限制。
+- GitHub push 和定期巡检向 Forgejo 同步分支与标签，只允许创建或快进；
+  Forgejo 独有分支、领先的分支及 `refs/pull/*` 均保留，不执行删除或强推。
+- PR 创建或分支更新前先同步 GitHub 的 base；GitHub 来源 PR 再同步其 head 到
+  Forgejo，Forgejo 来源 PR 则将同仓库 head 导入 GitHub 的同名分支。
+- 同名分支分叉、标签目标变化、PR 目标分支领先源分支时停止并记录冲突。
+  不会自动覆盖用户提交。Forgejo PR head 不能写入 GitHub 默认分支。
+- Fork PR 仍不支持。仅复制本次 PR 所需的 Forgejo head，不做全仓库反向复制。
+- Git 凭据通过子进程环境中的 URL 范围 HTTP header 传递，不写入仓库配置、
+  命令参数或日志；禁用重定向、交互凭据提示和 Git hooks。
 
-Forgejo webhook 的配置和签名方式见前文，也可参考
-[Forgejo webhook 文档](https://forgejo.org/docs/latest/user/repository/webhooks/)。
-GitHub 的 PR 标签通过 Issues API 管理，权限说明见
-[GitHub Labels API](https://docs.github.com/en/rest/issues/labels)。
+新普通仓库需要先由维护者初始化同一段 Git 历史及双方配置，bot 不会在无双边授权时
+替空仓库写入配置。迁移已有镜像时，先将新配置通过旧镜像同步到两端，再转换仓库。
+
+- GitHub App：Metadata / Contents 读，Issues / Pull requests 写；启用 refs 时需要
+  Contents 写。GitHub 的分支保护和 App 权限仍适用。
+- GitHub webhook：Issues、Pull request、Issue comment、Push。
+- Forgejo token：`read:user`、`write:issue`、`write:repository`，bot 账号需具备仓库写权限。
+- Forgejo webhook：Issue、Pull request（含同步/分支更新）、Issue comment、
+  Pull request comment，以及两类对象的标签事件。
+- 普通 Forgejo 仓库需启用 Issues 和 Pull Requests 单元。
+
+### 从现有 pull mirror 迁移
+
+1. 部署新版二进制，完成隔离普通仓库的双向 PR 实测。
+2. 备份 Forgejo 数据库、仓库 Git 数据及 bot 的整个 `/data`。保存原镜像来源和配置。
+3. 将显式绑定和 `sync_refs` 配置提交到 GitHub 默认分支，使用现有 mirror 完成最后一次
+   同步，核对两端默认分支 SHA 一致。不要在新二进制部署前加入严格解析器未知的字段。
+4. 使用 Forgejo 仓库设置中的“转换为普通仓库”，再开启 PR 单元。
+   官方转换沿用 repository ID，现有 Issue、评论和仓库地址保留；bridge scope 不包含
+   mirror 标记，因此既有对象映射继续有效。不要手工改数据库绕过 PR 限制。
+5. 停止 bot，检查并按外部证据恢复迁移期间的 blocked delivery，重启后验证新 PR、
+   分支更新、普通评论以及原 Issue 映射。原生镜像转换不会自动提供反向转换入口；
+   回滚转换应在停写后恢复一致的 Forgejo 和 bot 备份。
+
+限制与原位转换依据：
+[Forgejo PR 仓库判定](https://codeberg.org/forgejo/forgejo/src/tag/v17.0.1/models/repo/repo.go#L634-L637)、
+[官方转换实现](https://codeberg.org/forgejo/forgejo/src/tag/v17.0.1/services/repository/repository.go#L122-L130)。
 
 ### 同步范围
 
-下表描述代码中的映射语义；所有 PR 行为受上方镜像限制约束，当前生产部署未启用。
+下表适用于双方启用相应功能的普通仓库模式；原生 pull mirror 仅支持 Issue 和评论。
 
 | 内容 | 行为 |
 | --- | --- |
@@ -229,7 +248,7 @@ GitHub 的 PR 标签通过 Issues API 管理，权限说明见
 | 开放 / 关闭 | 双向关闭和重新打开；合并事件只同步关闭状态，不执行对端合并 |
 | 标签 | 按名称同步成员关系、移除已取消的标签；缺少的标签使用源端颜色和描述创建 |
 | 普通评论 | 转发新建评论，显示源平台和评论者；不转发评论编辑、删除、行内 review |
-| PR 分支 | 仅同仓库、双方已存在的 head/base；支持 base 变更，不传输 Git ref |
+| PR 分支 | 同仓库 head/base；开启 `sync_refs` 时按上方规则传输分支，否则需预先存在 |
 
 已有标签的颜色和描述保留各平台设置。`LABEL_MERGE_QUEUE_QUEUED` /
 `LABEL_MERGE_QUEUE_TESTING` 指定的两个合并队列标签不会跨平台导入，也不会被
@@ -237,8 +256,8 @@ GitHub 的 PR 标签通过 Issues API 管理，权限说明见
 表情反应和合并队列操作均不在桥接范围内。当前 bot 账号自己的写入会被过滤，
 包括它产生的命令回复；其他普通评论正常转发。
 
-PR 来自 fork、分支尚未镜像到对端、仓库未开放 PR 功能时，桥接不会复制代码或
-猜测分支。Fork PR 跳过；API 拒绝（例如缺少分支）保留失败事件，修复后可恢复。
+Fork PR 跳过；未开启 refs 同步时不猜测或创建分支。API 拒绝（例如缺少分支）或
+Git 分叉保留失败事件，修复并核实远端状态后可恢复。
 已有 Issue / PR 不会按标题或相同编号自动配对，也不做历史数据回填；后续评论
 只会发给已建立映射的对端。并发编辑按单消费者处理顺序收敛，不做字段级冲突合并。
 
@@ -287,7 +306,7 @@ trigger-state /data bridge-retry KEY
 
 ### 上线与回滚
 
-通用示例表保持注释；本仓库在线配置已显式开启 Issue 和评论，PR 保持关闭。
+通用示例表保持注释；生产功能以本仓库在线配置为准。
 新部署应先升级所有读取该仓库策略的
 实例，再添加 `[forgejo.bridge]`，并确认镜像中的配置已经更新。回滚到不认识该表的
 旧版本前，先移除该表并完成镜像同步；只设 `enabled = false` 仍会被旧版严格解析器拒绝。

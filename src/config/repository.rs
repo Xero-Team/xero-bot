@@ -425,8 +425,8 @@ impl ForgejoMirrorConfig {
 }
 
 /// Explicit two-way collaboration bridge between one GitHub repository and one
-/// Forgejo repository. Code and Git refs are never transported by this domain;
-/// the existing pull mirror remains the only Git replication path.
+/// Forgejo repository. Explicit identities also allow ordinary repositories;
+/// ref transport must be opted into separately from metadata replication.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForgejoBridgeConfig {
     pub enabled: bool,
@@ -434,6 +434,10 @@ pub struct ForgejoBridgeConfig {
     pub issues: bool,
     pub pull_requests: bool,
     pub comments: bool,
+    pub github_repository: Option<String>,
+    pub github_repository_id: Option<i64>,
+    pub forgejo_repository_id: Option<i64>,
+    pub sync_refs: bool,
 }
 
 impl ForgejoBridgeConfig {
@@ -444,6 +448,10 @@ impl ForgejoBridgeConfig {
             issues: false,
             pull_requests: false,
             comments: false,
+            github_repository: None,
+            github_repository_id: None,
+            forgejo_repository_id: None,
+            sync_refs: false,
         }
     }
 }
@@ -481,6 +489,10 @@ struct RawForgejoBridge {
     issues: bool,
     pull_requests: bool,
     comments: bool,
+    github_repository: Option<String>,
+    github_repository_id: Option<i64>,
+    forgejo_repository_id: Option<i64>,
+    sync_refs: bool,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -649,6 +661,23 @@ fn forgejo(raw: RawForgejoMirror) -> Domain<ForgejoMirrorConfig> {
 /// shared with the mirror domain, while toggle values are explicit booleans so
 /// a typo can never silently enable public cross-posting.
 fn forgejo_bridge(raw: RawForgejoBridge) -> Domain<ForgejoBridgeConfig> {
+    let explicit = raw.github_repository.is_some()
+        || raw.github_repository_id.is_some()
+        || raw.forgejo_repository_id.is_some()
+        || raw.sync_refs;
+    if explicit
+        && (raw.destination.is_none()
+            || !raw.github_repository.as_deref().is_some_and(|repo| {
+                crate::idle_workflows::config::repository_name(repo).is_ok() && repo.trim() == repo
+            })
+            || !raw.github_repository_id.is_some_and(|id| id > 0)
+            || !raw.forgejo_repository_id.is_some_and(|id| id > 0))
+    {
+        return Err(Problem::new(
+            ReasonCode::InvalidForgejoSync,
+            "ordinary Forgejo repositories require destination, github_repository and both positive repository IDs",
+        ));
+    }
     let Some(destination) = raw.destination.as_deref() else {
         return if raw.enabled {
             Err(Problem::new(
@@ -700,6 +729,10 @@ fn forgejo_bridge(raw: RawForgejoBridge) -> Domain<ForgejoBridgeConfig> {
         issues: raw.issues,
         pull_requests: raw.pull_requests,
         comments: raw.comments,
+        github_repository: raw.github_repository.map(|repo| repo.to_ascii_lowercase()),
+        github_repository_id: raw.github_repository_id,
+        forgejo_repository_id: raw.forgejo_repository_id,
+        sync_refs: raw.sync_refs,
     })
 }
 

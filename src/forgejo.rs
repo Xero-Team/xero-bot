@@ -13,6 +13,7 @@ use sha2::Sha256;
 pub mod bridge;
 pub mod commands;
 pub mod inbox;
+mod refs;
 mod repository_config;
 pub mod sync;
 
@@ -214,7 +215,9 @@ pub fn classify(event_header: &str, payload: &Value) -> ForgejoEvent {
                 return ForgejoEvent::Ignored("issue without number".into());
             };
             let action = jstr(payload, &["action"]).unwrap_or("").to_string();
-            if !bridge::supported_action(&action) {
+            if !bridge::supported_action(&action)
+                || matches!(action.as_str(), "synchronize" | "synchronized")
+            {
                 return ForgejoEvent::Ignored("unsupported issue action".into());
             }
             let issue = &payload["issue"];
@@ -234,7 +237,7 @@ pub fn classify(event_header: &str, payload: &Value) -> ForgejoEvent {
                     .to_string(),
             }
         }
-        "pull_request" | "pull_request_label" => {
+        "pull_request" | "pull_request_label" | "pull_request_sync" => {
             let Some(repo) = jstr(payload, &["repository", "full_name"]) else {
                 return ForgejoEvent::Ignored("pull request without repository".into());
             };

@@ -136,7 +136,7 @@ retention_days = 7 # 数字
 # GitHub 和 SQLite 不共享事务，不承诺 exactly-once。详情：docs/triggers.zh-CN.md。
 # Forgejo 双向协作消息桥 / Two-way collaboration bridge
 # 同步 Issue/PR 元数据与评论，不复制 CI、review approval 或 Git ref。
-# destination 指向从本 GitHub 仓库拉取的 Forgejo pull mirror；token 只放部署环境。
+# 普通仓库需要显式双边身份绑定；旧 pull mirror 仅支持 Issue/评论。token 只放部署环境。
 # 先升级 bot，再将配置镜像到 Forgejo；双方默认分支策略均须启用。
 # 仅同步新建对象和已有映射；fork PR / Git ref 不复制。详见 docs/forgejo.md。
 # 启用前需要为本仓库配置 GitHub 的 Issues / Pull request / Issue comment
@@ -145,8 +145,12 @@ retention_days = 7 # 数字
 # enabled = false
 # destination = "xero-team/xero-bot"
 # issues = true
-# pull_requests = true
+# pull_requests = false # 普通仓库完成绑定后可开启
 # comments = true
+# github_repository = "Xero-Team/xero-bot"
+# github_repository_id = 1351057454
+# forgejo_repository_id = 2
+# sync_refs = false # 普通仓库双方显式开启后，按快进规则同步 refs
 
 # Forgejo 单向仓库镜像 / One-way GitHub -> Forgejo mirror
 # 目标仓库必须已存在，并在 Forgejo 中配置为从本 GitHub 仓库拉取的 pull mirror。

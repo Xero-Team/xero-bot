@@ -4,6 +4,42 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use wiremock::matchers::{body_partial_json, method, path, query_param};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
+#[test]
+fn ordinary_repositories_require_matching_pinned_identities_on_both_sides() {
+    let policy = crate::config::repository::RepositoryConfig::parse("[forgejo.bridge]\nenabled=true\ndestination='dest/repo'\nissues=true\npull_requests=true\nsync_refs=true\ngithub_repository='Source/Repo'\ngithub_repository_id=123\nforgejo_repository_id=456", "source/repo").unwrap().forgejo_bridge.unwrap();
+    let metadata = json!({"id":456,"mirror":false});
+    assert_eq!(validate_source(&metadata, &policy), Ok(()));
+    assert_eq!(
+        source_repository(&metadata, &policy).unwrap(),
+        "source/repo"
+    );
+    assert_eq!(
+        matching_identities(&policy, &policy, "SOURCE/REPO", 123, 456),
+        Ok(())
+    );
+    assert!(validate_source(&json!({"id":457,"mirror":false}), &policy).is_err());
+    assert!(matching_identities(&policy, &policy, "source/repo", 124, 456).is_err());
+    assert!(matching_identities(
+        &policy,
+        &ForgejoBridgeConfig::disabled(),
+        "source/repo",
+        123,
+        456
+    )
+    .is_err());
+    assert!(validate_source(&metadata, &ForgejoBridgeConfig::disabled()).is_err());
+    // Scope remains the same after native mirror conversion.
+    let fj = ForgejoClient::new("https://forgejo.example", "test-token").unwrap();
+    let key = RepositoryKey {
+        installation_id: 7,
+        repository_id: 123,
+    };
+    assert_eq!(
+        bridge_scope(&fj, key, 456, "Source/Repo", "Dest/Repo"),
+        "[\"https://forgejo.example/api/v1/\",7,123,456,\"source/repo\",\"dest/repo\"]"
+    );
+}
+
 struct Dir(PathBuf);
 impl Dir {
     fn new() -> Self {
@@ -927,17 +963,18 @@ fn classifier_and_origin_validation_cover_supported_events_only() {
         crate::forgejo::classify("pull_request_label", &payload),
         ForgejoEvent::PullRequest { number: 5, .. }
     ));
-    for action in [
-        "deleted",
-        "assigned",
-        "review_requested",
-        "synchronized",
-        "synchronize",
-    ] {
+    for action in ["deleted", "assigned", "review_requested"] {
         let mut payload = payload.clone();
         payload["action"] = json!(action);
         assert!(github_item("issues", &payload).is_none());
         assert!(forgejo_item(&crate::forgejo::classify("pull_request", &payload)).is_none());
+    }
+    for action in ["synchronize", "synchronized"] {
+        let mut update = payload.clone();
+        update["action"] = json!(action);
+        assert!(github_item("issues", &update).is_none());
+        assert!(github_item("pull_request", &update).is_some());
+        assert!(forgejo_item(&crate::forgejo::classify("pull_request_sync", &update)).is_some());
     }
     assert!(github_comment(
         &json!({"action":"edited","issue":{"number":1},"comment":{"id":2,"body":"edited"}})

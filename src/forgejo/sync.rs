@@ -1,8 +1,6 @@
-//! GitHub Push driven one-way Forgejo mirror sync.
-//!
-//! This module only reads GitHub configuration and asks an existing Forgejo
-//! pull mirror to fetch. It never creates a repo, stores GitHub credentials in
-//! Forgejo, or writes a Git ref to GitHub.
+//! GitHub push driven synchronization to Forgejo. Legacy pull mirrors use the
+//! native fetch endpoint; explicitly bound ordinary repositories use conservative
+//! head/tag transport. Neither mode creates repositories or stores credentials.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -73,6 +71,55 @@ async fn sync_repository_with_cache(
             return SyncOutcome::InvalidConfiguration;
         }
     };
+    if let Ok(policy) = &snapshot.config.forgejo_bridge {
+        if policy.enabled && policy.sync_refs {
+            let Some(destination) = policy.destination.as_deref() else {
+                return SyncOutcome::InvalidConfiguration;
+            };
+            let client = match ForgejoClient::new(&cfg.forgejo_base_url, &cfg.forgejo_token) {
+                Ok(c) => c,
+                Err(e) => return SyncOutcome::Transport(e.to_string()),
+            };
+            let (_, peer) = match super::bridge::authorize_forgejo(
+                &client,
+                cfg,
+                destination,
+                repo,
+                key.repository_id,
+                policy,
+            )
+            .await
+            {
+                Ok(pair) => pair,
+                Err(e) => return SyncOutcome::Transport(e.to_string()),
+            };
+            if !peer.sync_refs {
+                return SyncOutcome::MirrorDisabled;
+            }
+            let outcome = match super::refs::sync_all(
+                gh,
+                cfg,
+                key.installation_id,
+                repo,
+                destination,
+            )
+            .await
+            {
+                Ok(()) => SyncOutcome::Requested,
+                Err(e) => SyncOutcome::Transport(e),
+            };
+            if outcome == SyncOutcome::Requested {
+                tracing::info!(
+                    repo,
+                    destination,
+                    "Forgejo ordinary repository refs synchronized"
+                );
+            } else {
+                tracing::warn!(repo, destination, result = %outcome, "Forgejo ordinary repository ref sync stopped");
+            }
+            return outcome;
+        }
+    }
     let mirror = match &snapshot.config.forgejo {
         Ok(mirror) => mirror,
         Err(problem) => {
@@ -141,7 +188,7 @@ async fn sync_destination_with(base_url: &str, token: &str, destination: &str) -
 
 /// One lock per Forgejo base URL + destination. Weak references let idle
 /// targets disappear without retaining process-lifetime state.
-fn target_lock(key: &str) -> Arc<tokio::sync::Mutex<()>> {
+pub(super) fn target_lock(key: &str) -> Arc<tokio::sync::Mutex<()>> {
     static LOCKS: OnceLock<Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>> = OnceLock::new();
     let locks = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
     let mut locks = match locks.lock() {
