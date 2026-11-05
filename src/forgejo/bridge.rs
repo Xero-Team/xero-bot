@@ -126,7 +126,7 @@ impl std::fmt::Display for BridgeOutcome {
             Self::BridgeDisabled => f.write_str("bridge-disabled"),
             Self::InvalidConfiguration => f.write_str("invalid-configuration"),
             Self::PolicyUnavailable => f.write_str("policy-unavailable"),
-            Self::RetryAfter(seconds) => write!(f, "policy-retry-after-{seconds}s"),
+            Self::RetryAfter(seconds) => write!(f, "read-retry-after-{seconds}s"),
             Self::MissingDestination => f.write_str("missing-destination"),
             Self::Ignored(reason) => write!(f, "ignored-{reason}"),
             Self::Synced => f.write_str("synced"),
@@ -397,6 +397,46 @@ fn octocrab_error(error: octocrab::Error) -> BridgeOutcome {
     }
 }
 
+// Only GET/identity lookups use these classifiers. Write failures retain their
+// existing blocked/unknown treatment and must never enter automatic retries.
+fn retry_read(outcome: BridgeOutcome) -> BridgeOutcome {
+    match outcome {
+        BridgeOutcome::Rejected(408 | 429 | 500..=599) | BridgeOutcome::Transport(_) => {
+            tracing::info!(result = %outcome, "temporary bridge read failure");
+            BridgeOutcome::RetryAfter(60)
+        }
+        other => other,
+    }
+}
+
+fn forgejo_read_error(error: ForgejoError) -> BridgeOutcome {
+    match error {
+        ForgejoError::Config(_) | ForgejoError::UnknownWriteOutcome(_) => forgejo_error(error),
+        other => retry_read(forgejo_error(other)),
+    }
+}
+
+fn github_read_error(error: GhError) -> BridgeOutcome {
+    match error {
+        GhError::Api {
+            status: 403,
+            ref message,
+        } if message.to_ascii_lowercase().contains("rate limit") => BridgeOutcome::RetryAfter(60),
+        other => retry_read(github_error(other)),
+    }
+}
+
+fn octocrab_read_error(error: octocrab::Error) -> BridgeOutcome {
+    if let octocrab::Error::GitHub { source, .. } = &error {
+        if source.status_code.as_u16() == 403
+            && source.message.to_ascii_lowercase().contains("rate limit")
+        {
+            return BridgeOutcome::RetryAfter(60);
+        }
+    }
+    retry_read(octocrab_error(error))
+}
+
 /// Relay a verified GitHub `issues` or `pull_request` webhook. Policy is read
 /// through the immutable-commit cache and gates all side effects.
 pub async fn from_github(
@@ -440,11 +480,11 @@ pub async fn from_github(
     match gh.repo_info(repo).await {
         Ok(value) if value["id"].as_i64() == Some(key.repository_id) => {}
         Ok(_) => return BridgeOutcome::Ignored("github-repository-identity-mismatch"),
-        Err(error) => return github_error(error),
+        Err(error) => return github_read_error(error),
     }
     let client = match ForgejoClient::new(&cfg.forgejo_base_url, &cfg.forgejo_token) {
         Ok(client) => client,
-        Err(error) => return forgejo_error(error),
+        Err(error) => return forgejo_read_error(error),
     };
     let (forgejo_id, remote_policy) =
         match authorize_forgejo(&client, cfg, destination, repo, key.repository_id, policy).await {
@@ -526,11 +566,11 @@ pub async fn comment_from_github(
     match gh.repo_info(repo).await {
         Ok(value) if value["id"].as_i64() == Some(key.repository_id) => {}
         Ok(_) => return BridgeOutcome::Ignored("github-repository-identity-mismatch"),
-        Err(error) => return github_error(error),
+        Err(error) => return github_read_error(error),
     }
     let client = match ForgejoClient::new(&cfg.forgejo_base_url, &cfg.forgejo_token) {
         Ok(client) => client,
-        Err(error) => return forgejo_error(error),
+        Err(error) => return forgejo_read_error(error),
     };
     let (forgejo_id, remote_policy) =
         match authorize_forgejo(&client, cfg, destination, repo, key.repository_id, policy).await {
@@ -589,7 +629,7 @@ pub async fn from_forgejo(
     };
     let client = match ForgejoClient::new(&cfg.forgejo_base_url, &cfg.forgejo_token) {
         Ok(client) => client,
-        Err(error) => return forgejo_error(error),
+        Err(error) => return forgejo_read_error(error),
     };
     let sender = match event {
         ForgejoEvent::Issue { sender, .. } | ForgejoEvent::PullRequest { sender, .. } => sender,
@@ -600,7 +640,7 @@ pub async fn from_forgejo(
     }
     let bot = match client.current_user().await {
         Ok(bot) => bot,
-        Err(error) => return forgejo_error(error),
+        Err(error) => return forgejo_read_error(error),
     };
     let Some(login) = bot["login"].as_str().filter(|s| !s.is_empty()) else {
         return BridgeOutcome::PolicyUnavailable;
@@ -644,11 +684,11 @@ pub async fn from_forgejo(
     }
     let gh = match Client::installation_resolved(cfg, binding.installation_id).await {
         Ok(client) => client,
-        Err(error) => return github_error(error),
+        Err(error) => return github_read_error(error),
     };
     let metadata = match gh.repo_info(&binding.github_repo).await {
         Ok(metadata) => metadata,
-        Err(error) => return github_error(error),
+        Err(error) => return github_read_error(error),
     };
     if metadata["id"].as_i64() != Some(binding.repository_id) {
         return BridgeOutcome::Ignored("github-repository-identity-mismatch");
@@ -738,11 +778,11 @@ pub async fn comment_from_forgejo(
     };
     let client = match ForgejoClient::new(&cfg.forgejo_base_url, &cfg.forgejo_token) {
         Ok(client) => client,
-        Err(error) => return forgejo_error(error),
+        Err(error) => return forgejo_read_error(error),
     };
     let bot = match client.current_user().await {
         Ok(bot) => bot,
-        Err(error) => return forgejo_error(error),
+        Err(error) => return forgejo_read_error(error),
     };
     let Some(login) = bot["login"].as_str().filter(|s| !s.is_empty()) else {
         return BridgeOutcome::PolicyUnavailable;
@@ -786,11 +826,11 @@ pub async fn comment_from_forgejo(
     }
     let gh = match Client::installation_resolved(cfg, binding.installation_id).await {
         Ok(client) => client,
-        Err(error) => return github_error(error),
+        Err(error) => return github_read_error(error),
     };
     let metadata = match gh.repo_info(&binding.github_repo).await {
         Ok(metadata) => metadata,
-        Err(error) => return github_error(error),
+        Err(error) => return github_read_error(error),
     };
     if metadata["id"].as_i64() != Some(binding.repository_id) {
         return BridgeOutcome::Ignored("github-repository-identity-mismatch");
@@ -866,9 +906,9 @@ async fn prepare_refs(
     };
     let route = format!("/repos/{source_repo}/pulls/{number}");
     let live = if from_forgejo {
-        forgejo.get(&route).await.map_err(forgejo_error)?
+        forgejo.get(&route).await.map_err(forgejo_read_error)?
     } else {
-        gh.get(&route).await.map_err(github_error)?
+        gh.get(&route).await.map_err(github_read_error)?
     };
     if live["state"].as_str() == Some("closed") {
         return Ok(());
@@ -948,7 +988,7 @@ pub(super) async fn authorize_forgejo(
     github_id: i64,
     local_policy: &ForgejoBridgeConfig,
 ) -> Result<(i64, ForgejoBridgeConfig), BridgeOutcome> {
-    let metadata = client.repository(repo).await.map_err(forgejo_error)?;
+    let metadata = client.repository(repo).await.map_err(forgejo_read_error)?;
     let id = metadata["id"]
         .as_i64()
         .filter(|id| *id > 0)
@@ -983,7 +1023,7 @@ async fn resolve_binding(
     let metadata = forgejo
         .repository(forgejo_repo)
         .await
-        .map_err(forgejo_error)?;
+        .map_err(forgejo_read_error)?;
     validate_source(&metadata, policy)?;
     let forgejo_repository_id = metadata["id"]
         .as_i64()
@@ -1008,10 +1048,10 @@ async fn resolve_binding(
         }
     }
 
-    let app = Client::app_client(cfg).map_err(github_error)?;
+    let app = Client::app_client(cfg).map_err(github_read_error)?;
     let installations = crate::github::paginate(&app, "/app/installations?per_page=100")
         .await
-        .map_err(github_error)?;
+        .map_err(github_read_error)?;
     let mut found = None;
     let mut lookup_error = None;
     for installation in installations {
@@ -1021,7 +1061,7 @@ async fn resolve_binding(
         let client = match Client::installation_resolved(cfg, installation_id).await {
             Ok(client) => client,
             Err(error) => {
-                lookup_error = Some(github_error(error));
+                lookup_error = Some(github_read_error(error));
                 continue;
             }
         };
@@ -1031,7 +1071,7 @@ async fn resolve_binding(
             {
                 Ok(repos) => repos,
                 Err(error) => {
-                    lookup_error = Some(github_error(error));
+                    lookup_error = Some(github_read_error(error));
                     continue;
                 }
             };
@@ -1364,8 +1404,8 @@ async fn forward_item(
         Target::Forgejo => github
             .get(&route, None::<&()>)
             .await
-            .map_err(octocrab_error)?,
-        Target::GitHub => forgejo.get(&route).await.map_err(forgejo_error)?,
+            .map_err(octocrab_read_error)?,
+        Target::GitHub => forgejo.get(&route).await.map_err(forgejo_read_error)?,
     };
     if !event_item.is_pr && live.get("pull_request").is_some_and(|pr| !pr.is_null()) {
         return Ok(BridgeOutcome::Ignored("source-kind-mismatch"));
@@ -1568,10 +1608,13 @@ async fn update_peer(
     if !reserved_labels.is_empty() {
         let route = format!("/repos/{destination}/issues/{peer}/labels");
         let labels = match target {
-            Target::Forgejo => forgejo.get_all(&route, 50).await.map_err(forgejo_error)?,
+            Target::Forgejo => forgejo
+                .get_all(&route, 50)
+                .await
+                .map_err(forgejo_read_error)?,
             Target::GitHub => crate::github::paginate(github, &format!("{route}?per_page=100"))
                 .await
-                .map_err(github_error)?,
+                .map_err(github_read_error)?,
         };
         labeled
             .labels
@@ -1692,7 +1735,7 @@ async fn ensure_forgejo_labels(
     let mut existing = client
         .get_all(&format!("/repos/{repo}/labels"), 50)
         .await
-        .map_err(forgejo_error)?;
+        .map_err(forgejo_read_error)?;
     let mut ids = Vec::new();
     for label in labels {
         let found = existing.iter().find(|current| {
@@ -1749,7 +1792,7 @@ async fn ensure_github_labels(
     }
     let existing = crate::github::paginate(github, &format!("/repos/{repo}/labels?per_page=100"))
         .await
-        .map_err(github_error)?;
+        .map_err(github_read_error)?;
     for label in labels {
         if existing.iter().any(|current| {
             current["name"]

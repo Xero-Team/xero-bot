@@ -1064,3 +1064,41 @@ fn classifier_and_origin_validation_cover_supported_events_only() {
         assert!(parse_github_origin(bad).is_none(), "{bad}");
     }
 }
+
+#[test]
+fn transient_read_failures_wait_but_identical_write_failures_remain_blocked() {
+    for status in [408, 429, 500, 502, 503, 504] {
+        let error = || ForgejoError::Api {
+            status,
+            message: "temporary".into(),
+        };
+        assert_eq!(forgejo_read_error(error()), BridgeOutcome::RetryAfter(60));
+        assert_eq!(forgejo_error(error()), BridgeOutcome::Rejected(status));
+        let gh = || GhError::Api {
+            status,
+            message: "temporary".into(),
+        };
+        assert_eq!(github_read_error(gh()), BridgeOutcome::RetryAfter(60));
+        assert_eq!(github_error(gh()), BridgeOutcome::Rejected(status));
+    }
+    assert_eq!(
+        github_read_error(GhError::Api {
+            status: 403,
+            message: "API rate limit exceeded".into()
+        }),
+        BridgeOutcome::RetryAfter(60)
+    );
+    for status in [401, 403, 404, 422] {
+        assert_eq!(
+            forgejo_read_error(ForgejoError::Api {
+                status,
+                message: "denied".into()
+            }),
+            BridgeOutcome::Rejected(status)
+        );
+    }
+    assert!(matches!(
+        forgejo_read_error(ForgejoError::UnknownWriteOutcome("lost response".into())),
+        BridgeOutcome::Transport(_)
+    ));
+}

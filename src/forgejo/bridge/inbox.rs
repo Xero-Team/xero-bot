@@ -198,7 +198,7 @@ pub async fn pump(cfg: &Config, store: &Store) -> Result<()> {
                         from_github(&gh, cfg, store, &repo, identity, &event, &payload).await
                     }
                 }
-                Err(error) => github_error(error),
+                Err(error) => github_read_error(error),
             },
             Ok(Delivery::Forgejo {
                 repo,

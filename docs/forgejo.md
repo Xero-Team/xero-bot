@@ -280,7 +280,8 @@ Git 分叉保留失败事件，修复并核实远端状态后可恢复。
 后续元数据步骤失败，可沿已有映射恢复，不再新建对象。已完成任务清除存储的正文，
 保留去重键和对象映射。SQLite 与外部 API 不共享事务，不承诺 exactly-once。
 
-临时配置读取失败进入持久化 `waiting` 队列：GitHub 限流遵守 `Retry-After` /
+临时仓库/PR/配置读取失败（包括 502/503、网络错误）进入持久化 `waiting` 队列：
+GitHub 配置读取的限流遵守 `Retry-After` /
 限额重置时间；无明确恢复时间时使用退避。到期后后台自动重试，重启保留等待时间。
 同一来源 Issue / PR 后续事件等待队首完成，其他对象继续处理。`bridge-deliveries`
 显示 `retry_at`（UTC Unix 秒）和 `attempts`。旧版因 `policy-unavailable` 阻塞的事件
