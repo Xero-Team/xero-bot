@@ -573,8 +573,19 @@ fn shipped_defaults_and_opt_in_examples_are_valid_and_separate() {
     let production = parse(include_str!("../.github/xero-bot.toml"));
     assert!(production.problems().is_empty());
     let forgejo = production.forgejo.unwrap();
-    assert!(forgejo.enabled);
+    assert!(!forgejo.enabled);
     assert_eq!(forgejo.destination.as_deref(), Some("xero-team/xero-bot"));
+    let bridge = production.forgejo_bridge.unwrap();
+    assert!(
+        bridge.enabled && bridge.issues && bridge.pull_requests && bridge.comments && bridge.sync_refs
+    );
+    assert_eq!(bridge.destination.as_deref(), Some("xero-team/xero-bot"));
+    assert_eq!(
+        bridge.github_repository.as_deref(),
+        Some("xero-team/xero-bot")
+    );
+    assert_eq!(bridge.github_repository_id, Some(1351057454));
+    assert_eq!(bridge.forgejo_repository_id, Some(2));
 
     let reference = parse(include_str!("../example.toml"));
     assert!(reference.problems().is_empty());
