@@ -577,7 +577,11 @@ fn shipped_defaults_and_opt_in_examples_are_valid_and_separate() {
     assert_eq!(forgejo.destination.as_deref(), Some("xero-team/xero-bot"));
     let bridge = production.forgejo_bridge.unwrap();
     assert!(
-        bridge.enabled && bridge.issues && bridge.pull_requests && bridge.comments && bridge.sync_refs
+        bridge.enabled
+            && bridge.issues
+            && bridge.pull_requests
+            && bridge.comments
+            && bridge.sync_refs
     );
     assert_eq!(bridge.destination.as_deref(), Some("xero-team/xero-bot"));
     assert_eq!(
