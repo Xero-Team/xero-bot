@@ -30,30 +30,21 @@ ttl_days = 30 # 1..365
 # Explicit opt-in examples live in examples/triggers-opt-in.toml.
 # To disable a command, REPLACE its entry above with mode = "disabled".
 # Never configure a canonical name and its alias together.
-# Forgejo 双向协作消息桥 / Two-way collaboration bridge
-# 同步 Issue/PR 元数据与评论，不复制 CI、review approval 或 Git ref。
-# destination 指向从本 GitHub 仓库拉取的 Forgejo pull mirror；token 只放部署环境。
-# 先升级 bot，再将配置镜像到 Forgejo；双方默认分支策略均须启用。
-# 仅同步新建对象和已有映射；Git ref 由 pull mirror 复制。详见 docs/forgejo.md。
-# Forgejo 17 禁止 pull mirror 使用 PR；保持 pull_requests=false，跟踪 #54。
-# 启用前需要为本仓库配置双方的 Issue、Issue comment 和标签 webhook 事件。
+# Forgejo 双向协作桥：普通仓库、固定双方身份、显式 Git refs 同步。
+# 先部署支持此配置的 bot，再按 docs/forgejo.md 备份并原位转换 Forgejo 仓库。
+# 双方默认分支必须使用相同绑定；token 只保存在部署环境。
 [forgejo.bridge]
 enabled = true
 destination = "xero-team/xero-bot"
+github_repository = "Xero-Team/xero-bot"
+github_repository_id = 1351057454
+forgejo_repository_id = 2
 issues = true
-pull_requests = false
+pull_requests = true
 comments = true
+sync_refs = true
 
-# Forgejo 单向仓库镜像 / One-way GitHub -> Forgejo mirror
-# 目标仓库必须已存在，并在 Forgejo 中配置为从本 GitHub 仓库拉取的 pull mirror。
-# bot 只调用 Forgejo 的 mirror-sync，不管理 Forgejo 保存的 GitHub 拉取凭据。
-# destination 必须是严格的 owner/repository；不能写 URL、token、query 或额外字段。
-# 默认关闭；缺失目标时不会猜测或自动创建仓库。
-# 升级所有实例后再取消注释；旧解析器拒绝未知表。
-# [forgejo.mirror]
-# enabled = false
-# destination = "xero-team/xero-bot"
-
+# 普通仓库由 bridge 同步 Git 引用，不再调用原生 pull mirror。
 [forgejo.mirror]
-enabled = true
+enabled = false
 destination = "xero-team/xero-bot"
