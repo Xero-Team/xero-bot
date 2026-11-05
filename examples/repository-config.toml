@@ -31,10 +31,10 @@ ttl_days = 30 # 1..365
 # To disable a command, REPLACE its entry above with mode = "disabled".
 # Never configure a canonical name and its alias together.
 # Forgejo 双向协作消息桥 / Two-way collaboration bridge
-# 同步 Issue/PR 元数据与评论，不复制 CI、review approval 或 Git ref。
+# 同步 Issue/PR 元数据与评论，不复制 CI 或 review approval。
 # 普通仓库需要显式双边身份绑定；旧 pull mirror 仅支持 Issue/评论。token 只放部署环境。
 # 先升级 bot，再将配置镜像到 Forgejo；双方默认分支策略均须启用。
-# 仅同步新建对象和已有映射；fork PR / Git ref 不复制。详见 docs/forgejo.md。
+# 仅同步新建对象和已有映射；fork PR 不复制。Git refs 需双方显式启用 sync_refs。详见 docs/forgejo.md。
 # 启用前需要为本仓库配置 GitHub 的 Issues / Pull request / Issue comment
 # webhook，以及 Forgejo 的同名 webhook 事件。
 # [forgejo.bridge]

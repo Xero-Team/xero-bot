@@ -166,6 +166,19 @@ async fn transfer(
     destination: &Remote,
     branch: Option<&str>,
 ) -> Result<(), String> {
+    tokio::time::timeout(
+        Duration::from_secs(300),
+        transfer_inner(source, destination, branch),
+    )
+    .await
+    .map_err(|_| "Git ref synchronization exceeded its total deadline".to_string())?
+}
+
+async fn transfer_inner(
+    source: &Remote,
+    destination: &Remote,
+    branch: Option<&str>,
+) -> Result<(), String> {
     let scratch = Scratch::new()?;
     let dir = &scratch.0;
     run(dir, None, &["init", "--bare", "--quiet"]).await?;
@@ -210,6 +223,7 @@ async fn transfer(
         return Err("PR source branch does not exist".into());
     }
     let mut conflicts = Vec::new();
+    let mut updates = Vec::new();
     for (name, sha) in sources {
         if selected.as_ref().is_some_and(|r| *r != name) {
             continue;
@@ -230,19 +244,14 @@ async fn transfer(
                 continue;
             }
         }
-        // No '+' or force option. Git's receive-side check also guards races
+        updates.push(format!("{sha}:{name}"));
+    }
+    if !updates.is_empty() {
+        // One bounded push; no '+' or force. Receive-side checks guard races
         // with user pushes after the destination snapshot was fetched.
-        run(
-            dir,
-            Some(destination),
-            &[
-                "push",
-                "--porcelain",
-                &destination.url,
-                &format!("{sha}:{name}"),
-            ],
-        )
-        .await?;
+        let mut args = vec!["push", "--porcelain", &destination.url];
+        args.extend(updates.iter().map(String::as_str));
+        run(dir, Some(destination), &args).await?;
     }
     if !conflicts.is_empty() {
         return Err(format!(

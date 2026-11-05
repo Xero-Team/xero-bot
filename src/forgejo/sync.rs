@@ -91,7 +91,10 @@ async fn sync_repository_with_cache(
             .await
             {
                 Ok(pair) => pair,
-                Err(e) => return SyncOutcome::Transport(e.to_string()),
+                Err(e) => {
+                    tracing::warn!(repo, destination, result = %e, "Forgejo ref sync authorization failed");
+                    return SyncOutcome::Transport(e.to_string());
+                }
             };
             if !peer.sync_refs {
                 return SyncOutcome::MirrorDisabled;
