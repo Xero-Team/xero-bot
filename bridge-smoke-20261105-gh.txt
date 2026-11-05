@@ -1,0 +1,2 @@
+Temporary GitHub -> Forgejo PR bridge deployment smoke test.
+Do not merge. Close after validation.
