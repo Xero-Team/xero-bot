@@ -9,6 +9,39 @@ fn run() -> xero_bot::trigger_state::Result<()> {
         return Err(usage.into());
     }
     let store = Store::open(std::path::Path::new(&args[0]))?;
+    if args[1] == "bridge-deliveries" {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&store.bridge_deliveries()?)?
+        );
+        return Ok(());
+    }
+    if args[1] == "bridge-retry" {
+        store.bridge_retry_delivery(
+            args.get(2)
+                .ok_or("usage: trigger-state DATA_DIR bridge-retry KEY")?,
+        )?;
+        return Ok(());
+    }
+    if args[1] == "bridge-status" {
+        println!("{}", serde_json::to_string_pretty(&store.bridge_status()?)?);
+        return Ok(());
+    }
+    if args[1] == "bridge-resolve" {
+        if args.len() != 8 {
+            return Err("usage: trigger-state DATA_DIR bridge-resolve SCOPE issue|pull|comment github|forgejo SOURCE PEER_OR_ZERO EVIDENCE".into());
+        }
+        store.bridge_resolve(
+            &args[2],
+            &args[3],
+            &args[4],
+            args[5].parse()?,
+            args[6].parse()?,
+            &args[7],
+        )?;
+        println!("Recorded bridge receipt; use bridge-retry KEY, then restart the server.");
+        return Ok(());
+    }
     if args[1] == "forgejo-inbox" || args[1] == "forgejo-resolve" {
         let inbox = xero_bot::forgejo::inbox::Inbox::open(std::path::Path::new(&args[0]))?;
         if args[1] == "forgejo-inbox" {

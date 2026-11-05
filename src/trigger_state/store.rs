@@ -7,6 +7,8 @@ use serde_json::Value;
 
 use super::{retry_delay, EventContext, Result, SessionWake};
 
+#[path = "bridge_store.rs"]
+mod bridge;
 #[path = "notification_migration.rs"]
 mod notification_migration;
 #[path = "notification_store.rs"]
@@ -134,6 +136,27 @@ impl Store {
             CREATE TABLE IF NOT EXISTS admin_audit(
                 id INTEGER PRIMARY KEY, operation TEXT NOT NULL, decision TEXT NOT NULL,
                 evidence TEXT NOT NULL, created_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS forgejo_bridge_objects(
+                scope TEXT NOT NULL, kind TEXT NOT NULL, side TEXT NOT NULL, number INTEGER NOT NULL,
+                peer INTEGER NOT NULL, revision TEXT NOT NULL, updated_at INTEGER NOT NULL,
+                PRIMARY KEY(scope,kind,side,number),
+                UNIQUE(scope,kind,side,peer)
+            );
+            CREATE TABLE IF NOT EXISTS forgejo_bridge_deliveries(
+                key TEXT PRIMARY KEY, lane TEXT NOT NULL, payload TEXT NOT NULL,
+                state TEXT NOT NULL DEFAULT 'pending', detail TEXT NOT NULL DEFAULT ''
+            );
+            CREATE INDEX IF NOT EXISTS bridge_delivery_lane ON forgejo_bridge_deliveries(lane,state);
+            UPDATE forgejo_bridge_deliveries SET state='pending' WHERE state='running';
+            CREATE TABLE IF NOT EXISTS forgejo_bridge_creates(
+                scope TEXT NOT NULL, kind TEXT NOT NULL, side TEXT NOT NULL, number INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL, PRIMARY KEY(scope,kind,side,number)
+            );
+            CREATE TABLE IF NOT EXISTS forgejo_bridge_comments(
+                scope TEXT NOT NULL, side TEXT NOT NULL, source_id INTEGER NOT NULL,
+                peer_item INTEGER NOT NULL, peer_comment INTEGER, updated_at INTEGER NOT NULL,
+                PRIMARY KEY(scope,side,source_id)
             );
             COMMIT;")?;
         let version: i64 = db.query_row("SELECT version FROM trigger_meta", [], |r| r.get(0))?;
