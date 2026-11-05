@@ -173,6 +173,16 @@ CI 不依赖 GitHub App、AI key 或 webhook secret。
 `https://github.com/xero-team/xero-bot.git`。暂不接受 SSH、带凭据的 origin
 或 GitHub Enterprise。GitHub App 必须安装在该 GitHub 仓库上。
 
+**实机限制（Forgejo 17.0.1）：当前部署仅支持 Issue 和普通评论。**
+Forgejo 的 `CanEnablePulls()` 要求仓库不是 mirror；PR API 的 `MustAllowPulls`
+会对镜像仓库返回 404，即使 API 显示 `has_pull_requests = true` 且账号有管理权限。
+参见官方 [仓库判定](https://codeberg.org/forgejo/forgejo/src/tag/v17.0.1/models/repo/repo.go#L634-L637)
+和 [PR API 权限检查](https://codeberg.org/forgejo/forgejo/src/tag/v17.0.1/routers/api/v1/permissions/must_allow_pulls.go)。
+当前 bridge 又依赖 pull mirror 绑定来源，所以生产配置必须保持 `pull_requests = false`。
+PR 代码路径的模拟 API 测试不代表真实 Forgejo 镜像支持 PR；普通仓库身份绑定和独立
+Git refs 同步需要后续设计，见 [#54](https://github.com/Xero-Team/xero-bot/issues/54)。
+不要转换现有镜像或直接修改 Forgejo 数据库来规避此限制。
+
 ### 启用
 
 先部署支持消息桥的 bot，再在 **GitHub 默认分支** 的 `.github/xero-bot.toml` 加入：
@@ -182,7 +192,7 @@ CI 不依赖 GitHub App、AI key 或 webhook secret。
 enabled = true
 destination = "xero-team/xero-bot" # Forgejo 的 owner/repository
 issues = true
-pull_requests = true
+pull_requests = false # Forgejo pull mirror 不支持 PR，见上方实机限制
 comments = true
 ```
 
@@ -201,7 +211,7 @@ Forgejo → GitHub 的目标从 mirror origin 和 GitHub App 安装清单解析�
 - Forgejo webhook：Issue、Pull request、Issue comment、Pull request comment，
   以及 Issue / Pull request 的标签事件。兼容 `issue_label` / `pull_request_label`
   事件名和 `label_updated` / `label_cleared` 动作。
-- Forgejo 仓库需启用 Issues / Pull Requests 单元；双方分支必须可读取。
+- Forgejo 镜像仓库需启用 Issues 单元；开启 Pull Requests 单元不能解除镜像限制。
 
 Forgejo webhook 的配置和签名方式见前文，也可参考
 [Forgejo webhook 文档](https://forgejo.org/docs/latest/user/repository/webhooks/)。
@@ -209,6 +219,8 @@ GitHub 的 PR 标签通过 Issues API 管理，权限说明见
 [GitHub Labels API](https://docs.github.com/en/rest/issues/labels)。
 
 ### 同步范围
+
+下表描述代码中的映射语义；所有 PR 行为受上方镜像限制约束，当前生产部署未启用。
 
 | 内容 | 行为 |
 | --- | --- |
@@ -275,6 +287,7 @@ trigger-state /data bridge-retry KEY
 
 ### 上线与回滚
 
-仓库中的示例表保持注释，不会随代码发布自动开启桥接。先升级所有读取该仓库策略的
+通用示例表保持注释；本仓库在线配置已显式开启 Issue 和评论，PR 保持关闭。
+新部署应先升级所有读取该仓库策略的
 实例，再添加 `[forgejo.bridge]`，并确认镜像中的配置已经更新。回滚到不认识该表的
 旧版本前，先移除该表并完成镜像同步；只设 `enabled = false` 仍会被旧版严格解析器拒绝。
