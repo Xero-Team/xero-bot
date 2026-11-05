@@ -403,6 +403,7 @@ pub struct RepositoryConfig {
     pub paths: Domain<Paths>,
     pub idle: Domain<Option<Rules>>,
     pub forgejo: Domain<ForgejoMirrorConfig>,
+    pub forgejo_bridge: Domain<ForgejoBridgeConfig>,
 }
 
 /// Validated one-way GitHub -> Forgejo pull-mirror declaration.
@@ -423,6 +424,30 @@ impl ForgejoMirrorConfig {
     }
 }
 
+/// Explicit two-way collaboration bridge between one GitHub repository and one
+/// Forgejo repository. Code and Git refs are never transported by this domain;
+/// the existing pull mirror remains the only Git replication path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForgejoBridgeConfig {
+    pub enabled: bool,
+    pub destination: Option<String>,
+    pub issues: bool,
+    pub pull_requests: bool,
+    pub comments: bool,
+}
+
+impl ForgejoBridgeConfig {
+    pub fn disabled() -> Self {
+        Self {
+            enabled: false,
+            destination: None,
+            issues: false,
+            pull_requests: false,
+            comments: false,
+        }
+    }
+}
+
 #[derive(Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct Document {
@@ -438,6 +463,7 @@ struct Document {
 #[serde(default, deny_unknown_fields)]
 struct RawForgejo {
     mirror: RawForgejoMirror,
+    bridge: RawForgejoBridge,
 }
 
 #[derive(Default, Deserialize)]
@@ -445,6 +471,16 @@ struct RawForgejo {
 struct RawForgejoMirror {
     enabled: bool,
     destination: Option<String>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct RawForgejoBridge {
+    enabled: bool,
+    destination: Option<String>,
+    issues: bool,
+    pull_requests: bool,
+    comments: bool,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -518,6 +554,9 @@ impl RepositoryConfig {
         if let Err(e) = &self.forgejo {
             problems.push(e);
         }
+        if let Err(e) = &self.forgejo_bridge {
+            problems.push(e);
+        }
         match &self.events {
             Err(e) => problems.push(e),
             Ok(rules) => problems.extend(rules.iter().filter_map(|r| r.value.as_ref().err())),
@@ -544,13 +583,15 @@ impl RepositoryConfig {
         let paths = paths(doc.path_triggers, &comments);
         let idle = idle::validate(doc.idle_workflows, repository)
             .map_err(|_| Problem::new(ReasonCode::InvalidIdle, "invalid idle workflow settings"));
-        let forgejo = forgejo(doc.forgejo);
+        let forgejo_bridge = forgejo_bridge(doc.forgejo.bridge);
+        let forgejo = forgejo(doc.forgejo.mirror);
         Ok(Self {
             comments,
             events,
             paths,
             idle,
             forgejo,
+            forgejo_bridge,
         })
     }
 }
@@ -558,9 +599,9 @@ impl RepositoryConfig {
 /// Validate the optional one-way mirror declaration. A disabled setting may
 /// omit `destination`, but a destination that is present is always validated so
 /// enabling it later cannot turn a typo into an unintended repository target.
-fn forgejo(raw: RawForgejo) -> Domain<ForgejoMirrorConfig> {
-    let Some(destination) = raw.mirror.destination.as_deref() else {
-        return if raw.mirror.enabled {
+fn forgejo(raw: RawForgejoMirror) -> Domain<ForgejoMirrorConfig> {
+    let Some(destination) = raw.destination.as_deref() else {
+        return if raw.enabled {
             Err(Problem::new(
                 ReasonCode::InvalidForgejoSync,
                 "enabled Forgejo mirror requires an owner/repository destination",
@@ -599,8 +640,66 @@ fn forgejo(raw: RawForgejo) -> Domain<ForgejoMirrorConfig> {
         ));
     }
     Ok(ForgejoMirrorConfig {
-        enabled: raw.mirror.enabled,
+        enabled: raw.enabled,
         destination: Some(destination.to_string()),
+    })
+}
+
+/// Validate the opt-in two-way collaboration bridge. Destination syntax is
+/// shared with the mirror domain, while toggle values are explicit booleans so
+/// a typo can never silently enable public cross-posting.
+fn forgejo_bridge(raw: RawForgejoBridge) -> Domain<ForgejoBridgeConfig> {
+    let Some(destination) = raw.destination.as_deref() else {
+        return if raw.enabled {
+            Err(Problem::new(
+                ReasonCode::InvalidForgejoSync,
+                "enabled Forgejo bridge requires a destination",
+            ))
+        } else {
+            Ok(ForgejoBridgeConfig::disabled())
+        };
+    };
+    if destination.is_empty() || destination.trim() != destination {
+        return Err(Problem::new(
+            ReasonCode::InvalidForgejoSync,
+            "Forgejo bridge destination must not contain surrounding whitespace",
+        ));
+    }
+    let Some((owner, repository)) = destination.split_once('/') else {
+        return Err(Problem::new(
+            ReasonCode::InvalidForgejoSync,
+            "Forgejo bridge destination must be owner/repository",
+        ));
+    };
+    if owner.is_empty()
+        || repository.is_empty()
+        || repository.contains('/')
+        || destination.chars().any(char::is_whitespace)
+        || destination.contains("..")
+        || [owner, repository].into_iter().any(|part| {
+            part == "."
+                || part
+                    .chars()
+                    .any(|ch| !(ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.')))
+        })
+    {
+        return Err(Problem::new(
+            ReasonCode::InvalidForgejoSync,
+            "Forgejo bridge destination is not a canonical owner/repository",
+        ));
+    }
+    if raw.enabled && !(raw.issues || raw.pull_requests || raw.comments) {
+        return Err(Problem::new(
+            ReasonCode::InvalidForgejoSync,
+            "enabled Forgejo bridge must select issues, pull_requests or comments",
+        ));
+    }
+    Ok(ForgejoBridgeConfig {
+        enabled: raw.enabled,
+        destination: Some(destination.to_string()),
+        issues: raw.issues,
+        pull_requests: raw.pull_requests,
+        comments: raw.comments,
     })
 }
 

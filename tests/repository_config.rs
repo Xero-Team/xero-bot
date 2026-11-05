@@ -32,6 +32,9 @@ fn defaults_empty_partial_and_idle_only() {
         let forgejo = cfg.forgejo.unwrap();
         assert!(!forgejo.enabled);
         assert_eq!(forgejo.destination, None);
+        let bridge = cfg.forgejo_bridge.unwrap();
+        assert!(!bridge.enabled);
+        assert_eq!(bridge.destination, None);
     }
     let c = parse("[command_triggers]\nreview={mode='disabled'}\n[command_sessions]\nttl_days=365")
         .comments
@@ -717,4 +720,68 @@ fn forgejo_explicit_empty_destination_is_invalid_even_when_disabled() {
     assert!(parse("[forgejo.mirror]\nenabled=false\ndestination='' ")
         .forgejo
         .is_err());
+}
+
+/// The two-way bridge is opt-in, strict, and refuses an enabled declaration
+/// that has no object class selected. Mirror and bridge settings are independent.
+#[test]
+fn forgejo_bridge_configuration_is_strict_and_selects_object_classes() {
+    let enabled = parse(concat!(
+        "[forgejo.bridge]\n",
+        "enabled = true\n",
+        "destination = \"xero-team/xero-bot\"\n",
+        "issues = true\n",
+        "pull_requests = true\n",
+        "comments = true\n",
+    ))
+    .forgejo_bridge
+    .unwrap();
+    assert!(enabled.enabled);
+    assert_eq!(enabled.destination.as_deref(), Some("xero-team/xero-bot"));
+    assert!(enabled.issues && enabled.pull_requests && enabled.comments);
+
+    for document in [
+        "[forgejo.bridge]\nenabled=true\ndestination='owner/repo'",
+        "[forgejo.bridge]\nenabled=false\ndestination=''",
+        "[forgejo.bridge]\nenabled=true\nissues=true",
+        "[forgejo.bridge]\nenabled=true\ndestination='owner/repo/extra'\nissues=true",
+        "[forgejo.bridge]\nenabled=true\ndestination=' owner/repo'\nissues=true",
+        "[forgejo.bridge]\nenabled=true\ndestination='owner/../repo'\nissues=true",
+        "[forgejo.bridge]\nenabled=true\ndestination='owner/repo'\nissues='yes'",
+        "[forgejo.bridge]\nenabled=true\ndestination='owner/repo'\nissues=true\nunknown=true",
+    ] {
+        let parsed = RepositoryConfig::parse(document, REPO);
+        assert!(
+            parsed.is_err()
+                || parsed.as_ref().is_ok_and(|config| config
+                    .problems()
+                    .iter()
+                    .any(|problem| problem.code == ReasonCode::InvalidForgejoSync
+                        || problem.code == ReasonCode::InvalidDocument)),
+            "{document}"
+        );
+    }
+
+    let disabled_with_target =
+        parse("[forgejo.bridge]\nenabled=false\ndestination='mirror-team/repo'\nissues=true")
+            .forgejo_bridge
+            .unwrap();
+    assert!(!disabled_with_target.enabled);
+    assert_eq!(
+        disabled_with_target.destination.as_deref(),
+        Some("mirror-team/repo")
+    );
+}
+
+/// Unknown bridge fields reject the whole document, including while disabled.
+#[test]
+fn forgejo_bridge_never_accepts_credentials_or_extra_routes() {
+    for document in [
+        "[forgejo.bridge]\nenabled=false\ntoken='secret'",
+        "[forgejo.bridge]\nenabled=false\nwebhook='https://example.com'",
+        "[forgejo]\nenabled=true",
+    ] {
+        let error = RepositoryConfig::parse(document, REPO).unwrap_err();
+        assert_eq!(error.code, ReasonCode::InvalidDocument, "{document}");
+    }
 }

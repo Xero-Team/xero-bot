@@ -83,6 +83,19 @@ async fn main() {
         });
     }
 
+    if cfg.forgejo_ready() {
+        let cfg = cfg.clone();
+        let store = Arc::clone(&triggers.store);
+        tokio::spawn(async move {
+            loop {
+                if let Err(error) = xero_bot::forgejo::bridge::inbox::pump(&cfg, &store).await {
+                    tracing::error!("bridge recovery unavailable: {error}");
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+        });
+    }
+
     let idle_workflows = if cfg.idle_workflows_enabled {
         match xero_bot::idle_workflows::Scheduler::open(
             std::path::Path::new(&cfg.data_dir),
@@ -276,6 +289,22 @@ async fn webhook(
     xero_bot::config::cache::RepositoryConfigCache::shared()
         .observe_webhook(&event_header, &payload);
 
+    if let Err(error) = xero_bot::forgejo::bridge::inbox::enqueue_github(
+        &state.triggers.store,
+        &state.cfg,
+        &event_header,
+        &payload,
+        headers
+            .get("x-github-delivery")
+            .and_then(|v| v.to_str().ok()),
+    ) {
+        tracing::error!("bridge admission failed: {error}");
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error":"bridge persistence unavailable"})),
+        );
+    }
+
     // Reject irrelevant/self comments before retaining user text. Routing is
     // pure; execution still reparses and checks current policy in the worker.
     if event_header == "issue_comment" {
@@ -398,6 +427,21 @@ async fn forgejo_webhook(
             (StatusCode::OK, Json(json!({"ignored": reason})))
         }
         event @ xero_bot::forgejo::ForgejoEvent::IssueComment { .. } => {
+            if let Err(error) = xero_bot::forgejo::bridge::inbox::enqueue_forgejo(
+                &state.triggers.store,
+                &state.cfg,
+                &event,
+                headers
+                    .get("x-forgejo-delivery")
+                    .or_else(|| headers.get("x-gitea-delivery"))
+                    .and_then(|v| v.to_str().ok()),
+            ) {
+                tracing::error!("bridge admission failed: {error}");
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({"error":"bridge persistence unavailable"})),
+                );
+            }
             let Some(inbox) = state.forgejo_inbox.as_ref() else {
                 return (
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -416,6 +460,30 @@ async fn forgejo_webhook(
                     (
                         StatusCode::SERVICE_UNAVAILABLE,
                         Json(json!({"error":"Forgejo comment could not be persisted"})),
+                    )
+                }
+            }
+        }
+        event @ (xero_bot::forgejo::ForgejoEvent::Issue { .. }
+        | xero_bot::forgejo::ForgejoEvent::PullRequest { .. }) => {
+            match xero_bot::forgejo::bridge::inbox::enqueue_forgejo(
+                &state.triggers.store,
+                &state.cfg,
+                &event,
+                headers
+                    .get("x-forgejo-delivery")
+                    .or_else(|| headers.get("x-gitea-delivery"))
+                    .and_then(|v| v.to_str().ok()),
+            ) {
+                Ok(inserted) => (
+                    StatusCode::ACCEPTED,
+                    Json(json!({"accepted":true,"persisted":true,"new":inserted,"bridge":true})),
+                ),
+                Err(error) => {
+                    tracing::error!("bridge admission failed: {error}");
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(json!({"error":"bridge persistence unavailable"})),
                     )
                 }
             }
@@ -577,6 +645,60 @@ mod trigger_ingress_tests {
         assert_ne!(result.0["accepted"], true);
         assert!(s.triggers.store.list(None).unwrap().is_empty());
     }
+    #[tokio::test]
+    async fn bridge_ingress_persists_normal_github_comments_and_forgejo_objects() {
+        let dir = Dir::new();
+        let mut s = state(&dir);
+        s.cfg.forgejo_base_url = "https://forgejo.example".into();
+        s.cfg.forgejo_token = "test-token".into();
+        s.cfg.forgejo_webhook_secret = "test-secret".into();
+        let mut github = payload();
+        github["comment"]["body"] = json!("ordinary discussion");
+        let body = serde_json::to_vec(&github).unwrap();
+        assert_eq!(
+            webhook(State(s.clone()), signed(&body), body.into())
+                .await
+                .0,
+            StatusCode::OK
+        );
+        assert_eq!(s.triggers.store.bridge_deliveries().unwrap().len(), 1);
+        assert!(s.triggers.store.inbox_status().unwrap().is_empty());
+        let fj = json!({"action":"opened","repository":{"id":9,"full_name":"team/repo"},"sender":{"login":"alice"},"issue":{"number":4,"title":"new issue","state":"open","updated_at":"2026-11-05T01:00:00Z"}});
+        let body = serde_json::to_vec(&fj).unwrap();
+        let mut headers = HeaderMap::new();
+        let mut mac = xero_bot::forgejo::HmacSha256::new_from_slice(b"test-secret").unwrap();
+        mac.update(&body);
+        headers.insert(
+            "x-forgejo-signature",
+            hex::encode(mac.finalize().into_bytes()).parse().unwrap(),
+        );
+        headers.insert("x-forgejo-event", "issues".parse().unwrap());
+        for _ in 0..2 {
+            let (status, response) =
+                forgejo_webhook(State(s.clone()), headers.clone(), body.clone().into()).await;
+            assert_eq!(status, StatusCode::ACCEPTED);
+            assert_eq!(response.0["persisted"], true);
+        }
+        assert_eq!(s.triggers.store.bridge_deliveries().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn bridge_disk_failure_never_acknowledges_delivery() {
+        let dir = Dir::new();
+        drop(state(&dir));
+        let db = rusqlite::Connection::open(dir.0.join("command-triggers.sqlite")).unwrap();
+        db.execute_batch("CREATE TRIGGER inject_bridge_failure BEFORE INSERT ON forgejo_bridge_deliveries BEGIN SELECT RAISE(ABORT,'injected disk failure'); END;").unwrap();
+        drop(db);
+        let mut s = state(&dir);
+        s.cfg.forgejo_base_url = "https://forgejo.example".into();
+        s.cfg.forgejo_token = "test-token".into();
+        s.cfg.forgejo_webhook_secret = "test-secret".into();
+        let body = serde_json::to_vec(&payload()).unwrap();
+        let (status, result) = webhook(State(s), signed(&body), body.into()).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_ne!(result.0["accepted"], true);
+    }
+
     #[tokio::test]
     async fn audit_forgejo_empty_secret_is_unauthorized() {
         let dir = Dir::new();

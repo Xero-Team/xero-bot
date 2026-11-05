@@ -10,7 +10,7 @@ Features:
 - **Rebase reminders** — when a PR conflicts with its target branch, adds the `needs-rebase` label and a reminder; clears it once resolved
 - **CodeQL quality reports** — reads the repo's existing code scanning alerts and maps them to files changed in the PR
 - **Bilingual replies** — answers in English or Chinese, chosen from the PR's own commit messages; no configuration
-- **Forgejo provider and mirror sync** — token-authenticated issue/PR triage plus opt-in, one-way GitHub → Forgejo mirror sync; see [docs/forgejo.md](docs/forgejo.md)
+- **Forgejo provider and sync** — token-authenticated triage, opt-in GitHub → Forgejo code mirroring, and a durable two-way Issue/PR/comment bridge; see [docs/forgejo.md](docs/forgejo.md)
 
 Repository trigger policy, durable sessions, opt-in creation actions, and PR path labels/CC are available independently of the idle scheduler. See the [trigger and upgrade guide](docs/triggers.md), [annotated example.toml](example.toml), [complete defaults](.github/xero-bot.toml), separate [opt-in examples](examples/triggers-opt-in.toml), and [cross-feature acceptance](docs/issue-18-acceptance.md).
 

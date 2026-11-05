@@ -57,6 +57,7 @@ pub async fn handle_issue_comment(
         commenter,
         author,
         is_pr,
+        ..
     } = event
     else {
         return Err("expected Forgejo issue comment".into());

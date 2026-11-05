@@ -10,6 +10,7 @@ use reqwest::{Method, Response};
 use serde_json::Value;
 use sha2::Sha256;
 
+pub mod bridge;
 pub mod commands;
 pub mod inbox;
 mod repository_config;
@@ -44,6 +45,13 @@ pub fn verify_signature(secret: &str, body: &[u8], signature_header: Option<&str
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ForgejoLabel {
+    pub name: String,
+    pub color: String,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ForgejoEvent {
     Ping,
     /// A newly created issue/PR comment. Forgejo numbers issues and PRs from
@@ -65,6 +73,42 @@ pub enum ForgejoEvent {
         repo: String,
         ref_name: String,
     },
+    /// A new, edited or state-changed issue. Pull requests use the dedicated
+    /// variants below so bridge routing cannot confuse an issue number with a
+    /// PR branch tuple.
+    Issue {
+        repo: String,
+        number: i64,
+        action: String,
+        title: String,
+        body: String,
+        state: String,
+        labels: Vec<ForgejoLabel>,
+        author: String,
+        sender: String,
+        repository_id: Option<i64>,
+        source_at: Option<String>,
+    },
+    /// A new, edited, reopened or closed pull request. `head` and `base` are
+    /// branch names, not SHAs: Forgejo's bridge creates the GitHub PR from the
+    /// mirrored branches.
+    PullRequest {
+        repo: String,
+        number: i64,
+        action: String,
+        title: String,
+        body: String,
+        state: String,
+        labels: Vec<ForgejoLabel>,
+        author: String,
+        head: String,
+        base: String,
+        head_repo: String,
+        base_repo: String,
+        sender: String,
+        repository_id: Option<i64>,
+        source_at: Option<String>,
+    },
     Ignored(String),
 }
 
@@ -82,6 +126,31 @@ fn ji64(value: &Value, path: &[&str]) -> Option<i64> {
         current = current.get(*key)?;
     }
     current.as_i64()
+}
+
+fn labels(value: &Value) -> Vec<ForgejoLabel> {
+    value
+        .get("labels")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|label| {
+            Some(ForgejoLabel {
+                name: label.get("name")?.as_str()?.to_string(),
+                color: label
+                    .get("color")
+                    .and_then(Value::as_str)
+                    .unwrap_or("ededed")
+                    .trim_start_matches('#')
+                    .to_string(),
+                description: label
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+            })
+        })
+        .collect()
 }
 
 /// Convert a Forgejo webhook into the small set of events the bot consumes.
@@ -135,6 +204,70 @@ pub fn classify(event_header: &str, payload: &Value) -> ForgejoEvent {
                 commenter: commenter.to_string(),
                 author,
                 is_pr,
+            }
+        }
+        "issues" | "issue_label" => {
+            let Some(repo) = jstr(payload, &["repository", "full_name"]) else {
+                return ForgejoEvent::Ignored("issue without repository".into());
+            };
+            let Some(number) = ji64(payload, &["issue", "number"]) else {
+                return ForgejoEvent::Ignored("issue without number".into());
+            };
+            let action = jstr(payload, &["action"]).unwrap_or("").to_string();
+            if !bridge::supported_action(&action) {
+                return ForgejoEvent::Ignored("unsupported issue action".into());
+            }
+            let issue = &payload["issue"];
+            ForgejoEvent::Issue {
+                repository_id: ji64(payload, &["repository", "id"]),
+                source_at: jstr(issue, &["updated_at"]).map(str::to_owned),
+                repo: repo.to_string(),
+                number,
+                action,
+                title: jstr(issue, &["title"]).unwrap_or("").to_string(),
+                body: jstr(issue, &["body"]).unwrap_or("").to_string(),
+                state: jstr(issue, &["state"]).unwrap_or("").to_string(),
+                labels: labels(issue),
+                author: jstr(issue, &["user", "login"]).unwrap_or("").to_string(),
+                sender: jstr(payload, &["sender", "login"])
+                    .unwrap_or("")
+                    .to_string(),
+            }
+        }
+        "pull_request" | "pull_request_label" => {
+            let Some(repo) = jstr(payload, &["repository", "full_name"]) else {
+                return ForgejoEvent::Ignored("pull request without repository".into());
+            };
+            let Some(number) = ji64(payload, &["pull_request", "number"]) else {
+                return ForgejoEvent::Ignored("pull request without number".into());
+            };
+            let action = jstr(payload, &["action"]).unwrap_or("").to_string();
+            if !bridge::supported_action(&action) {
+                return ForgejoEvent::Ignored("unsupported pull request action".into());
+            }
+            let pr = &payload["pull_request"];
+            ForgejoEvent::PullRequest {
+                repository_id: ji64(payload, &["repository", "id"]),
+                source_at: jstr(pr, &["updated_at"]).map(str::to_owned),
+                repo: repo.to_string(),
+                number,
+                action,
+                title: jstr(pr, &["title"]).unwrap_or("").to_string(),
+                body: jstr(pr, &["body"]).unwrap_or("").to_string(),
+                state: jstr(pr, &["state"]).unwrap_or("").to_string(),
+                labels: labels(pr),
+                author: jstr(pr, &["user", "login"]).unwrap_or("").to_string(),
+                sender: jstr(payload, &["sender", "login"])
+                    .unwrap_or("")
+                    .to_string(),
+                head: jstr(pr, &["head", "ref"]).unwrap_or("").to_string(),
+                base: jstr(pr, &["base", "ref"]).unwrap_or("").to_string(),
+                head_repo: jstr(pr, &["head", "repo", "full_name"])
+                    .unwrap_or("")
+                    .to_string(),
+                base_repo: jstr(pr, &["base", "repo", "full_name"])
+                    .unwrap_or("")
+                    .to_string(),
             }
         }
         other => ForgejoEvent::Ignored(format!("unsupported event: {other}")),

@@ -10,7 +10,7 @@ Xero-Team 的组织级 GitHub App 机器人。Rust 实现,主服务与离线状�
 - **rebase 提醒** — PR 与目标分支冲突时自动打 `needs-rebase` 标签并提醒,解决后自动清除
 - **CodeQL 质量报告** — 读取仓库存量 code scanning 告警,映射到 PR 变更文件
 - **中英双语回复** — 依 PR 自身的 commit 信息决定用中文还是英文,无需配置
-- **Forgejo provider 与镜像同步** — 独立于 GitHub App 的 token 鉴权、核心 Issue/PR triage，以及可选的 GitHub → Forgejo 单向镜像同步；参见 [docs/forgejo.md](docs/forgejo.md)
+- **Forgejo provider 与同步** — 独立 token 鉴权、Issue/PR triage、可选的 GitHub → Forgejo 代码镜像，以及持久化的双向 Issue/PR/评论桥；参见 [docs/forgejo.md](docs/forgejo.md)
 
 仓库触发策略、持久化会话、显式创建动作和 PR 路径标签/CC 均独立于 idle scheduler。参见
 [触发与升级指南](docs/triggers.zh-CN.md)、[完整配置参考 example.toml](example.toml)、[完整默认示例](.github/xero-bot.toml)、单独的

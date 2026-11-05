@@ -48,7 +48,7 @@ hex 格式以及兼容代理常见的 `sha256=` 前缀；空 secret、缺失签�
 - 写请求的传输失败或无法解析的响应返回 `UnknownWriteOutcome`，明确要求先核对远端状态再考虑重试；读取失败仍返回 `Transport` / `InvalidResponse`。HTTP 拒绝保留 `Api` 状态码，5xx 也不能据此推断写操作没有生效。
 - 错误只返回状态和经过脱敏、最多 512 字符的 provider message，不返回 token。
 
-当前支持独立的 Forgejo webhook、评论指令、持久化恢复，以及显式启用的 GitHub → Forgejo 单向镜像同步。
+当前支持独立的 Forgejo webhook、评论指令、持久化恢复，以及显式启用的 GitHub → Forgejo 单向镜像同步和 Forgejo ↔ GitHub Issue / PR 消息桥。
 
 ## 评论指令
 
@@ -164,3 +164,117 @@ CI 不依赖 GitHub App、AI key 或 webhook secret。
 旧版采用严格未知字段校验，即使 `enabled = false` 也会拒绝该新表，暂停仓库动作。
 因此本仓库的在线 `.github/xero-bot.toml` 及其副本 `examples/repository-config.toml`
 只保留注释示例；完整配置在 `example.toml`。回滚到旧版本前，应先从在线配置移除该表。
+
+## Forgejo ↔ GitHub Issue / PR 消息桥
+
+消息桥同步协作内容，代码继续由现有 GitHub → Forgejo pull mirror 复制。
+它与 `[forgejo.mirror]` 分别启用；默认关闭。目标仓库必须已存在，且 Forgejo
+仓库的 `original_url` 是本 GitHub 仓库的 HTTPS 地址，例如
+`https://github.com/xero-team/xero-bot.git`。暂不接受 SSH、带凭据的 origin
+或 GitHub Enterprise。GitHub App 必须安装在该 GitHub 仓库上。
+
+### 启用
+
+先部署支持消息桥的 bot，再在 **GitHub 默认分支** 的 `.github/xero-bot.toml` 加入：
+
+```toml
+[forgejo.bridge]
+enabled = true
+destination = "xero-team/xero-bot" # Forgejo 的 owner/repository
+issues = true
+pull_requests = true
+comments = true
+```
+
+三个内容开关默认都为 `false`，启用时至少选一个。仅开启 `comments` 时只能为
+已有持久映射的对象转发评论，不会创建 Issue / PR。`destination` 始终填写
+Forgejo 仓库名，即使 GitHub 仓库名与它不同也不改变含义。
+
+等待 pull mirror 把这份默认分支配置同步到 Forgejo，再启用双方 webhook。
+两个方向都会检查双方默认分支策略：配置错误、读取失败、目标不匹配时不写入。
+Forgejo → GitHub 的目标从 mirror origin 和 GitHub App 安装清单解析，并核对
+实际仓库 ID；不会使用 webhook 中声明的目标地址。
+
+- GitHub App 仓库权限：Metadata / Contents 读，Issues / Pull requests 写。
+- GitHub webhook：`Issues`、`Pull request`、`Issue comment`。
+- Forgejo token：`read:user`、`write:issue`、`write:repository`，账号本身需具备仓库相应权限。
+- Forgejo webhook：Issue、Pull request、Issue comment、Pull request comment，
+  以及 Issue / Pull request 的标签事件。兼容 `issue_label` / `pull_request_label`
+  事件名和 `label_updated` / `label_cleared` 动作。
+- Forgejo 仓库需启用 Issues / Pull Requests 单元；双方分支必须可读取。
+
+Forgejo webhook 的配置和签名方式见前文，也可参考
+[Forgejo webhook 文档](https://forgejo.org/docs/latest/user/repository/webhooks/)。
+GitHub 的 PR 标签通过 Issues API 管理，权限说明见
+[GitHub Labels API](https://docs.github.com/en/rest/issues/labels)。
+
+### 同步范围
+
+| 内容 | 行为 |
+| --- | --- |
+| 新 Issue / PR | `opened` 事件创建对端对象，双方编号可以不同 |
+| 标题、正文 | 双向更新；执行前读取源端当前状态，避免旧 webhook 覆盖新内容 |
+| 开放 / 关闭 | 双向关闭和重新打开；合并事件只同步关闭状态，不执行对端合并 |
+| 标签 | 按名称同步成员关系、移除已取消的标签；缺少的标签使用源端颜色和描述创建 |
+| 普通评论 | 转发新建评论，显示源平台和评论者；不转发评论编辑、删除、行内 review |
+| PR 分支 | 仅同仓库、双方已存在的 head/base；支持 base 变更，不传输 Git ref |
+
+已有标签的颜色和描述保留各平台设置。`LABEL_MERGE_QUEUE_QUEUED` /
+`LABEL_MERGE_QUEUE_TESTING` 指定的两个合并队列标签不会跨平台导入，也不会被
+对端标签集合清除。CI、Checks、review approval、assignee、reviewer、附件迁移、
+表情反应和合并队列操作均不在桥接范围内。当前 bot 账号自己的写入会被过滤，
+包括它产生的命令回复；其他普通评论正常转发。
+
+PR 来自 fork、分支尚未镜像到对端、仓库未开放 PR 功能时，桥接不会复制代码或
+猜测分支。Fork PR 跳过；API 拒绝（例如缺少分支）保留失败事件，修复后可恢复。
+已有 Issue / PR 不会按标题或相同编号自动配对，也不做历史数据回填；后续评论
+只会发给已建立映射的对端。并发编辑按单消费者处理顺序收敛，不做字段级冲突合并。
+
+### 去重与恢复
+
+验证签名后，webhook 将桥接任务提交到
+`XERO_DATA_DIR/command-triggers.sqlite` 才返回成功。独立消费者每两秒检查任务，
+服务重启后恢复未完成的事件。命令执行仍使用原来的命令收件箱，两者独立。
+普通讨论即使没有 bot 指令，也会进入桥接流程。
+反向代理应保留 `X-GitHub-Delivery` / `X-Forgejo-Delivery`（兼容
+`X-Gitea-Delivery`），用于区分同一秒内内容相同的不同编辑事件。
+
+映射范围包含 Forgejo API 地址、双方仓库 ID、GitHub installation ID 和仓库名。
+同一桥接范围的双向操作串行执行。正文中的 HMAC 隐藏标记用于识别来源；
+**复制或删除标记不会重新绑定对象**，SQLite 映射是唯一依据。
+请备份整个持久目录及 WAL；数据库丢失后不能靠标题、编号或标记重建映射。
+
+创建对象和评论前先保存写入占位。超时、响应损坏或进程中断后，如果没有可确认的
+远端编号，保留 `unknown` 占位，不盲目重复 POST。创建后立刻保存双向映射；
+后续元数据步骤失败，可沿已有映射恢复，不再新建对象。已完成任务清除存储的正文，
+保留去重键和对象映射。SQLite 与外部 API 不共享事务，不承诺 exactly-once。
+
+失败事件进入 `blocked`，暂停同一来源 Issue / PR 的后续桥接事件，其他对象继续。
+不会在后台不断重试写请求。停止服务后可以使用：
+
+```sh
+trigger-state /data bridge-deliveries # 待处理/阻塞事件的 KEY、lane、原因
+trigger-state /data bridge-status     # 不确定的创建/评论及其 SCOPE、来源编号
+
+# 若没有不确定 POST（例如策略读取失败），修复配置/权限后恢复：
+trigger-state /data bridge-retry KEY
+
+# 如果远端实际已创建：PEER 是对端 Issue/PR 编号或评论 ID。
+# SOURCE 是 bridge-status 中的来源编号；SCOPE 需按原值引用为单个参数。
+trigger-state /data bridge-resolve 'SCOPE' issue forgejo SOURCE PEER '已核对远端对象及其来源'
+# kind 可为 issue、pull、comment；side 可为 github、forgejo。
+
+# 仅在核实远端确实没有创建时，用 0 解除占位：
+trigger-state /data bridge-resolve 'SCOPE' comment github SOURCE 0 '已确认远端没有该评论'
+trigger-state /data bridge-retry KEY
+# 然后重启服务。仍会重新检查当前策略、映射和占位。
+```
+
+`bridge-retry` 本身不会清除不确定写入占位。对于已完成但未记录结果的创建/评论，
+必须先提供远端编号；不能仅因为 5xx 或超时就认定没有生效。
+
+### 上线与回滚
+
+仓库中的示例表保持注释，不会随代码发布自动开启桥接。先升级所有读取该仓库策略的
+实例，再添加 `[forgejo.bridge]`，并确认镜像中的配置已经更新。回滚到不认识该表的
+旧版本前，先移除该表并完成镜像同步；只设 `enabled = false` 仍会被旧版严格解析器拒绝。
