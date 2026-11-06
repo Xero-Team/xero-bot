@@ -262,6 +262,8 @@ GitHub → Settings → Developer settings → GitHub Apps → **New GitHub App*
 
 端点:`POST /webhook`(GitHub)、`GET /health`、`GET /cron`(受 `CRON_SECRET` 保护)。
 
+**升级要求：** 重启此版本前先配置服务端 `BOT_ACCESS_POLICY`；未配置或留空时，GitHub 和 Forgejo 仓库均不获准使用服务。公开 GitHub App 后，其他组织安装 App 也不会自动获得服务权限，仓库 TOML 无法覆盖准入策略。ID 获取、配置示例和撤权流程见[服务准入说明](docs/admission.md#中文)。`CRON_SECRET` 留空会关闭外部 `/cron` 入口，内置定时任务继续运行。
+
 <details>
 <summary><b>Docker 快速上手 — 从零到跑通</b></summary>
 

@@ -710,7 +710,15 @@ pub async fn from_forgejo(
         Ok(client) => client,
         Err(error) => return github_read_error(error),
     };
-    let metadata = match gh.repo_info(&binding.github_repo).await {
+    let metadata = match crate::admission::github_repository(
+        cfg,
+        &gh,
+        binding.installation_id,
+        &binding.github_repo,
+        Some(binding.repository_id),
+    )
+    .await
+    {
         Ok(metadata) => metadata,
         Err(error) => return github_read_error(error),
     };
@@ -856,7 +864,15 @@ pub async fn comment_from_forgejo(
         Ok(client) => client,
         Err(error) => return github_read_error(error),
     };
-    let metadata = match gh.repo_info(&binding.github_repo).await {
+    let metadata = match crate::admission::github_repository(
+        cfg,
+        &gh,
+        binding.installation_id,
+        &binding.github_repo,
+        Some(binding.repository_id),
+    )
+    .await
+    {
         Ok(metadata) => metadata,
         Err(error) => return github_read_error(error),
     };
@@ -1020,7 +1036,9 @@ pub(crate) async fn authorize_forgejo(
     github_id: i64,
     local_policy: &ForgejoBridgeConfig,
 ) -> Result<(i64, ForgejoBridgeConfig), BridgeOutcome> {
-    let metadata = client.repository(repo).await.map_err(forgejo_read_error)?;
+    let metadata = crate::admission::forgejo_repository(cfg, client, repo, None)
+        .await
+        .map_err(forgejo_read_error)?;
     let id = metadata["id"]
         .as_i64()
         .filter(|id| *id > 0)
@@ -1052,8 +1070,7 @@ async fn resolve_binding(
 ) -> Result<Binding, BridgeOutcome> {
     static CACHE: OnceLock<tokio::sync::Mutex<HashMap<String, (Instant, Binding)>>> =
         OnceLock::new();
-    let metadata = forgejo
-        .repository(forgejo_repo)
+    let metadata = crate::admission::forgejo_repository(cfg, forgejo, forgejo_repo, None)
         .await
         .map_err(forgejo_read_error)?;
     validate_source(&metadata, policy)?;
@@ -1074,7 +1091,14 @@ async fn resolve_binding(
     {
         let cache = cache.lock().await;
         if let Some((at, binding)) = cache.get(&key) {
-            if at.elapsed() < BINDING_TTL {
+            if at.elapsed() < BINDING_TTL
+                && crate::admission::github_scope(
+                    cfg,
+                    binding.installation_id,
+                    &binding.github_repo,
+                    Some(binding.repository_id),
+                )
+            {
                 return Ok(binding.clone());
             }
         }
@@ -1090,6 +1114,9 @@ async fn resolve_binding(
         let Some(installation_id) = installation["id"].as_i64().filter(|id| *id > 0) else {
             continue;
         };
+        if crate::admission::github_installation(cfg, installation_id).is_err() {
+            continue;
+        }
         let client = match Client::installation_resolved(cfg, installation_id).await {
             Ok(client) => client,
             Err(error) => {
@@ -1108,9 +1135,10 @@ async fn resolve_binding(
                 }
             };
         if let Some(repository) = repos.into_iter().find(|repo| {
-            repo["full_name"]
-                .as_str()
-                .is_some_and(|name| name.eq_ignore_ascii_case(&github_repo))
+            crate::admission::github_metadata(cfg, installation_id, repo)
+                && repo["full_name"]
+                    .as_str()
+                    .is_some_and(|name| name.eq_ignore_ascii_case(&github_repo))
         }) {
             let Some(repository_id) = repository["id"].as_i64().filter(|id| *id > 0) else {
                 continue;
@@ -2165,6 +2193,9 @@ pub(crate) async fn rollup_binding(
     repo: &str,
     number: i64,
 ) -> Result<(Client, String, i64, i64, Option<i64>), String> {
+    crate::admission::forgejo_repository(cfg, forgejo, repo, None)
+        .await
+        .map_err(|e| e.to_string())?;
     let local = forgejo
         .repository_config(repo)
         .await?
@@ -2177,6 +2208,16 @@ pub(crate) async fn rollup_binding(
     let gh = Client::installation_resolved(cfg, binding.installation_id)
         .await
         .map_err(|e| e.to_string())?;
+    crate::admission::github_repository(
+        cfg,
+        &gh,
+        binding.installation_id,
+        &binding.github_repo,
+        Some(binding.repository_id),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+
     let key = RepositoryKey {
         installation_id: binding.installation_id,
         repository_id: binding.repository_id,

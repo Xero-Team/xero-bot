@@ -1,3 +1,4 @@
+pub mod admission;
 pub mod agent;
 pub mod codeql;
 pub mod commands;

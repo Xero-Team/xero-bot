@@ -11,6 +11,8 @@ use std::path::Path;
 
 #[derive(Debug, Clone)]
 pub struct Config {
+    /// Deployment-owned JSON allowlist. Empty means no repositories are admitted.
+    pub bot_access_policy: String,
     // GitHub App
     pub app_id: String,
     pub private_key_pem: Option<String>,
@@ -237,6 +239,7 @@ impl Config {
 
     fn read_env() -> Config {
         Config {
+            bot_access_policy: cfg("BOT_ACCESS_POLICY", "{}"),
             app_id: cfg("APP_ID", ""),
             private_key_pem: read_key_pem(),
             webhook_secret: cfg("WEBHOOK_SECRET", ""),
@@ -310,6 +313,7 @@ impl Config {
 
     /// Required for any GitHub API access. Returns Err listing what's missing.
     pub fn validate(&self) -> Result<(), String> {
+        crate::admission::Policy::parse(&self.bot_access_policy)?;
         let mut missing = Vec::new();
         if self.app_id.is_empty() {
             missing.push("APP_ID");

@@ -23,6 +23,8 @@ impl Drop for Dir {
 }
 fn cfg(url: &str) -> Config {
     let mut cfg = Config::from_env();
+    cfg.bot_access_policy =
+        r#"{"forgejo":[{"owner_id":10,"repository_id":1,"repository":"team/repo"}]}"#.into();
     cfg.bot_name = "bot".into();
     cfg.forgejo_bot_name = "bot".into();
     cfg.forgejo_base_url = url.into();
@@ -54,7 +56,9 @@ async fn policy(server: &MockServer, text: &str) {
         .await;
     Mock::given(method("GET"))
         .and(path("/api/v1/repos/team/repo"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"default_branch":"main"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(
+            json!({"id":1,"full_name":"team/repo","owner":{"id":10},"default_branch":"main"}),
+        ))
         .mount(server)
         .await;
     Mock::given(method("GET"))
@@ -301,4 +305,20 @@ async fn unreadable_write_response_blocks_replay_and_following_thread_commands()
     drop(inbox);
     let inbox = Arc::new(Inbox::open(&dir.0).unwrap());
     assert_eq!(inbox.pump(&cfg, &store).await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn revoked_repository_cannot_resume_a_persisted_forgejo_command() {
+    let dir = Dir::new();
+    let server = MockServer::start().await;
+    let mut cfg = cfg(&server.uri());
+    let store = Store::open(&dir.0).unwrap();
+    let inbox = Inbox::open(&dir.0).unwrap();
+    inbox.enqueue(&cfg, &event(10, "@bot ping")).unwrap();
+    drop(inbox);
+    cfg.bot_access_policy = "{}".into();
+    let inbox = Arc::new(Inbox::open(&dir.0).unwrap());
+    assert_eq!(inbox.pump(&cfg, &store).await.unwrap(), 1);
+    assert_eq!(inbox.pump(&cfg, &store).await.unwrap(), 0);
+    assert!(server.received_requests().await.unwrap().is_empty());
 }

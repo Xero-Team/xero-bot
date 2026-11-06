@@ -123,6 +123,10 @@ pub async fn fallback(
     let token = gh.installation_token(cfg, repo.installation).await?;
     let source = Remote::new(github_url(&repo.name), "x-access-token", &token);
     let fj = crate::forgejo::ForgejoClient::new(&cfg.forgejo_base_url, &cfg.forgejo_token)?;
+    crate::admission::github_repository(cfg, gh, repo.installation, &repo.name, Some(repo.id))
+        .await?;
+    crate::admission::forgejo_repository(cfg, &fj, destination, None).await?;
+
     let me = fj.current_user().await?;
     let user = me["login"].as_str().ok_or("Forgejo identity missing")?;
     let base = cfg

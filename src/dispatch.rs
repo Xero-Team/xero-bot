@@ -758,23 +758,64 @@ pub async fn execute_work(cfg: &Config, work: Work) {
 }
 
 async fn execute_work_inner(cfg: &Config, work: Work) -> Result<(), String> {
+    let (installation, name) = match &work {
+        Work::Comment {
+            installation_id,
+            repo,
+            ..
+        }
+        | Work::RebaseCheck {
+            installation_id,
+            repo,
+            ..
+        }
+        | Work::BasePushed {
+            installation_id,
+            repo,
+            ..
+        }
+        | Work::Codeql {
+            installation_id,
+            repo,
+            ..
+        }
+        | Work::PrReview {
+            installation_id,
+            repo,
+            ..
+        }
+        | Work::QueuePrClosed {
+            installation_id,
+            repo,
+            ..
+        } => (*installation_id, repo.as_str()),
+    };
+    let repository = match &work {
+        Work::Comment { repository_id, .. } | Work::Codeql { repository_id, .. } => {
+            Some(*repository_id)
+        }
+        Work::BasePushed { repository_id, .. } => *repository_id,
+        _ => None,
+    };
+    if !crate::admission::github_scope(cfg, installation, name, repository) {
+        return Ok(());
+    }
+    let gh = Client::installation_resolved(cfg, installation)
+        .await
+        .map_err(|e| e.to_string())?;
+    crate::admission::github_repository(cfg, &gh, installation, name, repository)
+        .await
+        .map_err(|e| e.to_string())?;
     match work {
-        work @ Work::Comment {
-            installation_id, ..
-        } => {
-            let gh = Client::installation_resolved(cfg, installation_id)
-                .await
-                .map_err(|e| format!("installation client: {e}"))?;
+        work @ Work::Comment { .. } => {
             execute_comment_with_client(&gh, cfg, &RepositoryConfigCache::shared(), work).await
         }
         Work::RebaseCheck {
             repo,
             pr_number,
             action,
-            installation_id,
+            ..
         } => {
-            let gh = Client::installation(cfg, installation_id, "")
-                .map_err(|e| format!("installation client: {e}"))?;
             crate::rebase::handle_push_event(&gh, cfg, &repo, pr_number, &action).await;
             Ok(())
         }
@@ -784,9 +825,6 @@ async fn execute_work_inner(cfg: &Config, work: Work) -> Result<(), String> {
             ref_name,
             installation_id,
         } => {
-            let gh = Client::installation_resolved(cfg, installation_id)
-                .await
-                .map_err(|e| format!("installation client: {e}"))?;
             crate::rebase::handle_base_push(&gh, cfg, &repo, &ref_name).await;
             if let Some(repository_id) = repository_id.filter(|id| *id > 0) {
                 crate::forgejo::sync::sync_repository(
@@ -804,11 +842,7 @@ async fn execute_work_inner(cfg: &Config, work: Work) -> Result<(), String> {
             }
             Ok(())
         }
-        work @ Work::Codeql {
-            installation_id, ..
-        } => {
-            let gh = Client::installation(cfg, installation_id, "")
-                .map_err(|e| format!("installation client: {e}"))?;
+        work @ Work::Codeql { .. } => {
             execute_codeql_with_client(&gh, cfg, &RepositoryConfigCache::shared(), work).await
         }
         Work::PrReview {
@@ -818,9 +852,6 @@ async fn execute_work_inner(cfg: &Config, work: Work) -> Result<(), String> {
             reviewer,
             installation_id,
         } => {
-            let gh = Client::installation_resolved(cfg, installation_id)
-                .await
-                .map_err(|e| format!("installation client: {e}"))?;
             if crate::rollup::ingress::enabled_for(&gh, cfg, &repo, installation_id)
                 .await
                 .map_err(|e| e.to_string())?
@@ -840,8 +871,6 @@ async fn execute_work_inner(cfg: &Config, work: Work) -> Result<(), String> {
             pr_number,
             installation_id,
         } => {
-            let gh = Client::installation(cfg, installation_id, "")
-                .map_err(|e| format!("installation client: {e}"))?;
             if crate::rollup::ingress::enabled_for(&gh, cfg, &repo, installation_id)
                 .await
                 .map_err(|e| e.to_string())?

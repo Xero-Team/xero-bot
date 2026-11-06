@@ -1265,3 +1265,23 @@ mod events;
 
 #[path = "acceptance_tests.rs"]
 mod acceptance;
+
+/// Revocation applies to pre-upgrade/restarted queues before building any API client.
+#[tokio::test]
+async fn revoked_repository_discards_persisted_trigger_without_credentials() {
+    let dir = Dir::new();
+    let runtime = Runtime::open(&dir.0).unwrap();
+    runtime.store.enqueue(&context(), 100).unwrap();
+    drop(runtime);
+    let runtime = Runtime::open(&dir.0).unwrap();
+    let mut cfg = cfg();
+    cfg.bot_access_policy = "{}".into();
+    cfg.private_key_pem = None;
+    assert_eq!(runtime.pump(&cfg).await.unwrap(), 1);
+    assert!(runtime.store.list(None).unwrap().is_empty());
+    assert_eq!(runtime.pump(&cfg).await.unwrap(), 0);
+    assert_eq!(
+        runtime.store.inbox_status().unwrap()[0]["state"],
+        "succeeded"
+    );
+}

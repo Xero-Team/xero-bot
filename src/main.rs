@@ -4,8 +4,7 @@
 //!   POST /webhook          — GitHub App webhook receiver
 //!   POST /webhook/forgejo  — Forgejo token-provider webhook receiver
 //!   GET  /health           — liveness
-//!   GET  /cron     — rebase sweep (protect with CRON_SECRET, or bind to
-//!                    localhost and drive it with an external cron)
+//!   GET  /cron     — rebase sweep (disabled unless CRON_SECRET is set)
 //!
 //! Background work runs on tokio::spawn (no time limit).
 
@@ -113,16 +112,9 @@ async fn main() {
         None
     };
 
-    // We bind 0.0.0.0, so an unauthenticated /cron is reachable from anywhere
-    // the port is. The sweep walks every installation and can post reminder
-    // comments, so make the exposure visible rather than silently trusting the
-    // ".env" note about binding to an internal network.
+    // Internal workers do not depend on the externally authenticated trigger.
     if cfg.cron_secret.is_empty() {
-        tracing::warn!(
-            "CRON_SECRET is empty: GET /cron is unauthenticated and this server \
-             listens on 0.0.0.0 — set CRON_SECRET or firewall port {}",
-            cfg.port
-        );
+        tracing::warn!("CRON_SECRET is empty: external GET /cron is disabled");
     }
 
     // One throwaway AI request before serving. A bad key or a mismatched
@@ -302,6 +294,12 @@ async fn webhook(
         Ok(v) => v,
         Err(_) => return (StatusCode::BAD_REQUEST, Json(json!({"error": "bad json"}))),
     };
+    if !xero_bot::admission::github_webhook(&state.cfg, &payload) {
+        return (
+            StatusCode::OK,
+            Json(json!({"ignored":"repository not admitted"})),
+        );
+    }
 
     xero_bot::config::cache::RepositoryConfigCache::shared()
         .observe_webhook(&event_header, &payload);
@@ -438,6 +436,12 @@ async fn forgejo_webhook(
         Ok(value) => value,
         Err(_) => return (StatusCode::BAD_REQUEST, Json(json!({"error": "bad json"}))),
     };
+    if !xero_bot::admission::forgejo_metadata(&state.cfg, &payload["repository"]) {
+        return (
+            StatusCode::OK,
+            Json(json!({"ignored":"repository not admitted"})),
+        );
+    }
     match xero_bot::forgejo::classify(event_header, &payload) {
         xero_bot::forgejo::ForgejoEvent::Ping => (StatusCode::OK, Json(json!({"ok": "pong"}))),
         xero_bot::forgejo::ForgejoEvent::Ignored(reason) => {
@@ -516,13 +520,13 @@ async fn cron_sweep(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> (StatusCode, Json<Value>) {
-    // allow: bearer CRON_SECRET, localhost, or no secret configured
+    // Empty secrets disable the external trigger; internal workers run independently.
     let auth = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    let authorized =
-        state.cfg.cron_secret.is_empty() || auth == format!("Bearer {}", state.cfg.cron_secret);
+    let authorized = !state.cfg.cron_secret.trim().is_empty()
+        && auth == format!("Bearer {}", state.cfg.cron_secret);
     if !authorized {
         return (
             StatusCode::UNAUTHORIZED,
@@ -579,11 +583,16 @@ mod trigger_ingress_tests {
     }
     /// Build a signed-command fixture with complete recovery identity.
     fn payload() -> Value {
-        json!({"action":"created","repository":{"id":1,"full_name":"test/repo"},"installation":{"id":2},"issue":{"id":3,"number":1,"user":{"login":"alice"}},"comment":{"id":4,"body":"@bot ping","created_at":"2026-10-02T00:00:00Z","user":{"id":5,"login":"alice","type":"User"}}})
+        json!({"action":"created","repository":{"id":1,"full_name":"test/repo","owner":{"id":10}},"installation":{"id":2},"issue":{"id":3,"number":1,"user":{"login":"alice"}},"comment":{"id":4,"body":"@bot ping","created_at":"2026-10-02T00:00:00Z","user":{"id":5,"login":"alice","type":"User"}}})
     }
     /// Create ingress state with durable storage and the idle scheduler disabled.
     fn state(dir: &Dir) -> AppState {
         let mut cfg = Config::from_env();
+        cfg.bot_access_policy = json!({
+            "github":[{"installation_id":2,"owner_id":10,"repository_id":1,"repository":"test/repo"}],
+            "forgejo":[{"owner_id":10,"repository_id":9,"repository":"team/repo"},
+                       {"owner_id":10,"repository_id":1,"repository":"test/repo"}]
+        }).to_string();
         cfg.webhook_secret = "secret".into();
         cfg.bot_name = "bot".into();
         cfg.idle_workflows_enabled = false;
@@ -680,7 +689,7 @@ mod trigger_ingress_tests {
         );
         assert_eq!(s.triggers.store.bridge_deliveries().unwrap().len(), 1);
         assert!(s.triggers.store.inbox_status().unwrap().is_empty());
-        let fj = json!({"action":"opened","repository":{"id":9,"full_name":"team/repo"},"sender":{"login":"alice"},"issue":{"number":4,"title":"new issue","state":"open","updated_at":"2026-11-05T01:00:00Z"}});
+        let fj = json!({"action":"opened","repository":{"id":9,"full_name":"team/repo","owner":{"id":10}},"sender":{"login":"alice"},"issue":{"number":4,"title":"new issue","state":"open","updated_at":"2026-11-05T01:00:00Z"}});
         let body = serde_json::to_vec(&fj).unwrap();
         let mut headers = HeaderMap::new();
         let mut mac = xero_bot::forgejo::HmacSha256::new_from_slice(b"test-secret").unwrap();
@@ -790,7 +799,10 @@ mod trigger_ingress_tests {
                     .await
                     .unwrap();
                 assert_eq!(response.status(), StatusCode::OK);
-                assert_eq!(response.json::<Value>().await.unwrap()["ok"], "pong");
+                assert_eq!(
+                    response.json::<Value>().await.unwrap()["ignored"],
+                    "repository not admitted"
+                );
             }
             for sig in [None, Some(""), Some("00"), Some("not-hex")] {
                 let mut request = client
@@ -880,7 +892,7 @@ mod trigger_ingress_tests {
         let dir = Dir::new();
         let s = state(&dir);
         for action in ["opened", "edited", "reopened"] {
-            let event = json!({"action":action,"repository":{"id":1,"full_name":"test/repo"},"installation":{"id":2},"issue":{"id":3,"number":1,"created_at":"2026-10-03T00:00:00Z","user":{"id":5,"login":"alice","type":"User"}}});
+            let event = json!({"action":action,"repository":{"id":1,"full_name":"test/repo","owner":{"id":10}},"installation":{"id":2},"issue":{"id":3,"number":1,"created_at":"2026-10-03T00:00:00Z","user":{"id":5,"login":"alice","type":"User"}}});
             let body = serde_json::to_vec(&event).unwrap();
             let mut headers = signed(&body);
             headers.insert("x-github-event", "issues".parse().unwrap());
@@ -898,7 +910,7 @@ mod trigger_ingress_tests {
         let mut cfg = Config::from_env();
         cfg.codeql_label = "scan".into();
         cfg.merge_queue_enabled = true;
-        let mut p = json!({"action":"opened","repository":{"full_name":"test/repo"},"installation":{"id":2},"pull_request":{"number":1}});
+        let mut p = json!({"action":"opened","repository":{"full_name":"test/repo","owner":{"id":10}},"installation":{"id":2},"pull_request":{"number":1}});
         for action in ["opened", "reopened", "synchronize"] {
             p["action"] = json!(action);
             assert!(matches!(
@@ -917,5 +929,110 @@ mod trigger_ingress_tests {
             route_event(&cfg, "pull_request", &p),
             Routing::Act(xero_bot::dispatch::Work::QueuePrClosed { .. })
         ));
+    }
+    #[tokio::test]
+    async fn valid_signatures_do_not_admit_unapproved_or_mismatched_identities() {
+        for mutation in [
+            "empty-policy",
+            "installation",
+            "owner",
+            "repository",
+            "name",
+            "missing-owner",
+        ] {
+            let dir = Dir::new();
+            let mut s = state(&dir);
+            s.cfg.forgejo_base_url = "https://forgejo.example".into();
+            s.cfg.forgejo_token = "test-token".into();
+            s.cfg.forgejo_webhook_secret = "test-secret".into();
+            let mut p = payload();
+            match mutation {
+                "empty-policy" => s.cfg.bot_access_policy.clear(),
+                "installation" => p["installation"]["id"] = json!(99),
+                "owner" => p["repository"]["owner"]["id"] = json!(99),
+                "repository" => p["repository"]["id"] = json!(99),
+                "name" => p["repository"]["full_name"] = json!("untrusted/repo"),
+                _ => {
+                    p["repository"].as_object_mut().unwrap().remove("owner");
+                }
+            }
+            let body = serde_json::to_vec(&p).unwrap();
+            let (status, response) = webhook(State(s.clone()), signed(&body), body.into()).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(
+                response.0["ignored"], "repository not admitted",
+                "{mutation}"
+            );
+            assert!(s.triggers.store.inbox_status().unwrap().is_empty());
+            assert!(s.triggers.store.bridge_deliveries().unwrap().is_empty());
+            assert!(s.triggers.store.list(None).unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn forgejo_denial_precedes_both_bridge_and_command_persistence() {
+        for mutation in ["empty-policy", "owner", "repository"] {
+            let dir = Dir::new();
+            let mut s = state(&dir);
+            s.cfg.forgejo_base_url = "https://forgejo.example".into();
+            s.cfg.forgejo_token = "test-token".into();
+            s.cfg.forgejo_webhook_secret = "test-secret".into();
+            let mut p = payload();
+            match mutation {
+                "empty-policy" => s.cfg.bot_access_policy.clear(),
+                "owner" => p["repository"]["owner"]["id"] = json!(99),
+                _ => p["repository"]["id"] = json!(99),
+            }
+            let body = serde_json::to_vec(&p).unwrap();
+            let mut mac = xero_bot::forgejo::HmacSha256::new_from_slice(b"test-secret").unwrap();
+            mac.update(&body);
+            let mut h = HeaderMap::new();
+            h.insert(
+                "x-forgejo-signature",
+                hex::encode(mac.finalize().into_bytes()).parse().unwrap(),
+            );
+            h.insert("x-forgejo-event", "issue_comment".parse().unwrap());
+            let (status, response) = forgejo_webhook(State(s.clone()), h, body.into()).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(response.0["ignored"], "repository not admitted");
+            assert!(s.triggers.store.bridge_deliveries().unwrap().is_empty());
+            drop(s);
+            let db = rusqlite::Connection::open(dir.0.join("forgejo-comments.sqlite")).unwrap();
+            assert_eq!(
+                db.query_row("SELECT COUNT(*) FROM comments", [], |r| r.get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cron_requires_a_configured_secret_and_matching_bearer() {
+        let dir = Dir::new();
+        let mut s = state(&dir);
+        s.cfg.rebase_sweep_enabled = false;
+        s.cfg.merge_queue_enabled = false;
+        s.cfg.forgejo_base_url.clear();
+        s.cfg.forgejo_token.clear();
+        s.cfg.forgejo_webhook_secret.clear();
+        for (secret, header, expected) in [
+            ("", None, StatusCode::UNAUTHORIZED),
+            ("", Some("Bearer "), StatusCode::UNAUTHORIZED),
+            ("   ", Some("Bearer    "), StatusCode::UNAUTHORIZED),
+            ("cron-secret", None, StatusCode::UNAUTHORIZED),
+            (
+                "cron-secret",
+                Some("Bearer wrong"),
+                StatusCode::UNAUTHORIZED,
+            ),
+            ("cron-secret", Some("Bearer cron-secret"), StatusCode::OK),
+        ] {
+            s.cfg.cron_secret = secret.into();
+            let mut h = HeaderMap::new();
+            if let Some(value) = header {
+                h.insert("authorization", value.parse().unwrap());
+            }
+            assert_eq!(cron_sweep(State(s.clone()), h).await.0, expected);
+        }
     }
 }

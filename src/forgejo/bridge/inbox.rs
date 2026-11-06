@@ -188,6 +188,18 @@ pub async fn pump(cfg: &Config, store: &Store) -> Result<()> {
                 payload,
             }) => match Client::installation_resolved(cfg, installation).await {
                 Ok(gh) => {
+                    if let Err(error) = crate::admission::github_repository(
+                        cfg,
+                        &gh,
+                        installation,
+                        &repo,
+                        Some(repository),
+                    )
+                    .await
+                    {
+                        finish_outcome(store, &key, &github_read_error(error))?;
+                        continue;
+                    }
                     let identity = RepositoryKey {
                         installation_id: installation,
                         repository_id: repository,
@@ -205,16 +217,47 @@ pub async fn pump(cfg: &Config, store: &Store) -> Result<()> {
                 instance,
                 event,
             }) => {
-                if ForgejoClient::new(&cfg.forgejo_base_url, &cfg.forgejo_token)
-                    .is_ok_and(|client| client.api_base.as_str() == instance)
-                {
-                    if matches!(*event, ForgejoEvent::IssueComment { .. }) {
-                        comment_from_forgejo(cfg, store, &repo, &event).await
-                    } else {
-                        from_forgejo(cfg, store, &repo, &event).await
+                let repository_id = match event.as_ref() {
+                    ForgejoEvent::Issue { repository_id, .. }
+                    | ForgejoEvent::PullRequest { repository_id, .. }
+                    | ForgejoEvent::IssueComment { repository_id, .. } => *repository_id,
+                    _ => None,
+                };
+                if !crate::admission::forgejo_scope(cfg, &repo, repository_id) {
+                    finish_outcome(
+                        store,
+                        &key,
+                        &BridgeOutcome::Ignored("repository-admission-revoked"),
+                    )?;
+                    continue;
+                }
+                let client = match ForgejoClient::new(&cfg.forgejo_base_url, &cfg.forgejo_token) {
+                    Ok(client) => client,
+                    Err(error) => {
+                        finish_outcome(store, &key, &forgejo_read_error(error))?;
+                        continue;
                     }
+                };
+                if client.api_base.as_str() != instance {
+                    finish_outcome(
+                        store,
+                        &key,
+                        &BridgeOutcome::InvalidPayload(
+                            "Forgejo instance changed since admission".into(),
+                        ),
+                    )?;
+                    continue;
+                }
+                if let Err(error) =
+                    crate::admission::forgejo_repository(cfg, &client, &repo, repository_id).await
+                {
+                    finish_outcome(store, &key, &forgejo_read_error(error))?;
+                    continue;
+                }
+                if matches!(*event, ForgejoEvent::IssueComment { .. }) {
+                    comment_from_forgejo(cfg, store, &repo, &event).await
                 } else {
-                    BridgeOutcome::InvalidPayload("Forgejo instance changed since admission".into())
+                    from_forgejo(cfg, store, &repo, &event).await
                 }
             }
             Err(_) => BridgeOutcome::InvalidPayload("invalid persisted bridge delivery".into()),

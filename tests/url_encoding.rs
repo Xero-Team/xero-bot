@@ -230,7 +230,7 @@ async fn installation_repositories_follows_the_wrapped_pagination_shape() {
                 .insert_header("Link", format!("<{next}>; rel=\"next\"").as_str())
                 .set_body_json(json!({
                     "total_count": 2,
-                    "repositories": [{"full_name": "octocat/one"}],
+                    "repositories": [{"id":1,"owner":{"id":10},"full_name": "octocat/one"}],
                 })),
         )
         .mount(&server)
@@ -240,13 +240,19 @@ async fn installation_repositories_follows_the_wrapped_pagination_shape() {
         .and(query_param("page", "2"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "total_count": 2,
-            "repositories": [{"full_name": "octocat/two"}],
+            "repositories": [{"id":2,"owner":{"id":10},"full_name": "octocat/two"}],
         })))
         .mount(&server)
         .await;
 
     let gh = client_for(&server);
-    let repos = Client::installation_repositories_via(&gh).await.unwrap();
+    let mut cfg = xero_bot::config::Config::from_env();
+    cfg.bot_access_policy = json!({"github":[
+        {"installation_id":7,"owner_id":10,"repository_id":1,"repository":"octocat/one"},
+        {"installation_id":7,"owner_id":10,"repository_id":2,"repository":"octocat/two"}
+    ]})
+    .to_string();
+    let repos = gh.admitted_repositories(&cfg, 7).await.unwrap();
     assert_eq!(repos, vec!["octocat/one", "octocat/two"]);
 }
 

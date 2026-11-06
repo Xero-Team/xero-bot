@@ -282,12 +282,15 @@ pub async fn sweep(cfg: &Config) -> String {
         };
         // `/app/installations` does carry app_slug, but resolve it centrally so
         // every code path agrees on our identity.
+        if crate::admission::github_installation(cfg, inst_id).is_err() {
+            continue;
+        }
         let Ok(gh) = crate::github::Client::installation_resolved(cfg, inst_id).await else {
             errors += 1;
             continue;
         };
 
-        let repos = match crate::github::Client::installation_repositories_via(&gh).await {
+        let repos = match gh.admitted_repositories(cfg, inst_id).await {
             Ok(r) => r,
             Err(_) => {
                 errors += 1;

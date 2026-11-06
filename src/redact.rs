@@ -219,6 +219,7 @@ mod tests {
     /// A Config with everything empty, for tests that set two or three fields.
     fn blank_config() -> Config {
         Config {
+            bot_access_policy: "{}".into(),
             app_id: String::new(),
             private_key_pem: None,
             webhook_secret: String::new(),
