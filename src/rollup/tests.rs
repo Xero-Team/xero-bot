@@ -365,6 +365,37 @@ fn required_checks_reject_wrong_sha_spoofed_app_partial_and_skipped_results() {
     );
 }
 #[test]
+fn required_checks_cannot_hide_duplicate_named_jobs() {
+    let sha = "c".repeat(40);
+    let required = vec!["test".into()];
+    // Matrix jobs (or separate workflows) may share a name. Their IDs order
+    // creation, not retries; all of these jobs belong to the current runs.
+    for conclusion in ["failure", "skipped", "cancelled", "neutral"] {
+        let checks = vec![
+            json!({"id":1,"name":"test","head_sha":sha,"app":{"slug":"github-actions"},"conclusion":conclusion}),
+            json!({"id":2,"name":"test","head_sha":sha,"app":{"slug":"github-actions"},"conclusion":"success"}),
+        ];
+        assert_eq!(
+            engine::github_verdict(&checks, &required, &sha),
+            engine::Verdict::Failed,
+            "{conclusion}"
+        );
+    }
+    let mut checks = vec![
+        json!({"id":1,"name":"test","head_sha":sha,"app":{"slug":"github-actions"},"conclusion":null}),
+        json!({"id":2,"name":"test","head_sha":sha,"app":{"slug":"github-actions"},"conclusion":"success"}),
+    ];
+    assert_eq!(
+        engine::github_verdict(&checks, &required, &sha),
+        engine::Verdict::Pending
+    );
+    checks[0]["conclusion"] = json!("success");
+    assert_eq!(
+        engine::github_verdict(&checks, &required, &sha),
+        engine::Verdict::Green
+    );
+}
+#[test]
 fn durable_restart_retains_approval_candidate_and_fallback_progress() {
     let dir = crate::forgejo::refs::Scratch::new().unwrap();
     let mut r = repo();
@@ -653,6 +684,93 @@ async fn github_candidate_requires_push_run_on_its_own_branch() {
         .mount(&server)
         .await;
     Mock::given(method("GET")).and(path("/repos/team/repo/actions/runs/3/jobs")).respond_with(ResponseTemplate::new(200).set_body_json(json!({"total_count":1,"jobs":[{"id":4,"run_id":3,"head_sha":b.tip,"name":"test","conclusion":"success"}]}))).mount(&server).await;
+    assert_eq!(
+        engine::github_ci(&gh, "team/repo", &b.tip, &b.branch, &["test".into()])
+            .await
+            .unwrap(),
+        engine::Verdict::Green
+    );
+}
+
+#[tokio::test]
+async fn github_ci_checks_duplicate_jobs_across_latest_workflows() {
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let server = MockServer::start().await;
+    let gh = crate::github::Client {
+        crab: crate::github::client_builder()
+            .base_uri(server.uri())
+            .unwrap()
+            .personal_token("test")
+            .build()
+            .unwrap(),
+        app_slug: "bot".into(),
+    };
+    let b = batch();
+    Mock::given(method("GET"))
+        .and(path("/repos/team/repo/actions/runs"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(
+            json!({"total_count":3,"workflow_runs":[
+                {"id":1,"workflow_id":1,"head_sha":b.tip,"head_branch":b.branch,"event":"push"},
+                {"id":2,"workflow_id":1,"head_sha":b.tip,"head_branch":b.branch,"event":"push"},
+                {"id":3,"workflow_id":2,"head_sha":b.tip,"head_branch":b.branch,"event":"push"}
+            ]}),
+        ))
+        .mount(&server)
+        .await;
+    // Older workflow runs must never be fetched, even after all current jobs pass.
+    Mock::given(method("GET"))
+        .and(path("/repos/team/repo/actions/runs/1/jobs"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+    for (run, job, conclusion) in [(2, 20, "failure"), (3, 30, "success")] {
+        Mock::given(method("GET"))
+            .and(path(format!("/repos/team/repo/actions/runs/{run}/jobs")))
+            .and(query_param("filter", "latest"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"total_count":1,"jobs":[
+                    {"id":job,"run_id":run,"head_sha":b.tip,"name":"test","conclusion":conclusion}
+                ]})),
+            )
+            .mount(&server)
+            .await;
+    }
+    assert_eq!(
+        engine::github_ci(&gh, "team/repo", &b.tip, &b.branch, &["test".into()])
+            .await
+            .unwrap(),
+        engine::Verdict::Failed
+    );
+    Mock::given(method("GET"))
+        .and(path("/repos/team/repo/actions/runs/2/jobs"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"total_count":2,"jobs":[
+                {"id":21,"run_id":2,"head_sha":b.tip,"name":"test","conclusion":null},
+                {"id":22,"run_id":2,"head_sha":b.tip,"name":"test","conclusion":"success"}
+            ]})),
+        )
+        .with_priority(2)
+        .mount(&server)
+        .await;
+    assert_eq!(
+        engine::github_ci(&gh, "team/repo", &b.tip, &b.branch, &["test".into()])
+            .await
+            .unwrap(),
+        engine::Verdict::Pending
+    );
+    Mock::given(method("GET"))
+        .and(path("/repos/team/repo/actions/runs/2/jobs"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"total_count":2,"jobs":[
+                {"id":21,"run_id":2,"head_sha":b.tip,"name":"test","conclusion":"success"},
+                {"id":22,"run_id":2,"head_sha":b.tip,"name":"test","conclusion":"success"}
+            ]})),
+        )
+        .with_priority(1)
+        .mount(&server)
+        .await;
     assert_eq!(
         engine::github_ci(&gh, "team/repo", &b.tip, &b.branch, &["test".into()])
             .await

@@ -20,19 +20,24 @@ pub fn github_verdict(checks: &[Value], required: &[String], sha: &str) -> Verdi
     }
     let mut pending = false;
     for name in required {
-        let check = checks
-            .iter()
-            .filter(|v| {
-                v["name"] == *name && v["head_sha"] == sha && v["app"]["slug"] == "github-actions"
-            })
-            .max_by_key(|v| v["id"].as_i64().unwrap_or(0));
-        match check.and_then(|v| v["conclusion"].as_str()) {
-            Some("success") => (),
-            Some(
-                "failure" | "timed_out" | "cancelled" | "action_required" | "skipped" | "neutral",
-            ) => return Verdict::Failed,
-            _ => pending = true,
+        // github_ci already selects the newest run of each workflow and its
+        // latest execution. Equal job names may be concurrent matrix jobs or
+        // jobs from different workflows, so a larger ID cannot supersede them.
+        let mut found = false;
+        for check in checks.iter().filter(|v| {
+            v["name"] == *name && v["head_sha"] == sha && v["app"]["slug"] == "github-actions"
+        }) {
+            found = true;
+            match check["conclusion"].as_str() {
+                Some("success") => (),
+                Some(
+                    "failure" | "timed_out" | "cancelled" | "action_required" | "skipped"
+                    | "neutral",
+                ) => return Verdict::Failed,
+                _ => pending = true,
+            }
         }
+        pending |= !found;
     }
     if pending {
         Verdict::Pending

@@ -377,12 +377,18 @@ pub async fn forgejo(
     let mut repo = store
         .rollup_load(&name_gh)?
         .unwrap_or_else(|| Repository::new(&name_gh, id, installation));
+    if repo.id != id || repo.installation != installation {
+        return Err("repository binding changed".into());
+    }
     let p = policy(&gh, &repo).await?;
     let local = fj.repository_config(name).await?.rollup?;
     if !local.enabled || local.reviewers != p.reviewers {
         return Err("both repositories must enable rollup with identical reviewer mappings".into());
     }
     if matches!(command, Command::Queue) {
+        // Register Forgejo-first projects too. The worker verifies current
+        // GitHub visibility before publishing a newly created snapshot.
+        store.rollup_save(&repo)?;
         return Ok(status(&repo, cfg));
     }
     forgejo_write(fj, name, actor).await?;

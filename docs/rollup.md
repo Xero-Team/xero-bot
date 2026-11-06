@@ -50,6 +50,8 @@ a verified additional email on the Forgejo bot to attribute the same SHA on both
 providers. Source commit authors and existing history remain unchanged.
 
 GitHub Actions must pass every configured job on the candidate's **push** run.
+If matrix jobs or separate workflows share a configured job name, every matching
+job in the latest workflow executions must pass; one success cannot hide a failure.
 If GitHub fails, its API is unavailable, or its pending time exceeds
 `fallback_after_seconds`, the bot pushes the **same commit** to Forgejo. Every job
 of every configured Forgejo workflow must succeed. Either complete provider is
