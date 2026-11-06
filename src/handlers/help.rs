@@ -259,7 +259,13 @@ pub(crate) fn repository_help(
         session,
     ));
     text.push_str(&automatic(&snapshot.config, cfg, lang));
-    if cfg.rollup_enabled {
+    if cfg.rollup_enabled
+        && snapshot
+            .config
+            .rollup
+            .as_ref()
+            .is_ok_and(|policy| policy.enabled)
+    {
         text.push_str(lang.pick("\nDurable rollup: r+ approves the current SHA; r+ rollup allows batching. Web Approve does not enqueue. GitHub CI falls back to Forgejo; either complete suite may pass on the same candidate.\n", "\n持久化 Rollup：r+ 批准当前 SHA，r+ rollup 允许组批。网页 Approve 不自动入队。GitHub CI 失败后交由 Forgejo，同一候选在任一侧完整通过即可合并。\n"));
     } else {
         text.push_str(&super::queue_note(cfg.merge_queue_enabled, lang));

@@ -57,8 +57,10 @@ Bridge 将通过测试的提交同步到 Forgejo
 
 ## 启用项目
 
-1. 部署新版，保留 `XERO_DATA_DIR`，设置 `ROLLUP_ENABLED=true`、`PUBLIC_URL`。
-   仓库不启用 `[rollup]` 时继续使用旧队列。
+1. 部署新版，保留 `XERO_DATA_DIR`，设置 `PUBLIC_URL`。服务默认提供 Rollup 能力，
+   每个项目在 `.github/xero-bot.toml` 中通过 `[rollup].enabled` 控制启用。
+   未配置或设为 `false` 的项目继续使用旧队列。`ROLLUP_ENABLED=false` 会在
+   部署层关闭 Rollup 功能；迁移旧部署时移除原有的 false 覆盖。
 2. 双方默认分支配置普通仓库 bridge、固定仓库 ID、`sync_refs=true`。
    切换前清空旧队列；旧队列仍有 testing 标签时新队列不会开始。
 3. 在双方按实际项目修改 [配置示例](../examples/rollup.toml)，保持账号映射和

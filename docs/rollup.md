@@ -70,9 +70,12 @@ merged through Forgejo’s native API, preserving the same commit.
 
 ## Enable a project
 
-1. Deploy this version, preserve `XERO_DATA_DIR`, and set `ROLLUP_ENABLED=true` and
-   `PUBLIC_URL=https://bot.example.com`. Existing projects keep their legacy queue
-   unless they explicitly enable `[rollup]`.
+1. Deploy this version, preserve `XERO_DATA_DIR`, and set
+   `PUBLIC_URL=https://bot.example.com`. Rollup service support is enabled by
+   default. Each project controls activation through `[rollup].enabled` in its
+   `.github/xero-bot.toml`; an omitted or false value keeps the legacy queue.
+   `ROLLUP_ENABLED=false` disables Rollup service support across the deployment;
+   remove an old false override when migrating an existing deployment.
 2. Configure the ordinary-repository bridge on **both** default branches with
    pinned repository IDs and `sync_refs=true`. Drain the legacy queue before
    switching; an existing testing label blocks the new queue.

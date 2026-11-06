@@ -15,6 +15,88 @@ fn origin() -> Origin {
 fn repo() -> Repository {
     Repository::new("team/repo", 1, 2)
 }
+
+#[tokio::test]
+async fn project_toml_selects_rollup_and_help_reports_the_effective_mode() {
+    use base64::Engine;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let mut cfg = crate::config::Config::from_env();
+    cfg.rollup_enabled = true;
+    cfg.merge_queue_enabled = true;
+    for (index, enabled) in [None, Some(false), Some(true)].into_iter().enumerate() {
+        let server = MockServer::start().await;
+        let name = format!("team/project-{index}");
+        let id = 9_100_000 + index as i64;
+        let installation = 9_100_100;
+        let gh = crate::github::Client {
+            crab: crate::github::client_builder()
+                .base_uri(server.uri())
+                .unwrap()
+                .personal_token("test")
+                .build()
+                .unwrap(),
+            app_slug: "bot".into(),
+        };
+        Mock::given(method("GET"))
+            .and(path(format!("/repos/{name}")))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"id":id,"default_branch":"main"})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/repos/{name}/git/ref/heads/main")))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"object":{"sha":"a".repeat(40)}})),
+            )
+            .mount(&server)
+            .await;
+        let response = match enabled {
+            None => ResponseTemplate::new(404),
+            Some(value) => {
+                let text = format!("[rollup]\nenabled={value}\nrequired_checks=['test']\nforgejo_required_checks=['ci.yml']\n");
+                ResponseTemplate::new(200).set_body_json(json!({"type":"file","encoding":"base64","sha":"b".repeat(40),"content":base64::engine::general_purpose::STANDARD.encode(text)}))
+            }
+        };
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/repos/{name}/contents/.github/xero-bot.toml"
+            )))
+            .respond_with(response)
+            .mount(&server)
+            .await;
+        assert_eq!(
+            ingress::enabled_for(&gh, &cfg, &name, installation)
+                .await
+                .unwrap(),
+            enabled == Some(true)
+        );
+        let state = crate::config::cache::RepositoryConfigCache::shared()
+            .load(
+                &gh,
+                crate::config::cache::RepositoryKey {
+                    installation_id: installation,
+                    repository_id: id,
+                },
+                &name,
+            )
+            .await;
+        for lang in [crate::lang::Lang::En, crate::lang::Lang::Zh] {
+            let help = crate::handlers::help::repository_help(
+                state.snapshot().unwrap(),
+                &cfg,
+                lang,
+                &crate::handlers::help::HelpSession::Inactive,
+            );
+            assert_eq!(
+                help.contains(lang.pick("Durable rollup:", "持久化 Rollup：")),
+                enabled == Some(true)
+            );
+        }
+    }
+}
+
 fn batch() -> Batch {
     Batch {
         id: 1,

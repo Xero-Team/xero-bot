@@ -572,6 +572,14 @@ fn shipped_defaults_and_opt_in_examples_are_valid_and_separate() {
 
     let production = parse(include_str!("../.github/xero-bot.toml"));
     assert!(production.problems().is_empty());
+    let rollup = production.rollup.as_ref().unwrap();
+    assert!(rollup.enabled && rollup.public);
+    assert_eq!(rollup.required_checks, ["fmt, clippy, test"]);
+    assert_eq!(rollup.forgejo_required_checks, ["ci.yml"]);
+    assert_eq!(
+        rollup.reviewers.get("thefool").map(String::as_str),
+        Some("YUZHEthefool")
+    );
     let forgejo = production.forgejo.unwrap();
     assert!(!forgejo.enabled);
     assert_eq!(forgejo.destination.as_deref(), Some("xero-team/xero-bot"));

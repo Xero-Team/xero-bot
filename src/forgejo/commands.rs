@@ -960,6 +960,7 @@ mod tests {
 
     fn cfg() -> Config {
         let mut cfg = Config::from_env();
+        cfg.rollup_enabled = false; // Legacy command handlers; rollup is tested separately.
         cfg.forgejo_bot_name = "xero-review".into();
         cfg.forgejo_base_url = "https://forgejo.invalid".into();
         cfg.forgejo_token = "test-token".into();

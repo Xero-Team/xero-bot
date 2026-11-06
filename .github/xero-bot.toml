@@ -48,3 +48,17 @@ sync_refs = true
 [forgejo.mirror]
 enabled = false
 destination = "xero-team/xero-bot"
+
+# 项目合并队列开关；两侧默认分支保持相同配置。
+[rollup]
+enabled = true
+public = true
+max_batch = 4
+collect_seconds = 60
+timeout_seconds = 7200
+fallback_after_seconds = 900
+required_checks = ["fmt, clippy, test"]
+forgejo_required_checks = ["ci.yml"]
+
+[rollup.reviewers]
+thefool = "YUZHEthefool"

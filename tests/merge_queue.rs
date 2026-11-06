@@ -19,6 +19,7 @@ const REPO: &str = "octocat/hello";
 /// Merge-queue config pointed at nothing (octocrab is redirected per-test).
 fn queue_cfg() -> Config {
     let mut c = Config::from_env();
+    c.rollup_enabled = false; // Explicitly select the legacy staging queue.
     c.app_id = "12345".into();
     c.webhook_secret = "whsec".into();
     c.bot_name = "xero-review".into();
