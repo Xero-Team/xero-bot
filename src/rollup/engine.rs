@@ -694,6 +694,7 @@ async fn drive(gh: &Client, cfg: &Config, store: &Store, repo: &mut Repository) 
         audit_pr: None,
         audit_attempted: false,
         cleaned: false,
+        forgejo_recorded: false,
         github_ci: "pending".into(),
         forgejo_ci: "not_started".into(),
         fallback_started: None,
@@ -726,17 +727,32 @@ async fn drive(gh: &Client, cfg: &Config, store: &Store, repo: &mut Repository) 
     repo.batches.iter_mut().find(|b| b.id == id).unwrap().state = "testing".into();
     Ok(())
 }
-async fn cleanup(gh: &Client, cfg: &Config, repo: &mut Repository) -> Result<()> {
-    let Some(index) = repo
-        .batches
-        .iter()
-        .position(|b| b.finished.is_some() && !b.cleaned)
-    else {
+async fn cleanup(gh: &Client, cfg: &Config, store: &Store, repo: &mut Repository) -> Result<()> {
+    let Some(index) = repo.batches.iter().position(|b| {
+        b.finished.is_some() && (!b.cleaned || (b.state == "merged" && !b.forgejo_recorded))
+    }) else {
         return Ok(());
     };
     let batch = repo.batches[index].clone();
     if !internal_branch(&batch.branch) {
         return Err("refusing to clean a non-internal branch".into());
+    }
+    if batch.state == "merged" && !batch.forgejo_recorded {
+        let key = crate::config::cache::RepositoryKey {
+            installation_id: repo.installation,
+            repository_id: repo.id,
+        };
+        for entry in &batch.approvals {
+            let (fj, name, number) =
+                crate::forgejo::bridge::rollup_peer(gh, cfg, store, &repo.name, key, entry.number)
+                    .await?
+                    .ok_or("merged PR is missing its Forgejo binding")?;
+            record_forgejo_merge(&fj, &name, number, entry, &batch).await?;
+        }
+        repo.batches[index].forgejo_recorded = true;
+    }
+    if batch.cleaned {
+        return Ok(());
     }
     if let Some(number) = batch.audit_pr {
         let pr = gh.get_pr(&repo.name, number).await?;
@@ -753,6 +769,10 @@ async fn cleanup(gh: &Client, cfg: &Config, repo: &mut Repository) -> Result<()>
     }
     match gh.delete_branch_ref(&repo.name, &batch.branch).await {
         Ok(()) | Err(GhError::Api { status: 404, .. }) => (),
+        Err(GhError::Api {
+            status: 422,
+            message,
+        }) if message == "Reference does not exist" => (),
         Err(e) => return Err(e.into()),
     }
     if batch.fallback_started.is_some() {
@@ -800,7 +820,7 @@ async fn pump_repository(cfg: &Config, store: &Store, snapshot: Repository) -> R
         .ok_or("queue disappeared")?;
     let result = match Client::installation_resolved(cfg, repo.installation).await {
         Ok(gh) => {
-            if let Err(e) = cleanup(&gh, cfg, &mut repo).await {
+            if let Err(e) = cleanup(&gh, cfg, store, &mut repo).await {
                 tracing::warn!("rollup cleanup: {}", crate::redact::scrub(&e.to_string()));
             }
             match tokio::time::timeout(
@@ -858,4 +878,34 @@ pub(crate) fn reconcile_duplicates(repo: &mut Repository) {
             newest.insert(e.number, i);
         }
     }
+}
+
+/// Code was already fast-forwarded on GitHub and copied by the bridge. Record
+/// that fact without creating another merge commit. Forgejo's native manual
+/// merge endpoint verifies MergeCommitID is contained in the PR's base branch.
+pub(crate) async fn record_forgejo_merge(
+    fj: &crate::forgejo::ForgejoClient,
+    repo: &str,
+    number: i64,
+    entry: &Entry,
+    batch: &Batch,
+) -> Result<()> {
+    let pr = fj.get(&format!("/repos/{repo}/pulls/{number}")).await?;
+    if pr["merged"] == true {
+        return Ok(());
+    }
+    if pr["head"]["sha"] != entry.head || pr["base"]["ref"] != batch.base_branch {
+        return Err(
+            "Forgejo PR changed after integration; refusing to mark another revision merged".into(),
+        );
+    }
+    fj.post(
+        &format!("/repos/{repo}/pulls/{number}/merge"),
+        json!({
+            "Do":"manually-merged", "MergeCommitID":batch.tip, "head_commit_id":entry.head,
+            "force_merge":false, "delete_branch_after_merge":false
+        }),
+    )
+    .await?;
+    Ok(())
 }

@@ -133,6 +133,8 @@ pub struct Batch {
     pub audit_pr: Option<i64>,
     pub audit_attempted: bool,
     pub cleaned: bool,
+    #[serde(default)]
+    pub forgejo_recorded: bool,
     pub github_ci: String,
     pub forgejo_ci: String,
     pub fallback_started: Option<i64>,

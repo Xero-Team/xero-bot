@@ -46,6 +46,8 @@ Forgejo 必须通过全部指定 workflow 的所有 job。任一侧完整通过�
 快进到经过测试的提交。主分支变化就重建重测。两侧都失败则二分批次，后续批次
 基于实际合入后的主分支测试；单 PR 失败等待修复后重新批准，或 `retry`。
 API 故障自动退避重试，测试超时等待手动重试。测试分支会清理，审计 PR 和历史保留。
+Bridge 将通过测试的提交同步到 Forgejo
+目标分支后，机器人调用原生接口将对应 PR 标记为已合并，不再产生新的合并提交。
 
 ## 启用项目
 
@@ -56,7 +58,9 @@ API 故障自动退避重试，测试超时等待手动重试。测试分支会�
 3. 在双方按实际项目修改 [配置示例](../examples/rollup.toml)，保持账号映射和
    Forgejo workflow 名称一致。每个项目独立配置，不复用其他项目的仓库 ID。
 4. 两侧 CI 开启 `automation/xero/**` 的 push 触发。GitHub App 需要 contents、
-   pull requests、commit statuses 写权限和 Actions 读权限；Forgejo 17 的 bot 需要仓库管理员权限，才能查询其他审阅者的实时权限。
+   pull requests、commit statuses 写权限和 Actions 读权限；Forgejo 17 的 bot 需要
+   仓库管理员权限，才能查询其他审阅者的实时权限。Forgejo 仓库还需开启“允许将
+   PR 标记为手动合并”（`allow_manual_merge`），以便在测试提交同步后记录合并状态。
 5. 分支保护要求该 App 的 `xero/rollup` 检查。若同时强制要求 GitHub 原始 CI，
    Forgejo 通过后仍会被 GitHub 失败挡住。机器人不会修改或绕过分支保护，
    其他保护规则应保留。

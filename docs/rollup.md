@@ -57,7 +57,9 @@ commit without force. If the base moved, it rebuilds and retests. If both provid
 fail, a batch splits into two smaller groups; each is retested on the then-current
 base. A singleton failure waits for a fix/reapproval or `retry`. API failures back
 off, and a timed-out run waits for `retry`. Finished candidate refs are cleaned up;
-audit PRs and the durable build history remain.
+audit PRs and the durable build history remain. Once the bridge has copied the tested
+commit into Forgejo’s target branch, the bot records the paired PRs as manually
+merged through Forgejo’s native API, preserving the same commit.
 
 ## Enable a project
 
@@ -72,7 +74,10 @@ audit PRs and the durable build history remain.
    per project; never reuse another project's repository IDs.
 4. Allow Actions `push` events on `automation/xero/**` in both CI files. The App
    needs contents, pull requests and commit statuses write, and Actions read;
-   Forgejo's bot needs repository admin permission to query other reviewers' live permissions (Forgejo 17) and Actions access.
+   Forgejo's bot needs repository admin permission to query other reviewers' live
+   permissions (Forgejo 17) and Actions access. Enable Forgejo's “Allow marking
+   pull requests as manually merged” repository setting (`allow_manual_merge`)
+   so the bot can record PR completion after the tested commit is synchronized.
 5. Align branch protection with the policy: require the App's `xero/rollup` gate.
    Keeping GitHub-only CI as an additional required gate will also require it to
    pass, so it prevents the requested Forgejo fallback merge. The bot does not

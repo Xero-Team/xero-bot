@@ -33,6 +33,7 @@ fn batch() -> Batch {
         audit_pr: None,
         audit_attempted: false,
         cleaned: false,
+        forgejo_recorded: false,
         github_ci: "failed".into(),
         forgejo_ci: "pending".into(),
         fallback_started: Some(now()),
@@ -541,4 +542,66 @@ async fn github_candidate_requires_push_run_on_its_own_branch() {
             .unwrap(),
         engine::Verdict::Green
     );
+}
+
+#[tokio::test]
+async fn forgejo_completion_records_existing_commit_and_reconciles_restarts() {
+    use wiremock::matchers::{body_partial_json, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let server = MockServer::start().await;
+    let fj = crate::forgejo::ForgejoClient::new(&server.uri(), "test-token").unwrap();
+    let mut r = repo();
+    approve(&mut r, 1, &"a".repeat(40), 10);
+    let e = &r.entries[0];
+    let b = batch();
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/team/repo/pulls/1"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"merged":false,"head":{"sha":e.head},"base":{"ref":"main"}})),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("POST")).and(path("/api/v1/repos/team/repo/pulls/1/merge"))
+        .and(body_partial_json(json!({"Do":"manually-merged","MergeCommitID":b.tip,"head_commit_id":e.head,"force_merge":false})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({}))).expect(1).mount(&server).await;
+    engine::record_forgejo_merge(&fj, "team/repo", 1, e, &b)
+        .await
+        .unwrap();
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/team/repo/pulls/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"merged":true})))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    engine::record_forgejo_merge(&fj, "team/repo", 1, e, &b)
+        .await
+        .unwrap();
+}
+#[tokio::test]
+async fn forgejo_completion_cannot_close_a_changed_revision() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let server = MockServer::start().await;
+    let fj = crate::forgejo::ForgejoClient::new(&server.uri(), "test-token").unwrap();
+    let mut r = repo();
+    approve(&mut r, 1, &"a".repeat(40), 10);
+    Mock::given(method("GET"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"merged":false,"head":{"sha":"new"},"base":{"ref":"main"}})),
+        )
+        .mount(&server)
+        .await;
+    assert!(
+        engine::record_forgejo_merge(&fj, "team/repo", 1, &r.entries[0], &batch())
+            .await
+            .is_err()
+    );
+    assert!(server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .all(|r| r.method == "GET"));
 }
