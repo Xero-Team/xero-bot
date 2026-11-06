@@ -611,6 +611,18 @@ async fn drive(gh: &Client, cfg: &Config, store: &Store, repo: &mut Repository) 
                 } else {
                     repo.entries[i].state = "waiting".into();
                     repo.entries[i].detail = "等待同步、权限或 API 恢复".into();
+                    // Remote failures must reach the repository backoff. Keeping
+                    // only an entry-level waiting state would poll an exhausted
+                    // installation every 15 seconds and never increase its delay.
+                    if error.downcast_ref::<GhError>().is_some()
+                        || error
+                            .downcast_ref::<crate::forgejo::ForgejoError>()
+                            .is_some()
+                        || msg.contains("API returned")
+                        || msg.contains("github api returned")
+                    {
+                        return Err(error);
+                    }
                     tracing::warn!(
                         "rollup admission {}: {}",
                         repo.name,
