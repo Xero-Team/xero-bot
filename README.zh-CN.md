@@ -16,6 +16,8 @@ Xero-Team 的组织级 GitHub App 机器人。Rust 实现,主服务与离线状�
 [触发与升级指南](docs/triggers.zh-CN.md)、[完整配置参考 example.toml](example.toml)、[完整默认示例](.github/xero-bot.toml)、单独的
 [显式启用示例](examples/triggers-opt-in.toml)和[跨功能验收](docs/issue-18-acceptance.md)。
 
+支持按项目隔离、绑定提交 SHA 的 Rollup 队列、GitHub → Forgejo CI 回退与极简双语网页，需显式启用：[Rollup 指南](docs/rollup.zh-CN.md)。
+
 ## 命令参考
 
 评论中发出(大小写不敏感,一条评论可含多条命令,代码块内的内容会被忽略)。

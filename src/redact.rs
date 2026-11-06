@@ -248,6 +248,8 @@ mod tests {
             rebase_check_delay_secs: 0,
             rebase_sweep_enabled: false,
             rebase_sweep_interval_secs: 0,
+            public_url: "https://bot.example".into(),
+            rollup_enabled: false,
             merge_queue_enabled: false,
             merge_queue_staging_branch: String::new(),
             merge_queue_max_batch: 0,

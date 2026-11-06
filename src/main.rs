@@ -213,6 +213,18 @@ async fn main() {
         }
     });
 
+    if cfg.rollup_enabled {
+        let queue_cfg = cfg.clone();
+        let store = Arc::clone(&triggers.store);
+        tokio::spawn(async move {
+            loop {
+                if let Err(error) = xero_bot::rollup::engine::pump_all(&queue_cfg, &store).await {
+                    tracing::error!("rollup worker: {error}");
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+            }
+        });
+    }
     let port = cfg.port;
     let bot_name = cfg.bot_name.clone();
     let state = AppState {
@@ -223,7 +235,12 @@ async fn main() {
     };
 
     let app = Router::new()
-        .route("/", get(health))
+        .merge(xero_bot::rollup::web::routes(
+            xero_bot::rollup::web::WebState {
+                cfg: state.cfg.clone(),
+                store: Arc::clone(&state.triggers.store),
+            },
+        ))
         .route("/health", get(health))
         .route("/webhook", post(webhook))
         .route("/webhook/forgejo", post(forgejo_webhook))

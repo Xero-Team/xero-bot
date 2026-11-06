@@ -32,7 +32,7 @@ fn defaults_empty_partial_and_idle_only() {
         let cfg = parse(text);
         let c = cfg.comments.unwrap();
         assert_eq!(c.ttl_days, 30);
-        assert_eq!(CommandId::ALL.len(), 16);
+        assert_eq!(CommandId::ALL.len(), 19);
         for id in CommandId::ALL {
             assert_eq!(c.mode(id), id.default_mode());
             assert_ne!(c.mode(id), ManualMode::Disabled);

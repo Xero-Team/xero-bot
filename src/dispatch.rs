@@ -821,6 +821,12 @@ async fn execute_work_inner(cfg: &Config, work: Work) -> Result<(), String> {
             let gh = Client::installation_resolved(cfg, installation_id)
                 .await
                 .map_err(|e| format!("installation client: {e}"))?;
+            if crate::rollup::ingress::enabled_for(&gh, cfg, &repo, installation_id)
+                .await
+                .map_err(|e| e.to_string())?
+            {
+                return Ok(());
+            }
             let status =
                 crate::merge_queue::handle_review(&gh, cfg, &repo, pr_number, &state, &reviewer)
                     .await;
@@ -836,6 +842,12 @@ async fn execute_work_inner(cfg: &Config, work: Work) -> Result<(), String> {
         } => {
             let gh = Client::installation(cfg, installation_id, "")
                 .map_err(|e| format!("installation client: {e}"))?;
+            if crate::rollup::ingress::enabled_for(&gh, cfg, &repo, installation_id)
+                .await
+                .map_err(|e| e.to_string())?
+            {
+                return Ok(());
+            }
             let status = crate::merge_queue::handle_pr_closed(&gh, cfg, &repo, pr_number).await;
             tracing::info!("merge queue closed {repo}#{pr_number}: {status}");
             Ok(())

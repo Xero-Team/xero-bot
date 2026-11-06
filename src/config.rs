@@ -93,6 +93,9 @@ pub struct Config {
     /// PRs — behavior no deployment should gain silently. Everything the queue does
     /// is gated on this, including the new webhook routes.
     pub merge_queue_enabled: bool,
+    /// Durable queue replaces the legacy driver when enabled. Each repository must opt in.
+    pub rollup_enabled: bool,
+    pub public_url: String,
     /// The branch PR heads are merged into, one batch at a time.
     pub merge_queue_staging_branch: String,
     /// Upper bound on one batch; the queue takes PRs in ascending number.
@@ -279,6 +282,8 @@ impl Config {
             idle_workflows_poll_interval_secs: int_cfg("IDLE_WORKFLOWS_POLL_INTERVAL_SECS", 60),
 
             merge_queue_enabled: bool_cfg("MERGE_QUEUE_ENABLED", false),
+            rollup_enabled: bool_cfg("ROLLUP_ENABLED", false),
+            public_url: cfg("PUBLIC_URL", "https://bot.thefool.chat"),
             merge_queue_staging_branch: cfg("MERGE_QUEUE_STAGING_BRANCH", "staging"),
             merge_queue_max_batch: int_cfg("MERGE_QUEUE_MAX_BATCH", 8) as usize,
             merge_queue_ci_timeout_secs: int_cfg("MERGE_QUEUE_CI_TIMEOUT_SECS", 7_200),

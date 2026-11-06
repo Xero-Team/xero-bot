@@ -465,6 +465,12 @@ pub async fn from_github(
     if github_self(gh, &payload["sender"]) {
         return BridgeOutcome::SelfAuthored;
     }
+    if payload["pull_request"]["head"]["ref"]
+        .as_str()
+        .is_some_and(crate::rollup::internal_branch)
+    {
+        return BridgeOutcome::Ignored("internal-rollup");
+    }
     let Some(item) = github_item(event, payload) else {
         return BridgeOutcome::Ignored("unsupported-github-event");
     };
@@ -634,6 +640,9 @@ pub async fn from_forgejo(
     let Some(item) = forgejo_item(event) else {
         return BridgeOutcome::Ignored("unsupported-forgejo-event");
     };
+    if item.is_pr && crate::rollup::internal_branch(&item.head) {
+        return BridgeOutcome::Ignored("internal-rollup");
+    }
     let client = match ForgejoClient::new(&cfg.forgejo_base_url, &cfg.forgejo_token) {
         Ok(client) => client,
         Err(error) => return forgejo_read_error(error),
@@ -987,7 +996,7 @@ fn policy_wait(state: &ConfigState) -> BridgeOutcome {
     }
 }
 
-pub(super) async fn authorize_forgejo(
+pub(crate) async fn authorize_forgejo(
     client: &ForgejoClient,
     cfg: &Config,
     repo: &str,
@@ -2112,3 +2121,89 @@ mod tests {
 #[cfg(test)]
 #[path = "bridge_tests.rs"]
 mod relay_tests;
+
+/// Reuse the bridge's bilateral, pinned repository authorization for queue ingress.
+pub(crate) async fn rollup_binding(
+    forgejo: &ForgejoClient,
+    cfg: &Config,
+    store: &Store,
+    repo: &str,
+    number: i64,
+) -> Result<(Client, String, i64, i64, Option<i64>), String> {
+    let local = forgejo
+        .repository_config(repo)
+        .await?
+        .forgejo_bridge
+        .map_err(|e| e.to_string())?;
+    gate(cfg, &local).map_err(|e| e.to_string())?;
+    let binding = resolve_binding(forgejo, cfg, repo, &local)
+        .await
+        .map_err(|e| e.to_string())?;
+    let gh = Client::installation_resolved(cfg, binding.installation_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    let key = RepositoryKey {
+        installation_id: binding.installation_id,
+        repository_id: binding.repository_id,
+    };
+    let other = github_policy(&gh, cfg, &binding.github_repo, key, repo)
+        .await
+        .map_err(|e| e.to_string())?;
+    matching_identities(
+        &local,
+        &other,
+        &binding.github_repo,
+        binding.repository_id,
+        binding.forgejo_repository_id,
+    )
+    .map_err(|e| e.to_string())?;
+    let scope = bridge_scope(
+        forgejo,
+        key,
+        binding.forgejo_repository_id,
+        &binding.github_repo,
+        repo,
+    );
+    let peer = store
+        .bridge_peer(&scope, "pull", "forgejo", number)
+        .map_err(|e| e.to_string())?;
+    Ok((
+        gh,
+        binding.github_repo,
+        binding.repository_id,
+        binding.installation_id,
+        peer,
+    ))
+}
+
+pub(crate) async fn rollup_peer(
+    gh: &Client,
+    cfg: &Config,
+    store: &Store,
+    repo: &str,
+    key: RepositoryKey,
+    number: i64,
+) -> Result<Option<(ForgejoClient, String, i64)>, String> {
+    let state = RepositoryConfigCache::shared().load(gh, key, repo).await;
+    let snapshot = state.snapshot().map_err(|e| e.to_string())?;
+    let policy = snapshot
+        .config
+        .forgejo_bridge
+        .as_ref()
+        .map_err(|e| e.to_string())?;
+    if !policy.enabled {
+        return Ok(None);
+    }
+    let destination = gate(cfg, policy).map_err(|e| e.to_string())?;
+    let forgejo =
+        ForgejoClient::new(&cfg.forgejo_base_url, &cfg.forgejo_token).map_err(|e| e.to_string())?;
+    let (id, _) = authorize_forgejo(&forgejo, cfg, destination, repo, key.repository_id, policy)
+        .await
+        .map_err(|e| e.to_string())?;
+    let scope = bridge_scope(&forgejo, key, id, repo, destination);
+    let peer = store
+        .bridge_peer(&scope, "pull", "github", number)
+        .map_err(|e| e.to_string())?
+        .ok_or("waiting for the paired Forgejo PR")?;
+    Ok(Some((forgejo, destination.to_string(), peer)))
+}

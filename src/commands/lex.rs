@@ -233,6 +233,14 @@ impl<'a> Lexer<'a> {
         }
 
         let end = self.take_while(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+        let end = if self.text[start..end].eq_ignore_ascii_case("rollup")
+            && self.peek_at(end) == Some('=')
+        {
+            self.chars.next();
+            self.take_while(|c| c.is_ascii_alphabetic())
+        } else {
+            end
+        };
         let word = &self.text[start..end];
         if word.eq_ignore_ascii_case("as") {
             self.push(Tok::As, start..end);

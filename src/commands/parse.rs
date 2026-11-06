@@ -361,6 +361,21 @@ impl<'a> Parser<'a> {
                 } else {
                     SourceForm::BareWord
                 };
+                if matches!(
+                    CommandId::from_name(&word),
+                    Some(CommandId::Rollup | CommandId::Try | CommandId::Retry)
+                ) {
+                    let cmd = match word.as_str() {
+                        "try" => Command::Try,
+                        "retry" => Command::Retry,
+                        "rollup" | "rollup=always" => Command::Rollup { enabled: true },
+                        _ => Command::Rollup { enabled: false },
+                    };
+                    if self.end_arguments("rollup/try/retry") {
+                        self.emit(cmd, start, source);
+                    }
+                    return;
+                }
                 if let Some(cmd) = nullary(&word) {
                     if self.strict
                         && (!self.at_boundary()
@@ -500,24 +515,39 @@ impl<'a> Parser<'a> {
         if has_as && !required {
             self.pos += 1;
         }
-        let target = if required || has_as || !self.at_boundary() {
-            // Plain r+ is valid only when it really has no target arguments.
-            let user = self.user_arg(verb);
-            let valid_end = self.end_arguments(verb);
-            match (user, valid_end) {
-                (Some(user), true) => Some(user),
-                _ => return,
+        let is_rollup = matches!(self.peek(), Some(Tok::Word(w)) if matches!(w.as_str(), "rollup" | "rollup=always" | "rollup=never" | "rollup-"));
+        let target = if required || has_as || (!self.at_boundary() && !is_rollup) {
+            match self.user_arg(verb) {
+                Some(user) => Some(user),
+                None => {
+                    self.skip_tail();
+                    return;
+                }
             }
         } else {
             None
         };
-        self.emit(
-            Command::Approve {
+        let rollup = match self.peek() {
+            Some(Tok::Word(w)) if matches!(w.as_str(), "rollup" | "rollup=always") => Some(true),
+            Some(Tok::Word(w)) if matches!(w.as_str(), "rollup=never" | "rollup-") => Some(false),
+            _ => None,
+        };
+        if rollup.is_some() {
+            self.pos += 1;
+        }
+        if !self.end_arguments(verb) {
+            return;
+        }
+        let command = match rollup {
+            Some(enabled) => Command::ApproveRollup {
+                on_behalf_of: target,
+                enabled,
+            },
+            None => Command::Approve {
                 on_behalf_of: target,
             },
-            start,
-            SourceForm::Symbol,
-        );
+        };
+        self.emit(command, start, SourceForm::Symbol);
     }
 
     /// Expand the ready/reviewer/cc shorthand with shared compound provenance.

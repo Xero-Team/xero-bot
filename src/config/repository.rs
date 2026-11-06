@@ -27,6 +27,9 @@ pub enum CommandId {
     Ping,
     Help,
     Queue,
+    Rollup,
+    Try,
+    Retry,
 }
 
 /// Single vocabulary shared with the parser. Sigils are tokenized separately.
@@ -52,10 +55,16 @@ pub const WORD_ALIASES: &[&str] = &[
     "relabel",
     "assign",
     "queue",
+    "rollup",
+    "rollup=always",
+    "rollup=never",
+    "rollup-",
+    "try",
+    "retry",
 ];
 
 impl CommandId {
-    pub const ALL: [Self; 16] = [
+    pub const ALL: [Self; 19] = [
         Self::Claim,
         Self::Unclaim,
         Self::Cc,
@@ -72,6 +81,9 @@ impl CommandId {
         Self::Ping,
         Self::Help,
         Self::Queue,
+        Self::Rollup,
+        Self::Try,
+        Self::Retry,
     ];
 
     /// Return the canonical TOML key used for diagnostics and policy lookup.
@@ -99,6 +111,9 @@ impl CommandId {
             Self::Ping => &["ping"],
             Self::Help => &["help", "commands"],
             Self::Queue => &["queue"],
+            Self::Rollup => &["rollup", "rollup=always", "rollup=never", "rollup-"],
+            Self::Try => &["try"],
+            Self::Retry => &["retry"],
         }
     }
 
@@ -117,7 +132,9 @@ impl CommandId {
             Self::Claim | Self::Unclaim | Self::Cc | Self::RequestReview | Self::Ready => {
                 ManualMode::NoMention
             }
-            Self::Approve | Self::Reject => ManualMode::AlwaysMention,
+            Self::Approve | Self::Reject | Self::Rollup | Self::Try | Self::Retry => {
+                ManualMode::AlwaysMention
+            }
             _ => ManualMode::MentionOnce,
         }
     }
@@ -126,7 +143,13 @@ impl CommandId {
     pub fn requires_pr(self) -> bool {
         matches!(
             self,
-            Self::Review | Self::Codeql | Self::Approve | Self::Reject
+            Self::Review
+                | Self::Codeql
+                | Self::Approve
+                | Self::Reject
+                | Self::Rollup
+                | Self::Try
+                | Self::Retry
         )
     }
 }
@@ -140,7 +163,10 @@ impl Command {
             Self::Cc { .. } => CommandId::Cc,
             Self::RequestReview { .. } => CommandId::RequestReview,
             Self::Ready => CommandId::Ready,
-            Self::Approve { .. } => CommandId::Approve,
+            Self::Approve { .. } | Self::ApproveRollup { .. } => CommandId::Approve,
+            Self::Rollup { .. } => CommandId::Rollup,
+            Self::Try => CommandId::Try,
+            Self::Retry => CommandId::Retry,
             Self::Reject => CommandId::Reject,
             Self::Review => CommandId::Review,
             Self::Codeql => CommandId::Codeql,
@@ -404,6 +430,7 @@ pub struct RepositoryConfig {
     pub idle: Domain<Option<Rules>>,
     pub forgejo: Domain<ForgejoMirrorConfig>,
     pub forgejo_bridge: Domain<ForgejoBridgeConfig>,
+    pub rollup: Domain<crate::rollup::Policy>,
 }
 
 /// Validated one-way GitHub -> Forgejo pull-mirror declaration.
@@ -465,6 +492,7 @@ struct Document {
     path_triggers: RawPaths,
     idle_workflows: Option<Rules>,
     forgejo: RawForgejo,
+    rollup: crate::rollup::Policy,
 }
 
 #[derive(Default, Deserialize)]
@@ -566,6 +594,9 @@ impl RepositoryConfig {
         if let Err(e) = &self.forgejo {
             problems.push(e);
         }
+        if let Err(e) = &self.rollup {
+            problems.push(e);
+        }
         if let Err(e) = &self.forgejo_bridge {
             problems.push(e);
         }
@@ -604,6 +635,7 @@ impl RepositoryConfig {
             idle,
             forgejo,
             forgejo_bridge,
+            rollup: doc.rollup.validate(),
         })
     }
 }

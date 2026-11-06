@@ -1,0 +1,16 @@
+# Add to .github/xero-bot.toml on BOTH repositories AFTER deploying the new bot.
+# Requires an enabled bridge with pinned repository IDs and sync_refs=true.
+[rollup]
+enabled = true
+public = false
+max_batch = 4
+collect_seconds = 60
+timeout_seconds = 7200
+fallback_after_seconds = 900
+# Exact GitHub Actions check names, all required on the same candidate SHA.
+required_checks = ["fmt, clippy, test"]
+# Forgejo workflow filenames; all jobs in every workflow must succeed.
+forgejo_required_checks = ["ci.yml"]
+# Explicit one-to-one Forgejo login -> GitHub login; identical on both sides.
+[rollup.reviewers]
+forgejo-maintainer = "github-maintainer"
