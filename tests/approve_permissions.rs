@@ -35,6 +35,7 @@ const REPO: &str = "octocat/hello";
 /// point of these tests is which side of the switch we are on.
 fn test_cfg(on_behalf: bool) -> Config {
     let mut c = Config::from_env();
+    c.rollup_enabled = false; // These tests exercise legacy approval reviews.
     c.app_id = "12345".into();
     c.private_key_pem = Some(TEST_KEY.into());
     c.webhook_secret = "whsec".into();

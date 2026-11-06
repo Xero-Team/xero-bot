@@ -33,6 +33,18 @@ pub fn manual_key(repository: i64, comment: i64, command: &crate::commands::Comm
         Approve { on_behalf_of } => {
             args = serde_json::json!(on_behalf_of.as_ref().map(|u| u.to_ascii_lowercase()))
         }
+        ApproveRollup {
+            on_behalf_of,
+            enabled,
+        } => {
+            args = serde_json::json!([
+                on_behalf_of.as_ref().map(|u| u.to_ascii_lowercase()),
+                enabled
+            ]);
+        }
+        Rollup { enabled } => {
+            args = serde_json::json!(enabled);
+        }
         Label { add, remove } => {
             let mut add = add.clone();
             let mut remove = remove.clone();

@@ -13,6 +13,8 @@ mod bridge;
 mod notification_migration;
 #[path = "notification_store.rs"]
 mod notifications;
+#[path = "rollup_store.rs"]
+mod rollup;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -100,6 +102,7 @@ impl Store {
             PRAGMA synchronous=FULL;
             PRAGMA foreign_keys=ON;
             BEGIN EXCLUSIVE;
+            CREATE TABLE IF NOT EXISTS rollup_repositories(name TEXT PRIMARY KEY, payload TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS trigger_meta(version INTEGER NOT NULL);
             INSERT INTO trigger_meta SELECT 1 WHERE NOT EXISTS(SELECT 1 FROM trigger_meta);
             CREATE TABLE IF NOT EXISTS inbox(

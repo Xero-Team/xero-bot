@@ -32,7 +32,7 @@ fn defaults_empty_partial_and_idle_only() {
         let cfg = parse(text);
         let c = cfg.comments.unwrap();
         assert_eq!(c.ttl_days, 30);
-        assert_eq!(CommandId::ALL.len(), 16);
+        assert_eq!(CommandId::ALL.len(), 19);
         for id in CommandId::ALL {
             assert_eq!(c.mode(id), id.default_mode());
             assert_ne!(c.mode(id), ManualMode::Disabled);
@@ -572,6 +572,14 @@ fn shipped_defaults_and_opt_in_examples_are_valid_and_separate() {
 
     let production = parse(include_str!("../.github/xero-bot.toml"));
     assert!(production.problems().is_empty());
+    let rollup = production.rollup.as_ref().unwrap();
+    assert!(rollup.enabled && rollup.public);
+    assert_eq!(rollup.required_checks, ["fmt, clippy, test"]);
+    assert_eq!(rollup.forgejo_required_checks, ["ci.yml"]);
+    assert_eq!(
+        rollup.reviewers.get("thefool").map(String::as_str),
+        Some("YUZHEthefool")
+    );
     let forgejo = production.forgejo.unwrap();
     assert!(!forgejo.enabled);
     assert_eq!(forgejo.destination.as_deref(), Some("xero-team/xero-bot"));

@@ -31,6 +31,7 @@ const REPO: &str = "octocat/hello";
 
 fn test_cfg() -> Config {
     let mut c = Config::from_env();
+    c.rollup_enabled = false; // Verify legacy command write outcomes.
     c.app_id = "12345".into();
     c.private_key_pem = Some(TEST_KEY.into());
     c.webhook_secret = "whsec".into();

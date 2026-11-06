@@ -183,6 +183,7 @@ async fn both_providers_issue_and_pr_lifecycle_deduplicate_and_reopen() {
                     &input,
                     "scope",
                     &[],
+                    identities(),
                 )
             };
             let (first, duplicate) = tokio::join!(run(), run());
@@ -287,7 +288,8 @@ async fn both_providers_issue_and_pr_lifecycle_deduplicate_and_reopen() {
                     "dest/repo",
                     &echo,
                     "scope",
-                    &[]
+                    &[],
+                    identities(),
                 )
                 .await,
                 Ok(BridgeOutcome::AlreadyCurrent)
@@ -329,7 +331,8 @@ async fn uncertain_create_survives_restart_and_only_verified_receipt_unblocks_it
         "source/repo",
         &item,
         "scope",
-        &[]
+        &[],
+        identities(),
     )
     .await
     .is_err());
@@ -346,7 +349,8 @@ async fn uncertain_create_survives_restart_and_only_verified_receipt_unblocks_it
             "source/repo",
             &item,
             "scope",
-            &[]
+            &[],
+            identities(),
         )
         .await,
         Err(BridgeOutcome::NeedsReconciliation)
@@ -388,7 +392,8 @@ async fn uncertain_create_survives_restart_and_only_verified_receipt_unblocks_it
             "source/repo",
             &item,
             "scope",
-            &[]
+            &[],
+            identities(),
         )
         .await,
         Ok(BridgeOutcome::Synced)
@@ -454,6 +459,7 @@ async fn partial_create_resumes_metadata_without_repeating_post_or_patching_sour
             &item,
             "scope",
             &[],
+            identities(),
         )
     };
     assert_eq!(run().await, Err(BridgeOutcome::Rejected(503)));
@@ -506,8 +512,18 @@ async fn comments_deduplicate_and_unknown_receipts_never_report_success() {
                 id: 13,
                 number: 4,
                 is_pr: false,
-                body: "hello".into(),
-                author: "alice".into(),
+                body: if target == Target::GitHub {
+                    "Hello @thefool, `@thefool` and @unmapped"
+                } else {
+                    "Hello @YUZHEthefool, `@YUZHEthefool` and @unmapped"
+                }
+                .into(),
+                author: if target == Target::GitHub {
+                    "thefool"
+                } else {
+                    "YUZHEthefool"
+                }
+                .into(),
             };
             for attempt in 0..2 {
                 let result = if target == Target::Forgejo {
@@ -519,6 +535,7 @@ async fn comments_deduplicate_and_unknown_receipts_never_report_success() {
                         "scope",
                         93,
                         &comment,
+                        identities(),
                     )
                     .await
                 } else {
@@ -530,6 +547,7 @@ async fn comments_deduplicate_and_unknown_receipts_never_report_success() {
                         "scope",
                         93,
                         &comment,
+                        identities(),
                     )
                     .await
                 };
@@ -550,7 +568,17 @@ async fn comments_deduplicate_and_unknown_receipts_never_report_success() {
             }
             let body: Value =
                 serde_json::from_slice(&dest.received_requests().await.unwrap()[0].body).unwrap();
-            assert!(body["body"].as_str().unwrap().contains("**@alice**"));
+            let text = body["body"].as_str().unwrap();
+            if target == Target::GitHub {
+                assert!(text.contains("**[@YUZHEthefool](https://github.com/YUZHEthefool)**"));
+                assert!(text.contains("Hello @YUZHEthefool, `@thefool` and [@unmapped](https://forgejo.example/unmapped)"));
+                assert!(!text.contains("**@thefool**"));
+            } else {
+                assert!(text.contains("**[@thefool](https://forgejo.example/thefool)**"));
+                assert!(text.contains(
+                    "Hello @thefool, `@YUZHEthefool` and [@unmapped](https://github.com/unmapped)"
+                ));
+            }
             assert!(is_bridge_comment(
                 body["body"].as_str().unwrap(),
                 "secret",
@@ -588,7 +616,8 @@ async fn copied_markers_and_fork_prs_never_authorize_a_create_or_update() {
             "source/repo",
             &event_item(&copied, false),
             "scope",
-            &[]
+            &[],
+            identities(),
         )
         .await,
         Ok(BridgeOutcome::Ignored("unmapped-marked-object"))
@@ -606,7 +635,8 @@ async fn copied_markers_and_fork_prs_never_authorize_a_create_or_update() {
             "source/repo",
             &event_item(&fork, true),
             "scope",
-            &[]
+            &[],
+            identities(),
         )
         .await,
         Ok(BridgeOutcome::Ignored("fork-pr-not-mirrored"))
@@ -881,7 +911,8 @@ async fn merge_queue_labels_are_never_imported_or_removed() {
             "source/repo",
             &event_item(&raw, true),
             "scope",
-            &["queue: queued", "queue: testing"]
+            &["queue: queued", "queue: testing"],
+            identities(),
         )
         .await,
         Ok(BridgeOutcome::Synced)
@@ -1122,4 +1153,69 @@ fn transient_read_failures_wait_but_identical_write_failures_remain_blocked() {
         forgejo_read_error(ForgejoError::UnknownWriteOutcome("lost response".into())),
         BridgeOutcome::Transport(_)
     ));
+}
+
+fn identities() -> &'static Identities {
+    static IDENTITIES: std::sync::OnceLock<Identities> = std::sync::OnceLock::new();
+    IDENTITIES.get_or_init(|| {
+        let mut cfg = Config::from_env();
+        cfg.forgejo_base_url = "https://forgejo.example".into();
+        cfg.forgejo_user_map = r#"{"thefool":"YUZHEthefool"}"#.into();
+        Identities::new(&cfg, "bridge-bot").unwrap()
+    })
+}
+
+#[tokio::test]
+async fn expanded_mentions_cannot_reserve_or_send_an_oversized_comment() {
+    let github = MockServer::start().await;
+    let forgejo = MockServer::start().await;
+    let gh = gh(&github);
+    let fj = ForgejoClient::new(&forgejo.uri(), "test-token").unwrap();
+    let dir = Dir::new();
+    let store = Store::open(&dir.0).unwrap();
+    let comment = Comment {
+        id: 91,
+        number: 1,
+        is_pr: false,
+        author: "thefool".into(),
+        body: "@unmapped ".repeat(6000),
+    };
+    assert_eq!(
+        forward_comment_to_github(
+            &gh,
+            &store,
+            "secret",
+            "team/repo",
+            "scope",
+            2,
+            &comment,
+            identities()
+        )
+        .await,
+        Ok(BridgeOutcome::Ignored("rendered-comment-too-large"))
+    );
+    assert_eq!(
+        forward_comment_to_forgejo(
+            &fj,
+            &store,
+            "secret",
+            "team/repo",
+            "scope",
+            2,
+            &comment,
+            identities()
+        )
+        .await,
+        Ok(BridgeOutcome::Ignored("rendered-comment-too-large"))
+    );
+    assert!(store
+        .bridge_comment_status("scope", "github", 91)
+        .unwrap()
+        .is_none());
+    assert!(store
+        .bridge_comment_status("scope", "forgejo", 91)
+        .unwrap()
+        .is_none());
+    assert!(github.received_requests().await.unwrap().is_empty());
+    assert!(forgejo.received_requests().await.unwrap().is_empty());
 }

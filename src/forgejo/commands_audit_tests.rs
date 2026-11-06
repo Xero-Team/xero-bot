@@ -23,7 +23,9 @@ async fn audit_removal_is_sent_once_with_a_numeric_id() {
     let cfg = cfg();
     let job = comment_job("label -bug", false);
     let client = ForgejoClient::new(&server.uri(), "test-token").unwrap();
-    let ctx = CommandContext {client:&client,cfg:&cfg,job:&job,bot_login:"xero-review",lang:Lang::En};
+    let test_dir = Dir::new();
+    let test_store = Store::open(&test_dir.0).unwrap();
+    let ctx = CommandContext {client:&client,cfg:&cfg,job:&job,bot_login:"xero-review",store:&test_store,lang:Lang::En};
     set_labels(&ctx, &[], &["bug".into()]).await;
     let requests = server.received_requests().await.unwrap();
     let deletes: Vec<_> = requests.iter().filter(|r| r.method == "DELETE").collect();
@@ -44,7 +46,9 @@ async fn audit_status_delete_failure_is_not_reported_as_success() {
         .mount(&server).await;
     let job = comment_job("@xero-review ready", true);
     let client = ForgejoClient::new(&server.uri(), "test-token").unwrap();
-    let ctx = CommandContext {client:&client,cfg:&cfg,job:&job,bot_login:"xero-review",lang:Lang::En};
+    let test_dir = Dir::new();
+    let test_store = Store::open(&test_dir.0).unwrap();
+    let ctx = CommandContext {client:&client,cfg:&cfg,job:&job,bot_login:"xero-review",store:&test_store,lang:Lang::En};
     set_status(&ctx, Command::Ready).await;
     let requests = server.received_requests().await.unwrap();
     assert!(!requests.iter().any(|r| String::from_utf8_lossy(&r.body).contains("Status updated:")));
@@ -86,7 +90,9 @@ async fn audit_partial_dismissal_reports_the_failure() {
     let cfg = cfg();
     let job = comment_job("@xero-review r-", true);
     let client = ForgejoClient::new(&server.uri(), "test-token").unwrap();
-    let ctx = CommandContext {client:&client,cfg:&cfg,job:&job,bot_login:"xero-review",lang:Lang::En};
+    let test_dir = Dir::new();
+    let test_store = Store::open(&test_dir.0).unwrap();
+    let ctx = CommandContext {client:&client,cfg:&cfg,job:&job,bot_login:"xero-review",store:&test_store,lang:Lang::En};
     reject(&ctx).await;
     let requests = server.received_requests().await.unwrap();
     let reply = requests.iter().find(|r| r.url.path().ends_with("/comments")).unwrap();
@@ -137,6 +143,8 @@ async fn audit_organization_labels_can_be_removed_by_numeric_id() {
     Mock::given(method("POST")).respond_with(ResponseTemplate::new(201).set_body_json(json!({"id":1}))).mount(&server).await;
     let cfg=cfg();let job=comment_job("@xero-review label -org-triage",false);
     let client=ForgejoClient::new(&server.uri(),"test-token").unwrap();
-    let ctx=CommandContext{client:&client,cfg:&cfg,job:&job,bot_login:"xero-review",lang:Lang::En};
+    let test_dir = Dir::new();
+    let test_store = Store::open(&test_dir.0).unwrap();
+    let ctx=CommandContext{client:&client,cfg:&cfg,job:&job,bot_login:"xero-review",store:&test_store,lang:Lang::En};
     set_labels(&ctx,&[],&["org-triage".into()]).await;
 }

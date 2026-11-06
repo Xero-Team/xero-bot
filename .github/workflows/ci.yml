@@ -9,7 +9,7 @@ on:
     # `staging` is the merge queue's test branch: batches are folded onto it
     # and only advance to main once CI passes *on staging*. Leaving it out
     # means a batch never gets a verdict and times out.
-    branches: [main, staging]
+    branches: [main, staging, 'automation/xero/**']
   pull_request:
   workflow_dispatch:
 

@@ -637,6 +637,18 @@ pub async fn pump_all(cfg: &Config) -> String {
                 skipped += 1;
                 continue;
             }
+            match crate::rollup::ingress::enabled_for(&gh, cfg, &repo, inst_id).await {
+                Ok(true) => {
+                    skipped += 1;
+                    continue;
+                }
+                Ok(false) => (),
+                Err(e) => {
+                    errors += 1;
+                    tracing::warn!("queue policy {repo}: {e}");
+                    continue;
+                }
+            }
             match pump_one(&gh, cfg, &repo).await {
                 PumpOutcome::Idle | PumpOutcome::Testing => {}
                 PumpOutcome::Error(e) => {

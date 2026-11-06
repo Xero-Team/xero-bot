@@ -5,7 +5,7 @@ name: CI
 # needed here.
 on:
   push:
-    branches: [main, staging]
+    branches: [main, staging, 'automation/xero/**']
   workflow_dispatch:
 
 concurrency:

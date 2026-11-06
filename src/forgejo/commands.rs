@@ -36,6 +36,7 @@ struct CommandContext<'a> {
     cfg: &'a Config,
     job: &'a CommentJob,
     bot_login: &'a str,
+    store: &'a Store,
     lang: Lang,
 }
 
@@ -226,6 +227,7 @@ async fn handle_issue_comment_with_client(
         cfg,
         job: &job,
         bot_login,
+        store,
         lang,
     };
     for command in commands {
@@ -325,8 +327,10 @@ async fn authorize(
         }
     }
     match command {
-        Command::Reject => require_write(client, &job.repo, &job.commenter, lang).await,
-        Command::Approve { on_behalf_of } => {
+        Command::Reject | Command::Rollup { .. } | Command::Try | Command::Retry => {
+            require_write(client, &job.repo, &job.commenter, lang).await
+        }
+        Command::Approve { on_behalf_of } | Command::ApproveRollup { on_behalf_of, .. } => {
             if on_behalf_of.is_some() && !cfg.r_plus_allow_on_behalf {
                 return Err(lang
                     .pick(
@@ -405,6 +409,52 @@ async fn require_write(
 }
 
 async fn handle_one(ctx: &CommandContext<'_>, command: Command) -> &'static str {
+    let durable_queue = if ctx.cfg.rollup_enabled && crate::rollup::ingress::controls(&command) {
+        match ctx
+            .client
+            .repository_config(&ctx.job.repo)
+            .await
+            .and_then(|p| p.rollup.map_err(|e| e.to_string()))
+        {
+            Ok(p) => p.enabled,
+            Err(_) => {
+                let _ = reply(
+                    ctx.client,
+                    &ctx.job.repo,
+                    ctx.job.number,
+                    "⚠️ 无法验证队列配置，请稍后重试。",
+                )
+                .await;
+                return "queue-policy-unavailable";
+            }
+        }
+    } else {
+        false
+    };
+    if durable_queue && crate::rollup::ingress::controls(&command) {
+        let result = crate::rollup::ingress::forgejo(
+            ctx.client,
+            ctx.cfg,
+            ctx.store,
+            &ctx.job.repo,
+            ctx.job.number,
+            &ctx.job.commenter,
+            ctx.job.comment_id.unwrap_or(0),
+            ctx.job.source_at.as_deref().unwrap_or(""),
+            &command,
+        )
+        .await;
+        let (status, body) = match result {
+            Ok(body) => ("rollup", body),
+            Err(e) => (
+                "rollup-error",
+                format!("⚠️ {}", crate::redact::scrub(&e.to_string())),
+            ),
+        };
+        let _ = reply(ctx.client, &ctx.job.repo, ctx.job.number, &body).await;
+        return status;
+    }
+
     let lang = ctx.lang;
     match command {
         Command::Ping => {
@@ -467,7 +517,13 @@ async fn handle_one(ctx: &CommandContext<'_>, command: Command) -> &'static str 
             reject(ctx).await;
             "reject"
         }
-        Command::Review | Command::Codeql | Command::Queue => {
+        Command::ApproveRollup { .. }
+        | Command::Rollup { .. }
+        | Command::Try
+        | Command::Retry
+        | Command::Review
+        | Command::Codeql
+        | Command::Queue => {
             let _ = reply(
                 ctx.client,
                 &ctx.job.repo,
@@ -904,6 +960,7 @@ mod tests {
 
     fn cfg() -> Config {
         let mut cfg = Config::from_env();
+        cfg.rollup_enabled = false; // Legacy command handlers; rollup is tested separately.
         cfg.forgejo_bot_name = "xero-review".into();
         cfg.forgejo_base_url = "https://forgejo.invalid".into();
         cfg.forgejo_token = "test-token".into();

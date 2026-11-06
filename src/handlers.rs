@@ -60,7 +60,7 @@ automatic merge** — batches are tested on the `staging` branch, then advanced 
     }
 }
 
-mod help;
+pub(crate) mod help;
 pub use help::help_text;
 pub(crate) use help::{repository_help, HelpSession};
 
@@ -148,7 +148,10 @@ async fn handle_one(
         let verb = match &cmd {
             Command::Review => "review",
             Command::Codeql => "codeql",
-            Command::Approve { .. } => "r+",
+            Command::Approve { .. } | Command::ApproveRollup { .. } => "r+",
+            Command::Rollup { .. } => "rollup",
+            Command::Try => "try",
+            Command::Retry => "retry",
             Command::Reject => "r-",
             // `requires_pr` is exhaustive over the enum, so reaching here means
             // it and this list have drifted apart.
@@ -168,6 +171,44 @@ async fn handle_one(
         return "not-a-pr".into();
     }
 
+    let durable_queue = if cfg.rollup_enabled && crate::rollup::ingress::controls(&cmd) {
+        match crate::rollup::ingress::enabled_for(gh, cfg, &ctx.repo, ctx.installation_id).await {
+            Ok(enabled) => enabled,
+            Err(e) => {
+                let _ = gh
+                    .post_issue_comment(
+                        &ctx.repo,
+                        ctx.pr_number,
+                        &format!(
+                            "⚠️ Queue policy unavailable: {}",
+                            crate::redact::scrub(&e.to_string())
+                        ),
+                    )
+                    .await;
+                return "queue-policy-unavailable".into();
+            }
+        }
+    } else {
+        false
+    };
+    if durable_queue && crate::rollup::ingress::controls(&cmd) {
+        if let Err(refusal) = authorize(gh, cfg, ctx, &cmd).await {
+            let _ = gh
+                .post_issue_comment(&ctx.repo, ctx.pr_number, &refusal.message)
+                .await;
+            return refusal.status.into();
+        }
+        let result = crate::rollup::ingress::github(gh, cfg, ctx, &cmd).await;
+        let (status, body) = match result {
+            Ok(body) => ("ok", body),
+            Err(e) => (
+                "rollup-error",
+                format!("⚠️ {}", crate::redact::scrub(&e.to_string())),
+            ),
+        };
+        let _ = gh.post_issue_comment(&ctx.repo, ctx.pr_number, &body).await;
+        return status.into();
+    }
     match cmd {
         Command::Ping => labeled(
             "ping reply",
@@ -380,6 +421,16 @@ async fn handle_one(
             .await
         }
         Command::Unclaim => unclaim(gh, ctx).await,
+        Command::ApproveRollup { .. } | Command::Rollup { .. } | Command::Try | Command::Retry => {
+            let _ = gh
+                .post_issue_comment(
+                    &ctx.repo,
+                    ctx.pr_number,
+                    "⚠️ Durable rollup is not enabled on this deployment.",
+                )
+                .await;
+            "rollup-disabled".into()
+        }
         Command::Approve { on_behalf_of } => handle_approve(gh, cfg, ctx, on_behalf_of).await,
         Command::Reject => handle_reject(gh, cfg, ctx).await,
     }

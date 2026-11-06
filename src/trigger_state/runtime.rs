@@ -172,6 +172,12 @@ struct Frame {
 }
 tokio::task_local! { static ACTIVE: Arc<Frame>; }
 
+pub(crate) fn rollup_context() -> Option<(Arc<Store>, EventContext)> {
+    ACTIVE
+        .try_with(|f| (Arc::clone(&f.store), f.context.clone()))
+        .ok()
+}
+
 /// Report whether this task is inside a durable trigger execution scope.
 pub(crate) fn active() -> bool {
     ACTIVE.try_with(|_| ()).is_ok()

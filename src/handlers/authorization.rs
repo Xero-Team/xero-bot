@@ -69,8 +69,12 @@ pub(crate) async fn authorize(
             });
         }
     }
-    let Command::Approve { on_behalf_of } = command else {
-        return if matches!(command, Command::Reject) {
+    let (Command::Approve { on_behalf_of } | Command::ApproveRollup { on_behalf_of, .. }) = command
+    else {
+        return if matches!(
+            command,
+            Command::Reject | Command::Rollup { .. } | Command::Try | Command::Retry
+        ) {
             require_write(gh, ctx, &ctx.commenter, false).await
         } else {
             Ok(())

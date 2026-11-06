@@ -14,6 +14,8 @@ Features:
 
 Repository trigger policy, durable sessions, opt-in creation actions, and PR path labels/CC are available independently of the idle scheduler. See the [trigger and upgrade guide](docs/triggers.md), [annotated example.toml](example.toml), [complete defaults](.github/xero-bot.toml), separate [opt-in examples](examples/triggers-opt-in.toml), and [cross-feature acceptance](docs/issue-18-acceptance.md).
 
+A project-scoped, SHA-bound rollup queue with GitHub → Forgejo CI fallback and a minimal bilingual website is available as an opt-in: [Rollup guide](docs/rollup.md).
+
 ## Command reference
 
 Issued in comments (case-insensitive; one comment may contain several commands; content inside code blocks is ignored).

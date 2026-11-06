@@ -18,6 +18,7 @@ use xero_bot::github::Client;
 /// field to `Config` doesn't break this file.
 fn test_cfg() -> Config {
     let mut c = Config::from_env();
+    c.rollup_enabled = false; // Legacy command integration fixtures.
     c.app_id = "12345".into();
     c.private_key_pem = Some(TEST_KEY.into());
     c.webhook_secret = "whsec".into();

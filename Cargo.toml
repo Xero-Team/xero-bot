@@ -17,6 +17,7 @@ sha2 = "0.10"
 hex = "0.4"
 jsonwebtoken = "9"
 regex = "1"
+pulldown-cmark = { version = "0.13", default-features = false }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 base64 = "0.22"

@@ -26,6 +26,7 @@ const TEST_KEY: &str = include_str!("fixtures/rsa_test_key.txt");
 
 fn test_cfg() -> Config {
     let mut c = Config::from_env();
+    c.rollup_enabled = false; // Own-review matching exercises legacy review commands.
     c.app_id = "12345".into();
     c.private_key_pem = Some(TEST_KEY.into());
     c.webhook_secret = "whsec".into();

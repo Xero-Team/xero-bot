@@ -26,6 +26,8 @@ pub struct Config {
     pub forgejo_base_url: String,
     pub forgejo_token: String,
     pub forgejo_webhook_secret: String,
+    /// JSON object: Forgejo login -> GitHub login. Presentation only; never permissions.
+    pub forgejo_user_map: String,
 
     // AI provider (builtin engine)
     pub ai_base_url: String,
@@ -89,10 +91,13 @@ pub struct Config {
     pub idle_workflows_poll_interval_secs: u64,
 
     // Merge queue
-    /// Master switch. Default **false**: the queue writes branches and merges
-    /// PRs — behavior no deployment should gain silently. Everything the queue does
-    /// is gated on this, including the new webhook routes.
+    /// Legacy staging queue switch. Default false; repositories with rollup
+    /// enabled use their own TOML policy instead of this driver.
     pub merge_queue_enabled: bool,
+    /// Rollup service availability, default true. Each repository controls
+    /// activation with [rollup].enabled; false disables Rollup service support.
+    pub rollup_enabled: bool,
+    pub public_url: String,
     /// The branch PR heads are merged into, one batch at a time.
     pub merge_queue_staging_branch: String,
     /// Upper bound on one batch; the queue takes PRs in ascending number.
@@ -249,6 +254,7 @@ impl Config {
             forgejo_base_url: cfg("FORGEJO_BASE_URL", ""),
             forgejo_token: cfg("FORGEJO_TOKEN", ""),
             forgejo_webhook_secret: cfg("FORGEJO_WEBHOOK_SECRET", ""),
+            forgejo_user_map: cfg("FORGEJO_USER_MAP", "{}"),
 
             ai_base_url: cfg("AI_BASE_URL", ""),
             ai_api_key: cfg("AI_API_KEY", ""),
@@ -279,6 +285,8 @@ impl Config {
             idle_workflows_poll_interval_secs: int_cfg("IDLE_WORKFLOWS_POLL_INTERVAL_SECS", 60),
 
             merge_queue_enabled: bool_cfg("MERGE_QUEUE_ENABLED", false),
+            rollup_enabled: bool_cfg("ROLLUP_ENABLED", true),
+            public_url: cfg("PUBLIC_URL", "https://bot.thefool.chat"),
             merge_queue_staging_branch: cfg("MERGE_QUEUE_STAGING_BRANCH", "staging"),
             merge_queue_max_batch: int_cfg("MERGE_QUEUE_MAX_BATCH", 8) as usize,
             merge_queue_ci_timeout_secs: int_cfg("MERGE_QUEUE_CI_TIMEOUT_SECS", 7_200),
@@ -326,6 +334,7 @@ impl Config {
         if self.forgejo_ready() && self.forgejo_bot_name.trim().is_empty() {
             return Err("FORGEJO_BOT_NAME is empty".into());
         }
+        crate::forgejo::identity::UserMap::parse(&self.forgejo_user_map)?;
 
         // Parse the key now: signing happens on a background task whose errors
         // are only logged, so an unusable key would otherwise surface as a

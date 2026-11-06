@@ -54,6 +54,16 @@ pub enum Command {
     Approve {
         on_behalf_of: Option<String>,
     },
+    /// Approve a pinned revision and explicitly select its batching policy.
+    ApproveRollup {
+        on_behalf_of: Option<String>,
+        enabled: bool,
+    },
+    Rollup {
+        enabled: bool,
+    },
+    Try,
+    Retry,
     /// r- — withdraw approval
     Reject,
     /// codeql report

@@ -11,13 +11,13 @@ use base64::Engine;
 use super::ForgejoClient;
 use crate::{config::Config, github::Client};
 
-struct Remote {
+pub(crate) struct Remote {
     url: String,
     authorization: String,
 }
 
 impl Remote {
-    fn new(url: String, user: &str, token: &str) -> Self {
+    pub(crate) fn new(url: String, user: &str, token: &str) -> Self {
         Self {
             url,
             authorization: format!(
@@ -28,9 +28,9 @@ impl Remote {
     }
 }
 
-struct Scratch(PathBuf);
+pub(crate) struct Scratch(pub(crate) PathBuf);
 impl Scratch {
-    fn new() -> Result<Self, String> {
+    pub(crate) fn new() -> Result<Self, String> {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let path = std::env::temp_dir().join(format!(
             "xero-ref-sync-{}-{}-{}",
@@ -83,6 +83,11 @@ async fn git(
         "GIT_CONFIG_PARAMETERS",
         "GIT_ASKPASS",
         "SSH_ASKPASS",
+        "GIT_AUTHOR_NAME",
+        "GIT_AUTHOR_EMAIL",
+        "GIT_COMMITTER_NAME",
+        "GIT_COMMITTER_EMAIL",
+        "EMAIL",
     ] {
         cmd.env_remove(key);
     }
@@ -114,7 +119,11 @@ async fn git(
         .map_err(|_| "cannot start Git ref transport".to_string())
 }
 
-async fn run(dir: &Path, remote: Option<&Remote>, args: &[&str]) -> Result<String, String> {
+pub(crate) async fn run(
+    dir: &Path,
+    remote: Option<&Remote>,
+    args: &[&str],
+) -> Result<String, String> {
     let result = git(dir, remote, args).await?;
     if !result.status.success() {
         return Err(format!(
@@ -225,6 +234,9 @@ async fn transfer_inner(
     let mut conflicts = Vec::new();
     let mut updates = Vec::new();
     for (name, sha) in sources {
+        if crate::rollup::internal_branch(name.strip_prefix("refs/heads/").unwrap_or(&name)) {
+            continue;
+        }
         if selected.as_ref().is_some_and(|r| *r != name) {
             continue;
         }

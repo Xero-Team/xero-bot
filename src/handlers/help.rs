@@ -97,8 +97,11 @@ fn mode_name(mode: ManualMode) -> &'static str {
     }
 }
 /// Describe the action and its key restrictions independently of its trigger mode.
-fn description(id: CommandId, lang: Lang) -> &'static str {
+pub(crate) fn description(id: CommandId, lang: Lang) -> &'static str {
     let (en, zh) = match id {
+        CommandId::Rollup => ("Allow batching / rollup=never; write+ required", "允许组批 / rollup=never 单测；需要 write+ 权限"),
+        CommandId::Try => ("Test a pinned revision without merging", "测试固定提交，通过后不合并"),
+        CommandId::Retry => ("Retry the same approved revision", "重试仍有有效批准的同一提交"),
         CommandId::Claim => ("Assign yourself", "认领，指派给自己"),
         CommandId::Unclaim => ("Release your assignment", "释放自己的指派"),
         CommandId::Cc => ("`cc @user…`: notify users", "`cc @user…`：通知用户"),
@@ -111,8 +114,8 @@ fn description(id: CommandId, lang: Lang) -> &'static str {
             "等待审阅；PR 上还会重新请求/通知审阅者",
         ),
         CommandId::Approve => (
-            "Relay APPROVE; commenter needs write+, no self-approval",
-            "提交 APPROVE；评论者须有 write+ 权限，禁止自我审批",
+            "Approve current revision; enqueue when rollup is enabled. Requires write+, no self-approval",
+            "批准当前提交；队列启用时入队。须有 write+ 权限，禁止自我审批",
         ),
         CommandId::Reject => (
             "Withdraw bot approval / queue entry; requires write+",
@@ -256,7 +259,18 @@ pub(crate) fn repository_help(
         session,
     ));
     text.push_str(&automatic(&snapshot.config, cfg, lang));
-    text.push_str(&super::queue_note(cfg.merge_queue_enabled, lang));
+    if cfg.rollup_enabled
+        && snapshot
+            .config
+            .rollup
+            .as_ref()
+            .is_ok_and(|policy| policy.enabled)
+    {
+        text.push_str(lang.pick("\nDurable rollup: r+ approves the current SHA; r+ rollup allows batching. Web Approve does not enqueue. GitHub CI falls back to Forgejo; either complete suite may pass on the same candidate.\n", "\n持久化 Rollup：r+ 批准当前 SHA，r+ rollup 允许组批。网页 Approve 不自动入队。GitHub CI 失败后交由 Forgejo，同一候选在任一侧完整通过即可合并。\n"));
+    } else {
+        text.push_str(&super::queue_note(cfg.merge_queue_enabled, lang));
+    }
+
     text
 }
 /// Summarize independent subscriptions with deployment vetoes and bounded previews.
