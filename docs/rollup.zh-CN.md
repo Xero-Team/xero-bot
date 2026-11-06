@@ -37,6 +37,10 @@
 `automation/xero/rollup/N`（试跑为 `automation/xero/try/N`）。自动创建的审计 PR
 记录成员、批准人和候选 SHA；后来的批准等待下一批。关闭审计 PR 会撤销该批次。
 
+新增合并提交使用实际 GitHub App bot 用户 ID 对应的 noreply 邮箱。
+将该邮箱绑定为 Forgejo bot 的已验证附加邮箱后，同一 SHA 在两侧均关联正确账号。
+源提交作者与已有历史保持不变；普通用户 `@` 映射见 [Forgejo 配置](forgejo.md)。
+
 GitHub 必须在候选的 push 工作流上通过全部配置的 job。GitHub 失败、API 不可用，
 或等待超过 `fallback_after_seconds` 后，将**同一 SHA** 推到 Forgejo 测试。
 Forgejo 必须通过全部指定 workflow 的所有 job。任一侧完整通过即可合并，

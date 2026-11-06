@@ -12,6 +12,7 @@ use sha2::Sha256;
 
 pub mod bridge;
 pub mod commands;
+pub(crate) mod identity;
 pub mod inbox;
 pub(crate) mod refs;
 mod repository_config;

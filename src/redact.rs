@@ -228,6 +228,7 @@ mod tests {
             forgejo_base_url: String::new(),
             forgejo_token: String::new(),
             forgejo_webhook_secret: String::new(),
+            forgejo_user_map: "{}".into(),
             ai_base_url: String::new(),
             ai_api_key: String::new(),
             ai_model: String::new(),

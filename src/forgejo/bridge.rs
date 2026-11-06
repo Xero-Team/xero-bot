@@ -20,7 +20,7 @@ use hmac::Mac;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-use super::{ForgejoClient, ForgejoError, ForgejoEvent, ForgejoLabel};
+use super::{identity::Identities, ForgejoClient, ForgejoError, ForgejoEvent, ForgejoLabel};
 use crate::config::cache::{ConfigState, RepositoryConfigCache, RepositoryKey};
 use crate::config::repository::ForgejoBridgeConfig;
 use crate::config::Config;
@@ -515,6 +515,9 @@ pub async fn from_github(
         }
     }
     let scope = bridge_scope(&client, key, forgejo_id, repo, destination);
+    let Ok(identities) = Identities::new(cfg, &gh.app_slug) else {
+        return BridgeOutcome::InvalidConfiguration;
+    };
     match forward_item(
         &gh.crab,
         &client,
@@ -529,6 +532,7 @@ pub async fn from_github(
             &cfg.label_merge_queue_queued,
             &cfg.label_merge_queue_testing,
         ],
+        &identities,
     )
     .await
     {
@@ -607,6 +611,9 @@ pub async fn comment_from_github(
         Ok(None) => return BridgeOutcome::Ignored("unmapped-comment"),
         Err(error) => return storage_error(error),
     };
+    let Ok(identities) = Identities::new(cfg, &gh.app_slug) else {
+        return BridgeOutcome::InvalidConfiguration;
+    };
     match forward_comment_to_forgejo(
         &client,
         store,
@@ -615,6 +622,7 @@ pub async fn comment_from_github(
         &scope,
         peer,
         &comment,
+        &identities,
     )
     .await
     {
@@ -753,6 +761,9 @@ pub async fn from_forgejo(
             return outcome;
         }
     }
+    let Ok(identities) = Identities::new(cfg, &gh.app_slug) else {
+        return BridgeOutcome::InvalidConfiguration;
+    };
     match forward_item(
         &gh.crab,
         &client,
@@ -767,6 +778,7 @@ pub async fn from_forgejo(
             &cfg.label_merge_queue_queued,
             &cfg.label_merge_queue_testing,
         ],
+        &identities,
     )
     .await
     {
@@ -888,6 +900,9 @@ pub async fn comment_from_forgejo(
         Ok(None) => return BridgeOutcome::Ignored("unmapped-comment"),
         Err(error) => return BridgeOutcome::Transport(error.to_string()),
     };
+    let Ok(identities) = Identities::new(cfg, &gh.app_slug) else {
+        return BridgeOutcome::InvalidConfiguration;
+    };
     match forward_comment_to_github(
         &gh,
         store,
@@ -896,6 +911,7 @@ pub async fn comment_from_forgejo(
         &scope,
         peer,
         &comment,
+        &identities,
     )
     .await
     {
@@ -1411,6 +1427,7 @@ async fn forward_item(
     event_item: &Item,
     scope: &str,
     reserved_labels: &[&str],
+    identities: &Identities,
 ) -> Result<BridgeOutcome, BridgeOutcome> {
     let lock = scope_lock(scope);
     let _guard = lock.lock().await;
@@ -1476,6 +1493,7 @@ async fn forward_item(
                 kind,
                 scope,
                 reserved_labels,
+                identities,
             )
             .await
         } else {
@@ -1510,6 +1528,7 @@ async fn forward_item(
         &current_revision,
         scope,
         reserved_labels,
+        identities,
     )
     .await
 }
@@ -1531,6 +1550,7 @@ async fn create_peer(
     kind: Kind,
     scope: &str,
     reserved_labels: &[&str],
+    identities: &Identities,
 ) -> Result<BridgeOutcome, BridgeOutcome> {
     if item.is_pr && !item.peer_repo.eq_ignore_ascii_case(source_repo) {
         return Ok(BridgeOutcome::Ignored("fork-pr-not-mirrored"));
@@ -1541,21 +1561,24 @@ async fn create_peer(
     if item.body.len() > MAX_BODY || item.title.len() > 512 {
         return Ok(BridgeOutcome::Ignored("object-too-large"));
     }
+    let current_revision = revision(item);
+    let body = with_marker(
+        secret,
+        scope,
+        &identities.markdown(&item.body, target),
+        item.number,
+        kind,
+        &current_revision,
+    );
+    if body.len() > MAX_BODY {
+        return Ok(BridgeOutcome::Ignored("rendered-object-too-large"));
+    }
     if !store
         .bridge_create_begin(scope, kind.as_str(), peer_side(target), item.number)
         .map_err(storage_error)?
     {
         return Err(BridgeOutcome::NeedsReconciliation);
     }
-    let current_revision = revision(item);
-    let body = with_marker(
-        secret,
-        scope,
-        &item.body,
-        item.number,
-        kind,
-        &current_revision,
-    );
     let created = create_remote(github, forgejo, target, destination, item, &body).await?;
     let peer = number_of(&created).ok_or_else(|| {
         BridgeOutcome::InvalidPayload(
@@ -1589,20 +1612,10 @@ async fn create_peer(
         &current_revision,
         scope,
         reserved_labels,
+        identities,
     )
     .await?;
     Ok(BridgeOutcome::Synced)
-}
-
-fn marker_body(
-    secret: &str,
-    scope: &str,
-    item: &Item,
-    peer: i64,
-    kind: Kind,
-    revision: &str,
-) -> String {
-    with_marker(secret, scope, &item.body, peer, kind, revision)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1619,7 +1632,19 @@ async fn update_peer(
     revision: &str,
     scope: &str,
     reserved_labels: &[&str],
+    identities: &Identities,
 ) -> Result<BridgeOutcome, BridgeOutcome> {
+    let body = with_marker(
+        secret,
+        scope,
+        &identities.markdown(&item.body, target),
+        item.number,
+        kind,
+        revision,
+    );
+    if body.len() > MAX_BODY {
+        return Ok(BridgeOutcome::Ignored("rendered-object-too-large"));
+    }
     let mut labeled = item.clone();
     if !reserved_labels.is_empty() {
         let route = format!("/repos/{destination}/issues/{peer}/labels");
@@ -1644,7 +1669,7 @@ async fn update_peer(
                     }),
             );
     }
-    let mut payload = json!({"title": item.title, "body": marker_body(secret, scope, item, item.number, kind, revision), "state": item.state});
+    let mut payload = json!({"title": item.title, "body": body, "state": item.state});
     if item.is_pr && target == Target::Forgejo && item.state == "open" {
         payload["base"] = json!(item.base);
     }
@@ -1851,6 +1876,7 @@ fn safe_color(color: &str) -> String {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn forward_comment_to_forgejo(
     client: &ForgejoClient,
     store: &Store,
@@ -1859,11 +1885,21 @@ async fn forward_comment_to_forgejo(
     scope: &str,
     peer: i64,
     comment: &Comment,
+    identities: &Identities,
 ) -> Result<BridgeOutcome, BridgeOutcome> {
     let lock = scope_lock(scope);
     let _guard = lock.lock().await;
     if peer <= 0 || comment.body.trim().is_empty() || comment.body.len() > MAX_BODY {
         return Ok(BridgeOutcome::Ignored("invalid-comment"));
+    }
+    let body = format!(
+        "{}:\n\n{}\n\n{}",
+        identities.author(&comment.author, Target::Forgejo),
+        identities.markdown(&crate::redact::scrub(&comment.body), Target::Forgejo),
+        comment_marker(secret, scope, "github", comment.id)
+    );
+    if body.len() > MAX_BODY {
+        return Ok(BridgeOutcome::Ignored("rendered-comment-too-large"));
     }
     let inserted = store
         .bridge_comment_begin(
@@ -1886,12 +1922,6 @@ async fn forward_comment_to_forgejo(
             Err(BridgeOutcome::NeedsReconciliation)
         };
     }
-    let body = format!(
-        "**@{}** (GitHub):\n\n{}\n\n{}",
-        comment.author,
-        crate::redact::scrub(&comment.body),
-        comment_marker(secret, scope, "github", comment.id)
-    );
     let created = match client
         .post(
             &format!("/repos/{destination}/issues/{peer}/comments"),
@@ -1920,6 +1950,7 @@ async fn forward_comment_to_forgejo(
     Ok(BridgeOutcome::Synced)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn forward_comment_to_github(
     gh: &Client,
     store: &Store,
@@ -1928,11 +1959,21 @@ async fn forward_comment_to_github(
     scope: &str,
     peer: i64,
     comment: &Comment,
+    identities: &Identities,
 ) -> Result<BridgeOutcome, BridgeOutcome> {
     let lock = scope_lock(scope);
     let _guard = lock.lock().await;
     if peer <= 0 || comment.body.trim().is_empty() || comment.body.len() > MAX_BODY {
         return Ok(BridgeOutcome::Ignored("invalid-comment"));
+    }
+    let body = format!(
+        "{}:\n\n{}\n\n{}",
+        identities.author(&comment.author, Target::GitHub),
+        identities.markdown(&crate::redact::scrub(&comment.body), Target::GitHub),
+        comment_marker(secret, scope, "forgejo", comment.id)
+    );
+    if body.len() > MAX_BODY {
+        return Ok(BridgeOutcome::Ignored("rendered-comment-too-large"));
     }
     let inserted = store
         .bridge_comment_begin(
@@ -1955,12 +1996,6 @@ async fn forward_comment_to_github(
             Err(BridgeOutcome::NeedsReconciliation)
         };
     }
-    let body = format!(
-        "**@{}** (Forgejo):\n\n{}\n\n{}",
-        comment.author,
-        crate::redact::scrub(&comment.body),
-        comment_marker(secret, scope, "forgejo", comment.id)
-    );
     let created = match gh
         .post(
             &format!("/repos/{destination}/issues/{peer}/comments"),

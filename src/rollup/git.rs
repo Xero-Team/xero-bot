@@ -13,24 +13,27 @@ pub struct Prepared {
 fn github_url(repo: &str) -> String {
     format!("https://github.com/{repo}.git")
 }
+async fn configure_identity(
+    path: &std::path::Path,
+    identity: &crate::github::identity::CommitIdentity,
+) -> Result<()> {
+    run(path, None, &["config", "user.name", &identity.name]).await?;
+    run(path, None, &["config", "user.email", &identity.email]).await?;
+    Ok(())
+}
 pub async fn prepare(
     gh: &Client,
     cfg: &Config,
     repo: &Repository,
     batch: &Batch,
 ) -> Result<Prepared> {
+    let identity = gh.commit_identity(cfg).await?;
     let token = gh.installation_token(cfg, repo.installation).await?;
     let remote = Remote::new(github_url(&repo.name), "x-access-token", &token);
     let scratch = Scratch::new()?;
     let path = &scratch.0;
     run(path, None, &["init", "--quiet"]).await?;
-    run(path, None, &["config", "user.name", "xero-bot"]).await?;
-    run(
-        path,
-        None,
-        &["config", "user.email", "xero-bot@users.noreply.github.com"],
-    )
-    .await?;
+    configure_identity(path, &identity).await?;
     run(
         path,
         Some(&remote),
@@ -154,4 +157,73 @@ pub async fn fallback(
     )
     .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[tokio::test]
+    async fn merge_commits_use_bot_identity_and_preserve_contributor_authors() {
+        let scratch = Scratch::new().unwrap();
+        let path = &scratch.0;
+        run(path, None, &["init", "--quiet"]).await.unwrap();
+        let human = crate::github::identity::CommitIdentity {
+            name: "Contributor".into(),
+            email: "contributor@example.invalid".into(),
+        };
+        configure_identity(path, &human).await.unwrap();
+        run(path, None, &["commit", "--allow-empty", "-m", "base"])
+            .await
+            .unwrap();
+        let base = run(path, None, &["rev-parse", "HEAD"]).await.unwrap();
+        run(
+            path,
+            None,
+            &["commit", "--allow-empty", "-m", "contribution"],
+        )
+        .await
+        .unwrap();
+        let source = run(path, None, &["rev-parse", "HEAD"]).await.unwrap();
+        run(path, None, &["checkout", "--detach", base.trim()])
+            .await
+            .unwrap();
+        let bot = crate::github::identity::CommitIdentity {
+            name: "real-app[bot]".into(),
+            email: "123+real-app@users.noreply.github.com".into(),
+        };
+        configure_identity(path, &bot).await.unwrap();
+        run(
+            path,
+            None,
+            &[
+                "merge",
+                "--no-ff",
+                "--no-edit",
+                "-m",
+                "candidate",
+                source.trim(),
+            ],
+        )
+        .await
+        .unwrap();
+        let author = run(
+            path,
+            None,
+            &["show", "-s", "--format=%an|%ae|%cn|%ce", "HEAD"],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            author.trim(),
+            format!("{}|{}|{}|{}", bot.name, bot.email, bot.name, bot.email)
+        );
+        let original = run(
+            path,
+            None,
+            &["show", "-s", "--format=%an|%ae", source.trim()],
+        )
+        .await
+        .unwrap();
+        assert_eq!(original.trim(), "Contributor|contributor@example.invalid");
+    }
 }

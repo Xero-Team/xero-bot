@@ -44,6 +44,11 @@ them locally onto the latest default branch and pushes one immutable
 the approval manifest and candidate SHA. Later approvals wait for another batch.
 Closing the audit PR cancels that batch's approvals.
 
+Generated merge commits use the authenticated GitHub App bot's user ID and
+canonical noreply email, not a configured mention alias. Register that email as
+a verified additional email on the Forgejo bot to attribute the same SHA on both
+providers. Source commit authors and existing history remain unchanged.
+
 GitHub Actions must pass every configured job on the candidate's **push** run.
 If GitHub fails, its API is unavailable, or its pending time exceeds
 `fallback_after_seconds`, the bot pushes the **same commit** to Forgejo. Every job

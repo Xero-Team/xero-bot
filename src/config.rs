@@ -26,6 +26,8 @@ pub struct Config {
     pub forgejo_base_url: String,
     pub forgejo_token: String,
     pub forgejo_webhook_secret: String,
+    /// JSON object: Forgejo login -> GitHub login. Presentation only; never permissions.
+    pub forgejo_user_map: String,
 
     // AI provider (builtin engine)
     pub ai_base_url: String,
@@ -252,6 +254,7 @@ impl Config {
             forgejo_base_url: cfg("FORGEJO_BASE_URL", ""),
             forgejo_token: cfg("FORGEJO_TOKEN", ""),
             forgejo_webhook_secret: cfg("FORGEJO_WEBHOOK_SECRET", ""),
+            forgejo_user_map: cfg("FORGEJO_USER_MAP", "{}"),
 
             ai_base_url: cfg("AI_BASE_URL", ""),
             ai_api_key: cfg("AI_API_KEY", ""),
@@ -331,6 +334,7 @@ impl Config {
         if self.forgejo_ready() && self.forgejo_bot_name.trim().is_empty() {
             return Err("FORGEJO_BOT_NAME is empty".into());
         }
+        crate::forgejo::identity::UserMap::parse(&self.forgejo_user_map)?;
 
         // Parse the key now: signing happens on a background task whose errors
         // are only logged, so an unusable key would otherwise surface as a

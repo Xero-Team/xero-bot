@@ -83,6 +83,11 @@ async fn git(
         "GIT_CONFIG_PARAMETERS",
         "GIT_ASKPASS",
         "SSH_ASKPASS",
+        "GIT_AUTHOR_NAME",
+        "GIT_AUTHOR_EMAIL",
+        "GIT_COMMITTER_NAME",
+        "GIT_COMMITTER_EMAIL",
+        "EMAIL",
     ] {
         cmd.env_remove(key);
     }

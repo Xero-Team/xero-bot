@@ -2,6 +2,36 @@
 
 Forgejo 是与 GitHub App 分开的 provider。两者可以同时启用，但不会共享 token、webhook secret 或身份回退。
 
+## 跨平台用户与提交身份
+
+在部署 `.env` 中显式配置账号对应关系，键是 Forgejo **login**，值是 GitHub
+**login**，不要填写显示名、`@` 前缀或数字 ID：
+
+```dotenv
+FORGEJO_USER_MAP={"thefool":"YUZHEthefool","new_user":"new-github-user"}
+```
+
+修改后重启 bot。一个部署对应一个 Forgejo 站点，此映射对它管理的所有项目生效；
+后续增加用户只需添加一组映射。大小写不影响匹配，但必须一对一；格式错误、
+重复账号或多个 Forgejo 用户对应同一个 GitHub 用户会报错。
+
+桥接评论署名使用明确的账号链接，并保留来源平台。Issue/PR 描述和评论正文中的
+普通 `@` 提及按映射双向转换。未映射的用户转成**来源平台链接**，不会根据同名
+猜测目标用户。代码、代码块、邮箱、URL 和已有 Markdown 链接保持原样。
+机器人提及使用 GitHub App login 与 `FORGEJO_BOT_NAME` 的对应关系。
+该配置只影响显示和提及，不赋予仓库权限或审批资格；rollup 的
+`[rollup.reviewers]` 仍需按项目单独授权。
+
+Rollup 创建合并提交时通过认证的 GitHub App 查询其真正的 bot 用户 ID，使用
+`BOT_USER_ID+APP_SLUG@users.noreply.github.com`。用户名仍为 `APP_SLUG[bot]`；
+邮箱省略 `[bot]`，兼容 Forgejo 的邮箱校验，并由 GitHub 按实际 bot 用户 ID 关联。
+此处不能使用 App ID、
+Forgejo 用户 ID、`BOT_NAME` 或猜测的邮箱；查询失败时等待恢复，不生成错误署名。
+Forgejo 管理员可将该实际 bot 邮箱添加为 Forgejo bot 的已验证附加邮箱，使同一
+Git SHA 在两侧都显示正确的机器人。原主邮箱可保留；普通贡献者的作者字段和
+历史提交不会被改写。普通用户的提交头像关联仍由各平台账号绑定的邮箱决定，
+与上述 `@` 映射相互独立。
+
 ## 部署配置
 
 在 `.env` 中成组设置：
