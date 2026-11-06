@@ -282,6 +282,7 @@ impl Client {
         installation_id: i64,
         app_slug: &str,
     ) -> Result<Client, GhError> {
+        crate::admission::github_installation(cfg, installation_id)?;
         let app = Self::app_client(cfg)?;
         let crab = app.installation(InstallationId(installation_id as u64))?;
         Ok(Client {
@@ -300,6 +301,7 @@ impl Client {
         cfg: &Config,
         installation_id: i64,
     ) -> Result<Client, GhError> {
+        crate::admission::github_installation(cfg, installation_id)?;
         let slug = resolve_app_slug(cfg).await;
         Self::installation(cfg, installation_id, &slug)
     }
@@ -430,6 +432,7 @@ impl Client {
         cfg: &Config,
         installation_id: i64,
     ) -> Result<String, GhError> {
+        let repository_ids = crate::admission::github_token_repositories(cfg, installation_id)?;
         // Build the app JWT manually (same claims as octocrab's flow)
         let now = chrono_now_secs();
         let claims = json!({
@@ -454,6 +457,7 @@ impl Client {
             .header("User-Agent", "xero-bot")
             .header("Accept", "application/vnd.github+json")
             .header("X-GitHub-Api-Version", "2022-11-28")
+            .json(&json!({"repository_ids": repository_ids}))
             .send()
             .await
             .map_err(|e| GhError::BadShape(e.to_string()))?;
@@ -1405,17 +1409,20 @@ impl Client {
     /// The response wraps its list in `{"repositories": [...]}`, which
     /// `Page<Value>` unwraps — so an org past 100 repos no longer has its tail
     /// silently skipped by the sweep.
-    pub async fn installation_repositories_via(client: &Client) -> Result<Vec<String>, GhError> {
-        let repos = client
+    /// Enumerate only deployment-admitted identities, before repository configuration reads.
+    pub async fn admitted_repositories(
+        &self,
+        cfg: &Config,
+        installation: i64,
+    ) -> Result<Vec<String>, GhError> {
+        crate::admission::github_installation(cfg, installation)?;
+        let repos = self
             .get_all("/installation/repositories?per_page=100")
             .await?;
         Ok(repos
-            .iter()
-            .filter_map(|r| {
-                r.get("full_name")
-                    .and_then(|f| f.as_str())
-                    .map(String::from)
-            })
+            .into_iter()
+            .filter(|r| crate::admission::github_metadata(cfg, installation, r))
+            .filter_map(|r| r["full_name"].as_str().map(str::to_owned))
             .collect())
     }
 

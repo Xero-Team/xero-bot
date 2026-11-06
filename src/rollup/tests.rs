@@ -922,3 +922,24 @@ async fn forgejo_completion_cannot_close_a_changed_revision() {
         .iter()
         .all(|r| r.method == "GET"));
 }
+
+#[tokio::test]
+async fn revoked_rollup_repository_retains_queue_without_starting_work() {
+    let dir = crate::forgejo::refs::Scratch::new().unwrap();
+    let r = failed_four_member_batch();
+    let before = serde_json::to_value(&r).unwrap();
+    {
+        let store = Store::open(&dir.0).unwrap();
+        store.rollup_save(&r).unwrap();
+    }
+    let store = Store::open(&dir.0).unwrap();
+    let mut cfg = crate::config::Config::from_env();
+    cfg.rollup_enabled = true;
+    cfg.bot_access_policy = "{}".into();
+    cfg.private_key_pem = None;
+    engine::pump_all(&cfg, &store).await.unwrap();
+    assert_eq!(
+        serde_json::to_value(store.rollup_load(&r.name).unwrap().unwrap()).unwrap(),
+        before
+    );
+}

@@ -288,8 +288,10 @@ async fn remotes(
     }
     let client =
         ForgejoClient::new(&cfg.forgejo_base_url, &cfg.forgejo_token).map_err(|e| e.to_string())?;
-    let metadata = client
-        .repository(forgejo_repo)
+    crate::admission::github_repository(cfg, gh, installation, github_repo, None)
+        .await
+        .map_err(|e| e.to_string())?;
+    let metadata = crate::admission::forgejo_repository(cfg, &client, forgejo_repo, None)
         .await
         .map_err(|e| e.to_string())?;
     if metadata["mirror"].as_bool() != Some(false) {

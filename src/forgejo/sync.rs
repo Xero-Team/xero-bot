@@ -46,6 +46,17 @@ pub async fn sync_repository(
     repo: &str,
     key: RepositoryKey,
 ) -> SyncOutcome {
+    if let Err(error) = crate::admission::github_repository(
+        cfg,
+        gh,
+        key.installation_id,
+        repo,
+        Some(key.repository_id),
+    )
+    .await
+    {
+        return SyncOutcome::Transport(error.to_string());
+    }
     sync_repository_with_cache(gh, cfg, repo, key, RepositoryConfigCache::shared().as_ref()).await
 }
 
@@ -168,6 +179,14 @@ fn mirror_destination(mirror: &ForgejoMirrorConfig) -> Result<&str, SyncOutcome>
 }
 
 async fn sync_destination(cfg: &Config, destination: &str) -> SyncOutcome {
+    let client = match ForgejoClient::new(&cfg.forgejo_base_url, &cfg.forgejo_token) {
+        Ok(client) => client,
+        Err(error) => return SyncOutcome::Transport(error.to_string()),
+    };
+    if let Err(error) = crate::admission::forgejo_repository(cfg, &client, destination, None).await
+    {
+        return SyncOutcome::Transport(error.to_string());
+    }
     sync_destination_with(&cfg.forgejo_base_url, &cfg.forgejo_token, destination).await
 }
 
@@ -270,6 +289,9 @@ async fn sweep_once(cfg: &Config) -> String {
             errors += 1;
             continue;
         };
+        if crate::admission::github_installation(cfg, installation_id).is_err() {
+            continue;
+        }
         let gh = match Client::installation_resolved(cfg, installation_id).await {
             Ok(client) => client,
             Err(error) => {
@@ -278,7 +300,7 @@ async fn sweep_once(cfg: &Config) -> String {
                 continue;
             }
         };
-        let repos = match Client::installation_repositories_via(&gh).await {
+        let repos = match gh.admitted_repositories(cfg, installation_id).await {
             Ok(repos) => repos,
             Err(error) => {
                 tracing::warn!(
@@ -431,6 +453,7 @@ mod tests {
 
     fn mirror_config(forgejo: &MockServer) -> Config {
         let mut cfg = Config::from_env();
+        cfg.bot_access_policy = r#"{"forgejo":[{"owner_id":10,"repository_id":70,"repository":"mirror-team/xero-bot"}]}"#.into();
         cfg.forgejo_base_url = forgejo.uri();
         cfg.forgejo_token = "forgejo-token".into();
         cfg.forgejo_webhook_secret = "webhook-secret".into();
@@ -456,6 +479,14 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/api/v1/repos/mirror-team/xero-bot/mirror-sync"))
             .respond_with(ResponseTemplate::new(200))
+            .expect(3)
+            .mount(&forgejo)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/mirror-team/xero-bot"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"id":70,"full_name":"mirror-team/xero-bot","owner":{"id":10}}),
+            ))
             .expect(3)
             .mount(&forgejo)
             .await;
@@ -487,10 +518,13 @@ mod tests {
             "GitHub must receive no writes: {github_requests:?}"
         );
         let forgejo_requests = forgejo.received_requests().await.unwrap();
-        assert_eq!(forgejo_requests.len(), 3);
-        assert!(forgejo_requests.iter().all(|r| r.method == "POST"
-            && r.url.path() == "/api/v1/repos/mirror-team/xero-bot/mirror-sync"
-            && r.body.is_empty()));
+        assert_eq!(forgejo_requests.len(), 6);
+        assert!(forgejo_requests
+            .iter()
+            .filter(|r| r.method != "GET")
+            .all(|r| r.method == "POST"
+                && r.url.path() == "/api/v1/repos/mirror-team/xero-bot/mirror-sync"
+                && r.body.is_empty()));
     }
 
     #[tokio::test]

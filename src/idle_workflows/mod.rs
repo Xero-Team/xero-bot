@@ -123,6 +123,9 @@ impl Scheduler {
             let id = installation["id"]
                 .as_i64()
                 .ok_or("installation ID missing")?;
+            if crate::admission::github_installation(cfg, id).is_err() {
+                continue;
+            }
             let permissions = installation["permissions"]["actions"]
                 .as_str()
                 .unwrap_or("");
@@ -131,6 +134,9 @@ impl Scheduler {
                 .get_all("/installation/repositories?per_page=100")
                 .await?
             {
+                if !crate::admission::github_metadata(cfg, id, &repo) {
+                    continue;
+                }
                 let name = config::repository_name(
                     repo["full_name"]
                         .as_str()

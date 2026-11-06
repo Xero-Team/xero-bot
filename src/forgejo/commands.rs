@@ -63,8 +63,18 @@ pub async fn handle_issue_comment(
     else {
         return Err("expected Forgejo issue comment".into());
     };
+    if !crate::admission::forgejo_scope(cfg, &repo, repository_id) {
+        tracing::info!(
+            repo,
+            "discarding Forgejo command: repository admission revoked"
+        );
+        return Ok(());
+    }
     let client = ForgejoClient::new(&cfg.forgejo_base_url, &cfg.forgejo_token)
         .map_err(|error| error.to_string())?;
+    crate::admission::forgejo_repository(cfg, &client, &repo, repository_id)
+        .await
+        .map_err(|e| e.to_string())?;
     handle_issue_comment_with_client(
         &client,
         cfg,

@@ -87,6 +87,8 @@ fn gh(server: &MockServer) -> Client {
 }
 fn cfg(server: &MockServer) -> Config {
     let mut cfg = Config::from_env();
+    cfg.bot_access_policy =
+        r#"{"forgejo":[{"owner_id":10,"repository_id":70,"repository":"dest/repo"}]}"#.into();
     cfg.forgejo_base_url = server.uri();
     cfg.forgejo_token = "forgejo-test-token".into();
     cfg.forgejo_webhook_secret = "bridge-webhook-secret".into();
@@ -711,7 +713,7 @@ async fn policies(
         forgejo,
         "GET",
         "/api/v1/repos/dest/repo",
-        json!({"id":70,"default_branch":"main","mirror":true,"original_url":origin}),
+        json!({"id":70,"full_name":"dest/repo","owner":{"id":10},"default_branch":"main","mirror":true,"original_url":origin}),
     )
     .await;
     respond(
@@ -1218,4 +1220,28 @@ async fn expanded_mentions_cannot_reserve_or_send_an_oversized_comment() {
         .is_none());
     assert!(github.received_requests().await.unwrap().is_empty());
     assert!(forgejo.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn revoked_bridge_delivery_cannot_resume_after_restart() {
+    let dir = Dir::new();
+    let server = MockServer::start().await;
+    let mut cfg = cfg(&server);
+    let payload = json!({"GitHub":{"repo":"source/repo","installation":901,
+        "repository":9001,"event":"issues","payload":{"action":"opened","issue":{"number":4}}}});
+    {
+        let store = Store::open(&dir.0).unwrap();
+        store
+            .bridge_enqueue("revoked", "revoked-lane", &payload)
+            .unwrap();
+    }
+    cfg.bot_access_policy = "{}".into();
+    cfg.private_key_pem = None;
+    let store = Store::open(&dir.0).unwrap();
+    inbox::pump(&cfg, &store).await.unwrap();
+    assert!(store.bridge_claim_delivery().unwrap().is_none());
+    assert!(server.received_requests().await.unwrap().is_empty());
+    let rows = store.bridge_deliveries().unwrap();
+    assert_ne!(rows[0]["state"], "pending");
+    assert_ne!(rows[0]["state"], "done"); // Rejection is retained for operator inspection.
 }

@@ -833,24 +833,43 @@ async fn pump_repository(cfg: &Config, store: &Store, snapshot: Repository) -> R
     if snapshot.next_attempt > now() {
         return Ok(());
     }
+    if !crate::admission::github_scope(
+        cfg,
+        snapshot.installation,
+        &snapshot.name,
+        Some(snapshot.id),
+    ) {
+        return Ok(()); // Retain the queue, but suspend all work while admission is revoked.
+    }
     let _lock = lock(&snapshot.name).await;
     let mut repo = store
         .rollup_load(&snapshot.name)?
         .ok_or("queue disappeared")?;
     let result = match Client::installation_resolved(cfg, repo.installation).await {
         Ok(gh) => {
-            if let Err(e) = cleanup(&gh, cfg, store, &mut repo).await {
-                tracing::warn!("rollup cleanup: {}", crate::redact::scrub(&e.to_string()));
+            async {
+                crate::admission::github_repository(
+                    cfg,
+                    &gh,
+                    repo.installation,
+                    &repo.name,
+                    Some(repo.id),
+                )
+                .await?;
+                if let Err(e) = cleanup(&gh, cfg, store, &mut repo).await {
+                    tracing::warn!("rollup cleanup: {}", crate::redact::scrub(&e.to_string()));
+                }
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(300),
+                    drive(&gh, cfg, store, &mut repo),
+                )
+                .await
+                {
+                    Ok(v) => v,
+                    Err(_) => Err("queue transition timed out".into()),
+                }
             }
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(300),
-                drive(&gh, cfg, store, &mut repo),
-            )
             .await
-            {
-                Ok(v) => v,
-                Err(_) => Err("queue transition timed out".into()),
-            }
         }
         Err(e) => Err(e.into()),
     };

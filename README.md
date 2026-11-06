@@ -294,6 +294,8 @@ What you get in the container:
 
 Endpoints: `POST /webhook` (GitHub), `GET /health`, `GET /cron` (protected by `CRON_SECRET`).
 
+**Upgrade requirement:** configure the server's `BOT_ACCESS_POLICY` before restarting this version. Missing or empty configuration admits no GitHub or Forgejo repositories. A public GitHub App installation alone does not grant use of this service, and repository TOML cannot override admission. See [service admission and onboarding](docs/admission.md) for ID lookup, examples and revocation. Empty `CRON_SECRET` now disables the external `/cron` endpoint; internal workers continue running.
+
 <details>
 <summary><b>Docker quick-check — from zero to a working bot</b></summary>
 

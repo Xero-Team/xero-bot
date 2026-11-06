@@ -297,7 +297,13 @@ impl Runtime {
     pub async fn pump(&self, cfg: &Config) -> Result<usize> {
         self.pump_with(
             |context| async move {
+                // A restart/revocation must not give old persisted deliveries authority.
+                if !crate::admission::github_scope(cfg, context.installation_id, &context.repo, Some(context.repository_id)) {
+                    tracing::info!(repo=%context.repo, "discarding trigger: repository admission revoked");
+                    return Ok(());
+                }
                 let gh = Client::installation_resolved(cfg, context.installation_id).await?;
+                crate::admission::github_repository(cfg, &gh, context.installation_id, &context.repo, Some(context.repository_id)).await?;
                 self.process(&gh, cfg, &RepositoryConfigCache::shared(), &context)
                     .await
             },

@@ -618,12 +618,15 @@ pub async fn pump_all(cfg: &Config) -> String {
         let Some(inst_id) = inst.get("id").and_then(|i| i.as_i64()) else {
             continue;
         };
+        if crate::admission::github_installation(cfg, inst_id).is_err() {
+            continue;
+        }
         let Ok(gh) = crate::github::Client::installation_resolved(cfg, inst_id).await else {
             errors += 1;
             active = true;
             continue;
         };
-        let repos_list = match crate::github::Client::installation_repositories_via(&gh).await {
+        let repos_list = match gh.admitted_repositories(cfg, inst_id).await {
             Ok(r) => r,
             Err(_) => {
                 errors += 1;
