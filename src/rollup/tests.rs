@@ -194,8 +194,7 @@ fn duplicate_commands_and_late_rollup_changes_do_not_mutate_active_batch() {
     assert_eq!(r.entries[0].batch, Some(1));
     assert_eq!(r.entries[1].batch, None);
 }
-#[test]
-fn failed_batch_preserves_both_halves_and_does_not_blame_tail() {
+fn failed_four_member_batch() -> Repository {
     let mut r = repo();
     for n in 1..=4 {
         approve(&mut r, n, &"a".repeat(40), n);
@@ -210,8 +209,126 @@ fn failed_batch_preserves_both_halves_and_does_not_blame_tail() {
         e.batch = Some(1);
     }
     engine::finish(&mut r, 1, "failed", "test failed");
+    r
+}
+#[test]
+fn failed_batch_preserves_both_halves_and_does_not_blame_tail() {
+    let r = failed_four_member_batch();
     assert_eq!(r.split.iter().map(Vec::len).collect::<Vec<_>>(), vec![2, 2]);
     assert!(r.entries.iter().all(|e| e.state == "queued"));
+}
+#[test]
+fn split_batches_isolate_updated_try_and_rollup_never_entries() {
+    for command in [Command::Try, Command::Rollup { enabled: false }] {
+        for number in 1..=4 {
+            let mut r = failed_four_member_batch();
+            let keys: Vec<_> = r.entries.iter().map(|e| e.key.clone()).collect();
+            let mut o = origin();
+            o.number = number;
+            ingress::apply(
+                &mut r,
+                &command,
+                o,
+                number,
+                "a".repeat(40),
+                "alice".into(),
+                "new-mode".into(),
+                10,
+                10,
+            )
+            .unwrap();
+            // A new decision keeps its old split key, even when its queue age changes.
+            let mut eligible = keys.clone();
+            eligible.sort_by_key(|k| r.entry(k).unwrap().created);
+            let expected = if number <= 2 {
+                vec![
+                    vec![keys[0].clone()],
+                    vec![keys[1].clone()],
+                    keys[2..].to_vec(),
+                ]
+            } else {
+                vec![
+                    keys[..2].to_vec(),
+                    vec![keys[2].clone()],
+                    vec![keys[3].clone()],
+                ]
+            };
+            for group in expected {
+                assert_eq!(
+                    engine::select_group(&mut r, &eligible, &Policy::default()),
+                    group,
+                    "{command:?} on PR #{number}"
+                );
+            }
+            assert!(r.split.is_empty());
+        }
+    }
+}
+#[test]
+fn split_batches_honor_reduced_limit_and_keep_remainder_across_restart() {
+    let mut r = failed_four_member_batch();
+    let eligible: Vec<_> = r.entries.iter().map(|e| e.key.clone()).collect();
+    let policy = Policy {
+        max_batch: 1,
+        ..Default::default()
+    };
+    assert_eq!(
+        engine::select_group(&mut r, &eligible, &policy),
+        eligible[..1]
+    );
+    assert_eq!(
+        r.split,
+        vec![eligible[1..2].to_vec(), eligible[2..].to_vec()]
+    );
+    let dir = crate::forgejo::refs::Scratch::new().unwrap();
+    {
+        let store = Store::open(&dir.0).unwrap();
+        store.rollup_save(&r).unwrap();
+    }
+    let store = Store::open(&dir.0).unwrap();
+    let mut r = store.rollup_load(&r.name).unwrap().unwrap();
+    for key in &eligible[1..] {
+        assert_eq!(
+            engine::select_group(&mut r, &eligible, &policy),
+            vec![key.clone()]
+        );
+    }
+    assert!(r.split.is_empty());
+}
+#[test]
+fn normal_batches_keep_collection_window_and_isolate_try_entries() {
+    let mut r = repo();
+    for n in 1..=4 {
+        approve(&mut r, n, &"a".repeat(40), now());
+    }
+    let mut o = origin();
+    o.number = 3;
+    ingress::apply(
+        &mut r,
+        &Command::Try,
+        o,
+        3,
+        "a".repeat(40),
+        "alice".into(),
+        "try".into(),
+        now() + 1,
+        10,
+    )
+    .unwrap();
+    let eligible: Vec<_> = r.entries.iter().map(|e| e.key.clone()).collect();
+    let mut policy = Policy::default();
+    assert!(engine::select_group(&mut r, &eligible, &policy).is_empty());
+    policy.collect_seconds = 0;
+    assert_eq!(
+        engine::select_group(&mut r, &eligible, &policy),
+        eligible[..2]
+    );
+    r.entries[2].created -= 1;
+    assert_eq!(
+        engine::select_group(&mut r, &eligible[2..], &policy),
+        eligible[2..3]
+    );
+    assert!(r.split.is_empty());
 }
 #[test]
 fn required_checks_reject_wrong_sha_spoofed_app_partial_and_skipped_results() {

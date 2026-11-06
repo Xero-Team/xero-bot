@@ -635,33 +635,7 @@ async fn drive(gh: &Client, cfg: &Config, store: &Store, repo: &mut Repository) 
     reconcile_duplicates(repo);
     eligible.retain(|k| repo.entry(k).is_some_and(Entry::waiting));
     eligible.sort_by_key(|k| repo.entry(k).unwrap().created);
-    let group = if !repo.split.is_empty() {
-        let requested = repo.split.remove(0);
-        requested
-            .into_iter()
-            .filter(|k| eligible.contains(k))
-            .collect::<Vec<_>>()
-    } else if let Some(first) = eligible.first() {
-        let e = repo.entry(first).unwrap();
-        if now() - e.created < p.collect_seconds {
-            return Ok(());
-        }
-        if !e.rollup || e.try_only {
-            vec![first.clone()]
-        } else {
-            eligible
-                .iter()
-                .take_while(|k| {
-                    let e = repo.entry(k).unwrap();
-                    e.rollup && !e.try_only
-                })
-                .take(p.max_batch)
-                .cloned()
-                .collect()
-        }
-    } else {
-        return Ok(());
-    };
+    let group = select_group(repo, &eligible, &p);
     if group.is_empty() {
         return Ok(());
     }
@@ -726,6 +700,46 @@ async fn drive(gh: &Client, cfg: &Config, store: &Store, repo: &mut Repository) 
     prepared.publish(repo, &batch.branch).await?;
     repo.batches.iter_mut().find(|b| b.id == id).unwrap().state = "testing".into();
     Ok(())
+}
+
+pub(crate) fn select_group(repo: &mut Repository, eligible: &[String], p: &Policy) -> Vec<String> {
+    let splitting = !repo.split.is_empty();
+    let mut candidates = if splitting {
+        let requested = repo.split.remove(0);
+        requested
+            .into_iter()
+            .filter(|k| eligible.contains(k))
+            .collect::<Vec<_>>()
+    } else {
+        eligible.to_vec()
+    };
+    let Some(first) = candidates.first() else {
+        return vec![];
+    };
+    let e = repo.entry(first).unwrap();
+    if !splitting && now() - e.created < p.collect_seconds {
+        return vec![];
+    }
+    // Split keys outlive approval and policy changes. Reapply the same limits
+    // as a fresh batch, so try-only and rollup=never entries always run alone.
+    let size = if !e.rollup || e.try_only {
+        1
+    } else {
+        candidates
+            .iter()
+            .take_while(|k| {
+                let e = repo.entry(k).unwrap();
+                e.rollup && !e.try_only
+            })
+            .take(p.max_batch)
+            .count()
+    };
+    let remaining = candidates.split_off(size);
+    if splitting && !remaining.is_empty() {
+        // Keep the rest ahead of later split halves and newly queued entries.
+        repo.split.insert(0, remaining);
+    }
+    candidates
 }
 async fn cleanup(gh: &Client, cfg: &Config, store: &Store, repo: &mut Repository) -> Result<()> {
     let Some(index) = repo.batches.iter().position(|b| {
