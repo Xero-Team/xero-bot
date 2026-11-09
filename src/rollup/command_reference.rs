@@ -412,6 +412,7 @@ fn lookup(lang: Lang, name: &str, provider: Provider) -> String {
     )
 }
 fn instructions(cfg: &Config, lang: Lang, ttl: u16, provider: Option<Provider>) -> String {
+    let example_bot = escape(provider.unwrap_or_default().bot(cfg));
     let bots = match provider {
         Some(p) => format!("{}: <code>@{}</code>", p.label(), escape(p.bot(cfg))),
         None => format!(
@@ -422,7 +423,7 @@ fn instructions(cfg: &Config, lang: Lang, ttl: u16, provider: Option<Provider>) 
     };
     format!("<section class=command-guide><p>{bots}</p><p>{}</p><p>{}</p><p>{}</p></section>",
         lang.pick("The @ rule means mentioning the bot. An @user argument (for example cc @user) mentions the recipient, not the bot. Bare commands must form a complete comment, separated by newlines or semicolons; every part of a compound command has its own policy.", "表中的 @ 指 @ 机器人；cc @user 等参数中的 @user 是目标用户。免 @ 指令须组成完整评论，可用换行或分号分隔；组合中的每条指令分别检查策略。"),
-        lang.pick(&format!("For mention_once, first send a valid explicit bot command; later comments by the same user in the same Issue/PR and platform can omit @ for {ttl} days. Only valid explicit mentions renew the session. This page cannot determine your session; use help in the thread."), &format!("mention_once 须先发送有效的显式 @ 指令；同一平台、项目、Issue/PR 内，同一用户的后续评论在 {ttl} 天会话有效期内免 @，仅有效的显式 @ 会续期。此页不判断个人会话状态，可在线程中使用 help 查询。")),
+        lang.pick(&format!("For mention_once, first send an eligible explicit command whose effective mode is no_mention or mention_once and that passes applicability and authorization checks (for example <code>@{example_bot} help</code> under the default policy). Later comments by the same user in the same project, Issue/PR and platform can omit @ for {ttl} days. Only eligible explicit mentions open or renew a session. Commands in always_mention mode, such as <code>@{example_bot} r+</code> under the defaults, never open or renew a session, even when successful. On Forgejo, queue, review and codeql also never open or renew a session. This page cannot determine your session; use help in the thread."), &format!("mention_once 须先发送可用于唤醒的显式 @ 指令，其生效模式须为 no_mention 或 mention_once，并通过适用性与权限检查（例如默认策略下的 <code>@{example_bot} help</code>）。同一平台、项目、Issue/PR 内，同一用户的后续评论在 {ttl} 天会话有效期内免 @。只有符合唤醒条件的显式 @ 才会建立或续期会话。always_mention 模式的指令（如默认策略下的 <code>@{example_bot} r+</code>）即使执行成功，也不会建立或续期会话。Forgejo 的 queue、review 和 codeql 同样不会建立或续期会话。此页不判断个人会话状态，可在线程中使用 help 查询。")),
         lang.pick("Availability describes configured commands. Repository permissions, PR state and execution checks still apply; mentioning the bot grants no permissions.", "可用状态表示配置允许调用；执行时仍会检查仓库权限、PR 状态等条件，@ 不会授予权限。"))
 }
 fn table(cfg: &Config, lang: Lang, policy: Option<(&RepositoryConfig, Provider)>) -> String {
