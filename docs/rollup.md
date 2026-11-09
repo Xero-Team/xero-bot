@@ -16,6 +16,29 @@ Private repositories never appear in the public API, even if `public=true`.
 A project appears after its first queue command, including `queue`.
 Commands on non-public projects report status without advertising a public queue link.
 
+The project list and queue pages link to `/commands/OWNER/REPO`, which displays
+the project's effective command policy, all aliases and syntax examples, and
+whether each command needs no bot mention, an earlier active session, or a bot
+mention on every call. Disabled and unsupported commands stay visible with a
+reason. The default `/commands` page includes the complete registry and a project
+lookup form. An admitted public repository can be queried before its first queue
+command; command lookup does not require Rollup or public queue opt-in.
+
+Use `?provider=forgejo` for a Forgejo repository (using its own owner/name).
+Each provider reads its own default-branch `.github/xero-bot.toml`; the page shows
+the pinned source commit and session TTL. GitHub uses the same 60-second policy
+cache as dispatch. Only confirmed missing files use defaults; invalid or
+unavailable policy produces an error. Private, archived and unadmitted projects
+are not exposed. Permissions and personal Issue/PR sessions are still checked at
+execution time; use `help` in the thread to check your own session.
+
+`/api/commands` returns the default reference, and `/api/commands/OWNER/REPO`
+returns the project reference with the same provider/language parameters.
+`mode` uses the TOML names (`disabled`, `no_mention`, `mention_once`,
+`always_mention`); `available` is null for unverified defaults and a boolean for
+project commands. Rollup-only and delegated-approval examples include their
+additional requirements. These read-only endpoints never execute commands.
+
 ## Commands
 
 Mention the bot on a PR on either provider:

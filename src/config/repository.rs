@@ -190,6 +190,29 @@ pub enum ManualMode {
     AlwaysMention,
 }
 
+impl ManualMode {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::NoMention => "no_mention",
+            Self::MentionOnce => "mention_once",
+            Self::AlwaysMention => "always_mention",
+        }
+    }
+
+    pub fn mention_label(self, lang: crate::lang::Lang) -> &'static str {
+        match self {
+            Self::Disabled => lang.pick("Disabled (even with @)", "已禁用（@ 也不可用）"),
+            Self::NoMention => lang.pick("No @ needed", "无需 @"),
+            Self::MentionOnce => lang.pick(
+                "@ first; then an active session",
+                "先 @ 唤醒，会话有效期内免 @",
+            ),
+            Self::AlwaysMention => lang.pick("@ on every call", "每次都需要 @"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ReasonCode {
     InvalidDocument,
