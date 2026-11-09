@@ -20,9 +20,20 @@ The project list and queue pages link to `/commands/OWNER/REPO`, which displays
 the project's effective command policy, all aliases and syntax examples, and
 whether each command needs no bot mention, an earlier active session, or a bot
 mention on every call. Disabled and unsupported commands stay visible with a
-reason. The default `/commands` page includes the complete registry and a project
-lookup form. An admitted public repository can be queried before its first queue
-command; command lookup does not require Rollup or public queue opt-in.
+reason. The default `/commands` page includes the complete registry and an
+automatically populated project selector. Choose GitHub or Forgejo, then select
+a repository; project pages retain the current selection. A collapsed manual
+form also works without JavaScript. Discovery does not require queue activity,
+Rollup, or public queue opt-in.
+
+`/api/command-projects?provider=github` (or `forgejo`) returns repository names
+from the deployment admission policy after checking live provider identities
+and public, non-archived status. GitHub discovery follows installation pagination;
+Forgejo checks only admitted repositories. It never grants access to new projects.
+Results are cached for at most 60 seconds, failures for 15 seconds; concurrent
+requests share a refresh. Expired results are discarded on errors, and the UI
+offers retry/manual lookup. Project selection still rechecks identity, visibility
+and effective configuration independently.
 
 Use `?provider=forgejo` for a Forgejo repository (using its own owner/name).
 Each provider reads its own default-branch `.github/xero-bot.toml`; the page shows

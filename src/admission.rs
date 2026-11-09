@@ -155,6 +155,25 @@ pub(crate) fn github_identity(cfg: &Config, name: &str) -> Option<(i64, i64)> {
         .find(|entry| entry.repository.eq_ignore_ascii_case(name))
         .map(|entry| (entry.installation_id, entry.repository_id))
 }
+/// Discovery candidates only: live identity and visibility must still be checked.
+pub(crate) fn github_installations(cfg: &Config) -> Vec<i64> {
+    policy(cfg)
+        .unwrap_or_default()
+        .github
+        .into_iter()
+        .map(|entry| entry.installation_id)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+pub(crate) fn forgejo_repositories(cfg: &Config) -> Vec<String> {
+    policy(cfg)
+        .unwrap_or_default()
+        .forgejo
+        .into_iter()
+        .map(|entry| entry.repository)
+        .collect()
+}
 pub fn forgejo_scope(cfg: &Config, name: &str, id: Option<i64>) -> bool {
     policy(cfg).is_some_and(|p| p.forgejo_entry(name, id).is_some())
 }

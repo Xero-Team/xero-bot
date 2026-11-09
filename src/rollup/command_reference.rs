@@ -392,10 +392,8 @@ fn payload(cfg: &Config, lang: Lang, project: Option<(&str, Provider, &ProjectPo
 }
 
 fn lookup(lang: Lang, name: &str, provider: Provider) -> String {
-    format!(
-        r#"<form class="command-lookup" action="/commands" method="get"><input type="hidden" name="lang" value="{}"><label>{}<select name="provider"><option value="github"{}>GitHub</option><option value="forgejo"{}>Forgejo</option></select></label><label class="repository-input">{}<input name="project" value="{}" placeholder="owner/repository" required maxlength="200"></label><button type="submit">{}</button></form>"#,
-        code(lang),
-        lang.pick("Platform", "平台"),
+    let platforms = format!(
+        r#"<option value="github"{}>GitHub</option><option value="forgejo"{}>Forgejo</option>"#,
         if provider == Provider::Github {
             " selected"
         } else {
@@ -405,10 +403,22 @@ fn lookup(lang: Lang, name: &str, provider: Provider) -> String {
             " selected"
         } else {
             ""
-        },
-        lang.pick("Project", "项目"),
-        escape(name),
-        lang.pick("View project commands", "查看项目指令")
+        }
+    );
+    let locale = code(lang);
+    let platform = lang.pick("Platform", "平台");
+    let project = lang.pick("Project", "项目");
+    let submit = lang.pick("View project commands", "查看项目指令");
+    let name = escape(name);
+    format!(
+        r#"<form class="command-lookup" data-project-lookup data-current-project="{name}" action="/commands" method="get"><input type="hidden" name="lang" value="{locale}"><label>{platform}<select name="provider">{platforms}</select></label><label class="repository-input">{project}<select name="project" required disabled><option value="">{loading}</option></select></label><button type="submit" disabled>{submit}</button><button type="button" data-refresh disabled>{refresh}</button><p class="project-status" role="status" aria-live="polite">{loading}</p></form><details class="manual-project"><summary>{manual}</summary><form class="command-lookup" action="/commands" method="get"><input type="hidden" name="lang" value="{locale}"><label>{platform}<select name="provider">{platforms}</select></label><label class="repository-input">{project}<input name="project" value="{name}" placeholder="owner/repository" required maxlength="200"></label><button type="submit">{submit}</button></form></details><noscript><p>{no_script}</p></noscript><script src="/assets/projects.js" defer></script>"#,
+        loading = lang.pick("Discovering projects…", "正在检测已接入的仓库…"),
+        refresh = lang.pick("Refresh projects", "刷新仓库"),
+        manual = lang.pick("Enter a project manually", "手动输入仓库"),
+        no_script = lang.pick(
+            "Enable JavaScript for automatic discovery, or expand the manual form above.",
+            "启用 JavaScript 可自动检测仓库，也可以展开上方的手动输入。"
+        ),
     )
 }
 fn instructions(cfg: &Config, lang: Lang, ttl: u16, provider: Option<Provider>) -> String {
@@ -518,7 +528,7 @@ pub(super) async fn commands(State(s): State<WebState>, Query(q): Query<Options>
             .into_response();
     }
     let mut body = format!("<h1>{}</h1><p>{}</p>", lang.pick("Command reference", "指令参考"), lang.pick("Complete built-in defaults from the running bot's command registry. Select a project to see its effective configuration.", "由运行版本的统一指令注册表生成完整默认参考。选择项目可查看实际生效的配置。"));
-    body.push_str(&lookup(lang, "", Provider::Github));
+    body.push_str(&lookup(lang, "", q.provider));
     body.push_str(&instructions(
         &s.cfg,
         lang,
@@ -526,7 +536,13 @@ pub(super) async fn commands(State(s): State<WebState>, Query(q): Query<Options>
         None,
     ));
     body.push_str(&table(&s.cfg, lang, None));
-    page(lang.pick("Commands", "指令"), &body, "/commands", lang).into_response()
+    page(
+        lang.pick("Commands", "指令"),
+        &body,
+        &format!("/commands?provider={}", q.provider.key()),
+        lang,
+    )
+    .into_response()
 }
 pub(super) async fn command_data(
     State(s): State<WebState>,
