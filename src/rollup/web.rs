@@ -12,6 +12,8 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 #[path = "command_reference.rs"]
 mod command_reference;
+#[path = "project_directory.rs"]
+mod project_directory;
 use command_reference::{command_data, commands, project_command_data, project_commands};
 #[derive(Clone)]
 pub struct WebState {
@@ -35,6 +37,7 @@ fn code(lang: Lang) -> &'static str {
     lang.pick("en", "zh")
 }
 pub fn routes<S: Clone + Send + Sync + 'static>(state: WebState) -> Router<S> {
+    let directory = project_directory::routes(state.cfg.clone());
     Router::new()
         .route("/", get(projects))
         .route("/queue", get(projects))
@@ -47,6 +50,7 @@ pub fn routes<S: Clone + Send + Sync + 'static>(state: WebState) -> Router<S> {
         .route("/api/commands/{owner}/{repo}", get(project_command_data))
         .route("/assets/queue.js", get(script))
         .with_state(state)
+        .merge(directory)
 }
 fn escape(s: &str) -> String {
     s.replace('&', "&amp;")

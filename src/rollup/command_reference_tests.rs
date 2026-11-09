@@ -418,6 +418,19 @@ async fn public_routes_link_projects_redirect_lookup_and_do_not_fallback_on_erro
     assert!(defaults.contains("完整默认参考"));
     assert!(defaults.contains("release-assignment"));
     assert!(defaults.contains("每次都需要 @"));
+    assert!(defaults.contains("data-project-lookup"));
+    assert!(defaults.contains("/assets/projects.js"));
+    assert!(defaults.contains("<select name=\"project\" required disabled>"));
+    let forgejo_defaults = client
+        .get(format!("{url}/commands?provider=forgejo&lang=zh"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(forgejo_defaults.contains("value=\"forgejo\" selected"));
+    assert!(forgejo_defaults.contains("provider=forgejo&amp;lang=en"));
     let lookup = client
         .get(format!(
             "{url}/commands?project=team%2Frepo&provider=forgejo&lang=zh"
