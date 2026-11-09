@@ -303,7 +303,7 @@ async fn remotes(
         .filter(|v| !v.is_empty())
         .ok_or("Forgejo login missing")?;
     let token = gh
-        .installation_token(cfg, installation)
+        .repository_token(cfg, installation, github_repo)
         .await
         .map_err(|e| e.to_string())?;
     let root = client

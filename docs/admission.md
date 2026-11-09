@@ -42,7 +42,7 @@ Example structure, with **illustrative IDs that must be replaced**:
 }
 ```
 
-Names match case-insensitively, but all IDs must match the **same entry**. There is no wildcard or automatic organization-wide enrollment. A new project, rename, transfer, recreated repository or reinstalled App requires the operator to review and update the relevant entry. One GitHub installation cannot name different owner IDs. At most 500 repositories may be listed per installation, matching GitHub's scoped installation-token limit. Tokens used by Git subprocesses are restricted to that installation's admitted repository IDs.
+Names match case-insensitively, but all IDs must match the **same entry**. There is no wildcard or automatic organization-wide enrollment. A new project, rename, transfer, recreated repository or reinstalled App requires the operator to review and update the relevant entry. One GitHub installation cannot name different owner IDs. At most 500 repositories may be listed per installation. Tokens used by Git subprocesses are restricted to the single repository being operated on, after live identity verification. A deleted or inaccessible sibling in the policy therefore cannot make token issuance fail for a healthy admitted repository.
 
 ## Enforcement and revocation
 

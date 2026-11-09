@@ -15,6 +15,8 @@ use crate::config::Config;
 pub mod actions;
 pub mod identity;
 pub mod repository_config;
+#[cfg(test)]
+mod token_tests;
 
 pub struct Client {
     pub crab: Octocrab,
@@ -424,15 +426,30 @@ impl Client {
         }
     }
 
-    /// Fetch the current installation access token as a raw string (for git
-    /// clone auth in subprocess engines). Builds a short-lived app JWT and
-    /// exchanges it — independent of octocrab's internal cache.
-    pub async fn installation_token(
+    /// Mint a raw Git token for one admitted, live-verified repository. A stale
+    /// sibling entry in the deployment policy must not poison every Git operation.
+    pub async fn repository_token(
         &self,
         cfg: &Config,
         installation_id: i64,
+        repo: &str,
     ) -> Result<String, GhError> {
-        let repository_ids = crate::admission::github_token_repositories(cfg, installation_id)?;
+        self.repository_token_at(cfg, installation_id, repo, "https://api.github.com")
+            .await
+    }
+
+    // The endpoint is private and fixed by the public entry point; tests use a
+    // local server to exercise the actual token request without real credentials.
+    async fn repository_token_at(
+        &self,
+        cfg: &Config,
+        installation_id: i64,
+        repo: &str,
+        api: &str,
+    ) -> Result<String, GhError> {
+        let repository_id = crate::admission::github_token_repository(cfg, installation_id, repo)?;
+        crate::admission::github_repository(cfg, self, installation_id, repo, Some(repository_id))
+            .await?;
         // Build the app JWT manually (same claims as octocrab's flow)
         let now = chrono_now_secs();
         let claims = json!({
@@ -448,16 +465,22 @@ impl Client {
         )
         .map_err(|e| GhError::BadShape(format!("jwt encode: {e}")))?;
 
-        let http = reqwest::Client::new();
+        let http = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .timeout(std::time::Duration::from_secs(15))
+            .build()
+            .map_err(|e| GhError::BadShape(e.to_string()))?;
         let resp = http
             .post(format!(
-                "https://api.github.com/app/installations/{installation_id}/access_tokens"
+                "{api}/app/installations/{installation_id}/access_tokens"
             ))
             .bearer_auth(&jwt)
             .header("User-Agent", "xero-bot")
             .header("Accept", "application/vnd.github+json")
             .header("X-GitHub-Api-Version", "2022-11-28")
-            .json(&json!({"repository_ids": repository_ids}))
+            .json(&json!({"repository_ids": [repository_id]}))
             .send()
             .await
             .map_err(|e| GhError::BadShape(e.to_string()))?;

@@ -28,7 +28,9 @@ pub async fn prepare(
     batch: &Batch,
 ) -> Result<Prepared> {
     let identity = gh.commit_identity(cfg).await?;
-    let token = gh.installation_token(cfg, repo.installation).await?;
+    let token = gh
+        .repository_token(cfg, repo.installation, &repo.name)
+        .await?;
     let remote = Remote::new(github_url(&repo.name), "x-access-token", &token);
     let scratch = Scratch::new()?;
     let path = &scratch.0;
@@ -120,7 +122,9 @@ pub async fn fallback(
     batch: &Batch,
     destination: &str,
 ) -> Result<()> {
-    let token = gh.installation_token(cfg, repo.installation).await?;
+    let token = gh
+        .repository_token(cfg, repo.installation, &repo.name)
+        .await?;
     let source = Remote::new(github_url(&repo.name), "x-access-token", &token);
     let fj = crate::forgejo::ForgejoClient::new(&cfg.forgejo_base_url, &cfg.forgejo_token)?;
     crate::admission::github_repository(cfg, gh, repo.installation, &repo.name, Some(repo.id))

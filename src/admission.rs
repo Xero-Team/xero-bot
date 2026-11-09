@@ -248,15 +248,17 @@ pub async fn forgejo_repository(
     }
     Ok(meta)
 }
-/// Raw Git credentials are restricted to exactly the admitted repository IDs.
-pub fn github_token_repositories(cfg: &Config, installation: i64) -> Result<Vec<i64>, GhError> {
-    github_installation(cfg, installation)?;
+/// Select exactly the operation's repository; unrelated stale entries must not
+/// break token creation, and a subprocess needs no access to sibling repositories.
+pub fn github_token_repository(
+    cfg: &Config,
+    installation: i64,
+    name: &str,
+) -> Result<i64, GhError> {
     let p = policy(cfg).ok_or_else(denied)?;
-    Ok(p.github
-        .into_iter()
-        .filter(|e| e.installation_id == installation)
-        .map(|e| e.repository_id)
-        .collect())
+    p.github_entry(installation, name, None)
+        .map(|entry| entry.repository_id)
+        .ok_or_else(denied)
 }
 
 #[cfg(test)]
