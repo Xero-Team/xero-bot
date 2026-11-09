@@ -392,27 +392,36 @@ fn payload(cfg: &Config, lang: Lang, project: Option<(&str, Provider, &ProjectPo
 }
 
 fn lookup(lang: Lang, name: &str, provider: Provider) -> String {
-    let platforms = format!(
-        r#"<option value="github"{}>GitHub</option><option value="forgejo"{}>Forgejo</option>"#,
-        if provider == Provider::Github {
-            " selected"
-        } else {
-            ""
-        },
-        if provider == Provider::Forgejo {
-            " selected"
-        } else {
-            ""
-        }
-    );
+    let platforms = [Provider::Github, Provider::Forgejo].into_iter().map(|p| {
+        let selected = p == provider;
+        format!(r#"<button type="button" role="radio" aria-checked="{selected}" tabindex="{}" data-provider="{}">{}</button>"#, if selected { 0 } else { -1 }, p.key(), p.label())
+    }).collect::<String>();
+    let manual_platforms = [Provider::Github, Provider::Forgejo]
+        .into_iter()
+        .map(|p| {
+            format!(
+                r#"<label><input type="radio" name="provider" value="{}"{}>{}</label>"#,
+                p.key(),
+                if p == provider { " checked" } else { "" },
+                p.label()
+            )
+        })
+        .collect::<String>();
     let locale = code(lang);
     let platform = lang.pick("Platform", "平台");
     let project = lang.pick("Project", "项目");
     let submit = lang.pick("View project commands", "查看项目指令");
     let name = escape(name);
     format!(
-        r#"<form class="command-lookup" data-project-lookup data-current-project="{name}" action="/commands" method="get"><input type="hidden" name="lang" value="{locale}"><label>{platform}<select name="provider">{platforms}</select></label><label class="repository-input">{project}<select name="project" required disabled><option value="">{loading}</option></select></label><button type="submit" disabled>{submit}</button><button type="button" data-refresh disabled>{refresh}</button><p class="project-status" role="status" aria-live="polite">{loading}</p></form><details class="manual-project"><summary>{manual}</summary><form class="command-lookup" action="/commands" method="get"><input type="hidden" name="lang" value="{locale}"><label>{platform}<select name="provider">{platforms}</select></label><label class="repository-input">{project}<input name="project" value="{name}" placeholder="owner/repository" required maxlength="200"></label><button type="submit">{submit}</button></form></details><noscript><p>{no_script}</p></noscript><script src="/assets/projects.js" defer></script>"#,
+        r#"<form class="command-lookup" data-project-lookup data-current-project="{name}" action="/commands" method="get"><input type="hidden" name="lang" value="{locale}"><input type="hidden" name="provider" value="{provider}"><div class="platform-field"><span id="platform-label">{platform}</span><div class="platform-options" role="radiogroup" aria-labelledby="platform-label">{platforms}</div></div><div class="repository-input" data-project-picker><span id="project-label">{project}</span><input type="hidden" name="project"><button type="button" class="project-trigger" data-project-trigger aria-haspopup="dialog" aria-expanded="false" aria-controls="project-popover" aria-labelledby="project-label project-value" disabled><svg class="repo-icon" viewBox="0 0 20 20" fill="none" aria-hidden="true"><path d="M5 3h11v14H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2Zm0 0v10m-2 2a2 2 0 0 1 2-2h11M8 6h5"/></svg><span id="project-value" data-project-name>{loading}</span><svg class="picker-chevron" viewBox="0 0 20 20" fill="none" aria-hidden="true"><path d="m6 8 4 4 4-4"/></svg></button><div id="project-popover" class="project-popover" role="dialog" aria-labelledby="project-label" hidden><div class="project-search"><svg viewBox="0 0 20 20" fill="none" aria-hidden="true"><circle cx="8.5" cy="8.5" r="5.5"/><path d="m13 13 4 4"/></svg><input type="search" data-project-search role="combobox" aria-label="{search}" placeholder="{search}" aria-autocomplete="list" aria-expanded="false" aria-controls="project-options" autocomplete="off" autocapitalize="none" spellcheck="false"><button type="button" class="search-clear" data-project-clear aria-label="{clear}" hidden>×</button></div><div id="project-options" class="project-options" role="listbox" aria-labelledby="project-label"></div><div class="project-empty" data-project-empty hidden>{empty}</div><div class="project-results" data-project-results role="status" aria-live="polite"></div></div></div><button type="submit" class="project-submit" disabled>{submit}</button><button type="button" data-refresh disabled>{refresh}</button><p class="project-status" role="status" aria-live="polite">{loading}</p></form><details class="manual-project"><summary>{manual}</summary><form class="command-lookup" action="/commands" method="get"><input type="hidden" name="lang" value="{locale}"><fieldset class="manual-platform"><legend>{platform}</legend>{manual_platforms}</fieldset><label class="repository-input">{project}<input name="project" value="{name}" placeholder="owner/repository" required maxlength="200"></label><button type="submit">{submit}</button></form></details><noscript><p>{no_script}</p></noscript><script src="/assets/projects.js" defer></script>"#,
+        provider = provider.key(),
         loading = lang.pick("Discovering projects…", "正在检测已接入的仓库…"),
+        search = lang.pick("Search owner or repository…", "搜索仓库名称或所属组织…"),
+        clear = lang.pick("Clear search", "清除搜索"),
+        empty = lang.pick(
+            "No matching repositories. Try another keyword.",
+            "没有匹配的仓库，试试其他关键词。"
+        ),
         refresh = lang.pick("Refresh projects", "刷新仓库"),
         manual = lang.pick("Enter a project manually", "手动输入仓库"),
         no_script = lang.pick(

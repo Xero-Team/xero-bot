@@ -190,8 +190,9 @@ async fn installation_token(
     gh: &Client,
     cfg: &Config,
     installation_id: i64,
+    repo: &str,
 ) -> Result<String, String> {
-    gh.installation_token(cfg, installation_id)
+    gh.repository_token(cfg, installation_id, repo)
         .await
         .map_err(|e| format!("could not get an installation token: {e}"))
 }
@@ -592,7 +593,7 @@ async fn run_pi_inner(
     let lock = lock_for(&format!("pi:{repo}"));
     let _serialized = lock.lock().await;
 
-    let token = installation_token(gh, cfg, installation_id).await?;
+    let token = installation_token(gh, cfg, installation_id, repo).await?;
     let dir = ensure_checkout(cfg, repo, pr_number, &base_ref, &token).await?;
     verify_automatic_checkout(&dir, &meta, &token).await?;
 
@@ -715,7 +716,7 @@ async fn run_codex_inner(
 
     // No lock: the working tree and the output file below are both per PR, and
     // a second review of the same PR never reaches this function.
-    let token = installation_token(gh, cfg, installation_id).await?;
+    let token = installation_token(gh, cfg, installation_id, repo).await?;
     let dir = ensure_checkout(cfg, repo, pr_number, &base_ref, &token).await?;
     verify_automatic_checkout(&dir, &meta, &token).await?;
 

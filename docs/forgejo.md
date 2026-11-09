@@ -182,9 +182,10 @@ CI 不依赖 GitHub App、AI key 或 webhook secret。
 - 未启用、provider 未配置或目标缺失时不发请求。
 - 同一 `FORGEJO_BASE_URL + destination` 的并发同步会串行化；重复触发是安全的
   mirror-sync 请求，不会向 GitHub 写 ref。
-- `GET /cron` 在已有 sweep 后追加 `forgejo_sync` 摘要。每个进程最多每 15 分钟执行一轮对账，整轮期间拒绝重叠扫描；频繁 cron 不会重复读取配置或请求 mirror-sync。重启后可立即对账。
+- 内置同步补偿 worker 在启动 60 秒后检查，之后每轮结束 15 分钟再检查，不依赖 `CRON_SECRET`。`FORGEJO_RECONCILE_ENABLED=false` 可关闭后台补偿，Push 同步仍正常处理。
+- `GET /cron` 在已有 sweep 后追加 `forgejo_sync` 摘要，与内置 worker 共用同一节流锁。每个进程最多每 15 分钟执行一轮对账，整轮期间拒绝重叠扫描；频繁 cron 不会重复读取配置或请求 mirror-sync。重启后外部 cron 可立即对账。
 - 不自动重放 Forgejo 写请求。401/403/404/409/超时只记录稳定状态，等待下一次
-  Push 或 cron 对账，不猜测目标、不降级为任意 URL 推送。
+  Push、后台补偿或 cron 对账，不猜测目标、不降级为任意 URL 推送。
 - `sync-requested` / `requested` 表示 Forgejo 接受了同步请求，不代表后台镜像拉取已完成。最终结果请查看 Forgejo 的镜像状态。
 - 日志只包含源仓库、目标状态和 HTTP 状态，不包含 `FORGEJO_TOKEN`。
 
@@ -238,6 +239,8 @@ enabled = false # 普通仓库不能使用原生 mirror-sync
 - Fork PR 仍不支持。仅复制本次 PR 所需的 Forgejo head，不做全仓库反向复制。
 - Git 凭据通过子进程环境中的 URL 范围 HTTP header 传递，不写入仓库配置、
   命令参数或日志；禁用重定向、交互凭据提示和 Git hooks。
+- GitHub Git token 仅包含当前操作的仓库 ID，签发前重新验证该仓库身份；其他项目
+  已被删除或移出 App 安装时，不会连带阻断本项目的同步。
 
 新普通仓库需要先由维护者初始化同一段 Git 历史及双方配置，bot 不会在无双边授权时
 替空仓库写入配置。迁移已有镜像时，先将新配置通过旧镜像同步到两端，再转换仓库。

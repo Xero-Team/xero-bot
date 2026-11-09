@@ -158,6 +158,10 @@ async fn main() {
         });
     }
 
+    if cfg.forgejo_ready() && cfg.forgejo_reconcile_enabled {
+        tokio::spawn(xero_bot::forgejo::sync::run_reconciliation(cfg.clone()));
+    }
+
     // merge queue driver loop. Sleep-first like the rebase sweep: a restart
     // mid-batch recovers on the first tick, but booting shouldn't immediately
     // race GitHub's webhooks with a burst of staging writes. One loop, never

@@ -420,7 +420,10 @@ async fn public_routes_link_projects_redirect_lookup_and_do_not_fallback_on_erro
     assert!(defaults.contains("每次都需要 @"));
     assert!(defaults.contains("data-project-lookup"));
     assert!(defaults.contains("/assets/projects.js"));
-    assert!(defaults.contains("<select name=\"project\" required disabled>"));
+    assert!(!defaults.contains("<select"));
+    assert!(defaults.contains("role=\"combobox\""));
+    assert!(defaults.contains("role=\"listbox\""));
+    assert!(defaults.contains("搜索仓库名称或所属组织"));
     let forgejo_defaults = client
         .get(format!("{url}/commands?provider=forgejo&lang=zh"))
         .send()
@@ -429,7 +432,10 @@ async fn public_routes_link_projects_redirect_lookup_and_do_not_fallback_on_erro
         .text()
         .await
         .unwrap();
-    assert!(forgejo_defaults.contains("value=\"forgejo\" selected"));
+    assert!(forgejo_defaults.contains("name=\"provider\" value=\"forgejo\""));
+    assert!(
+        forgejo_defaults.contains("aria-checked=\"true\" tabindex=\"0\" data-provider=\"forgejo\"")
+    );
     assert!(forgejo_defaults.contains("provider=forgejo&amp;lang=en"));
     let lookup = client
         .get(format!(

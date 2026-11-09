@@ -100,7 +100,7 @@ async fn empty_or_revoked_policy_prevents_client_and_token_creation() {
             Err(GhError::Api { status: 403, .. })
         ));
         assert!(matches!(
-            gh.installation_token(&cfg, 7).await,
+            gh.repository_token(&cfg, 7, "team/one").await,
             Err(GhError::Api { status: 403, .. })
         ));
     }
@@ -161,7 +161,8 @@ async fn discovery_and_git_tokens_are_limited_to_admitted_repositories() {
         gh.admitted_repositories(&cfg, 7).await.unwrap(),
         vec!["team/one"]
     );
-    assert_eq!(github_token_repositories(&cfg, 7).unwrap(), vec![21]);
+    assert_eq!(github_token_repository(&cfg, 7, "team/one").unwrap(), 21);
+    assert!(github_token_repository(&cfg, 7, "elsewhere/two").is_err());
     assert!(gh.admitted_repositories(&cfg, 999).await.is_err());
     assert_eq!(server.received_requests().await.unwrap().len(), 1);
 }

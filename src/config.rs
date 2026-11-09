@@ -28,6 +28,8 @@ pub struct Config {
     pub forgejo_base_url: String,
     pub forgejo_token: String,
     pub forgejo_webhook_secret: String,
+    /// Background reconciliation also runs when the optional external cron is disabled.
+    pub forgejo_reconcile_enabled: bool,
     /// JSON object: Forgejo login -> GitHub login. Presentation only; never permissions.
     pub forgejo_user_map: String,
 
@@ -257,6 +259,7 @@ impl Config {
             forgejo_base_url: cfg("FORGEJO_BASE_URL", ""),
             forgejo_token: cfg("FORGEJO_TOKEN", ""),
             forgejo_webhook_secret: cfg("FORGEJO_WEBHOOK_SECRET", ""),
+            forgejo_reconcile_enabled: bool_cfg("FORGEJO_RECONCILE_ENABLED", true),
             forgejo_user_map: cfg("FORGEJO_USER_MAP", "{}"),
 
             ai_base_url: cfg("AI_BASE_URL", ""),

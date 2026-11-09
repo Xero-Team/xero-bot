@@ -22,7 +22,9 @@ whether each command needs no bot mention, an earlier active session, or a bot
 mention on every call. Disabled and unsupported commands stay visible with a
 reason. The default `/commands` page includes the complete registry and an
 automatically populated project selector. Choose GitHub or Forgejo, then select
-a repository; project pages retain the current selection. A collapsed manual
+a repository in the custom searchable popover; repository-name matches rank
+ahead of owner-only matches. Use arrow keys and Enter to select, or Escape to
+dismiss. Platform buttons and project pages retain the current selection. A collapsed manual
 form also works without JavaScript. Discovery does not require queue activity,
 Rollup, or public queue opt-in.
 

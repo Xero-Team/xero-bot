@@ -231,6 +231,32 @@ fn valid_destination(destination: &str) -> bool {
 }
 
 const RECONCILE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+const STARTUP_DELAY: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Recover missed/failed push synchronization without requiring an external cron.
+/// Repository opt-ins, live admission checks and conservative ref transfer still apply.
+pub async fn run_reconciliation(cfg: Config) {
+    if !cfg.forgejo_ready() || !cfg.forgejo_reconcile_enabled {
+        return;
+    }
+    reconciliation_loop(|| async {
+        let summary = sweep(&cfg).await;
+        tracing::info!(%summary, "Forgejo background reconciliation completed");
+    })
+    .await;
+}
+
+async fn reconciliation_loop<F, Fut>(mut run: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    tokio::time::sleep(STARTUP_DELAY).await;
+    loop {
+        run().await;
+        tokio::time::sleep(RECONCILE_INTERVAL).await;
+    }
+}
 
 /// One deployment-wide gate, held for the entire scan. Frequent or overlapping
 /// cron calls must not rescan GitHub or enqueue another full round of fetches.
@@ -656,6 +682,57 @@ mod tests {
             .await
             .contains("already running"));
         assert_eq!(scans.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn background_reconciliation_recovers_without_external_cron_and_never_overlaps() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let scans = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let count = Arc::clone(&scans);
+        let gate = Arc::clone(&release);
+        let worker = tokio::spawn(async move {
+            reconciliation_loop(|| async {
+                count.fetch_add(1, Ordering::SeqCst);
+                gate.notified().await;
+            })
+            .await;
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(STARTUP_DELAY - std::time::Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(scans.load(Ordering::SeqCst), 0);
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(scans.load(Ordering::SeqCst), 1);
+        tokio::time::advance(RECONCILE_INTERVAL * 2).await;
+        tokio::task::yield_now().await;
+        assert_eq!(scans.load(Ordering::SeqCst), 1);
+        release.notify_one();
+        tokio::task::yield_now().await;
+        tokio::time::advance(RECONCILE_INTERVAL - std::time::Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(scans.load(Ordering::SeqCst), 1);
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(scans.load(Ordering::SeqCst), 2);
+        worker.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn disabled_reconciliation_never_waits_or_accesses_providers() {
+        let mut cfg = Config::from_env();
+        cfg.forgejo_base_url = "https://forgejo.invalid".into();
+        cfg.forgejo_token = "test-token".into();
+        cfg.forgejo_webhook_secret = "test-secret".into();
+        cfg.cron_secret.clear();
+        cfg.forgejo_reconcile_enabled = false;
+        let started = tokio::time::Instant::now();
+        run_reconciliation(cfg.clone()).await;
+        cfg.forgejo_reconcile_enabled = true;
+        cfg.forgejo_token.clear();
+        run_reconciliation(cfg).await;
+        assert_eq!(started.elapsed(), std::time::Duration::ZERO);
     }
 
     #[tokio::test]
