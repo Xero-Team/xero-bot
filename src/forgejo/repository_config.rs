@@ -7,10 +7,26 @@ use crate::config::repository::{RepositoryConfig, CONFIG_PATH};
 #[path = "repository_config_tests.rs"]
 mod tests;
 
+pub struct RepositoryConfigSnapshot {
+    pub config: RepositoryConfig,
+    pub default_branch: String,
+    pub commit_sha: String,
+    pub file_present: bool,
+}
+
 impl ForgejoClient {
     /// Read the complete default-branch policy at a pinned commit. Domain errors
     /// remain in the returned config so consumers can fail closed for their domain.
     pub async fn repository_config(&self, repo: &str) -> Result<RepositoryConfig, String> {
+        self.repository_config_snapshot(repo)
+            .await
+            .map(|snapshot| snapshot.config)
+    }
+
+    pub async fn repository_config_snapshot(
+        &self,
+        repo: &str,
+    ) -> Result<RepositoryConfigSnapshot, String> {
         if !super::commands::valid_repository(repo) {
             return Err("invalid Forgejo repository name".into());
         }
@@ -45,7 +61,13 @@ impl ForgejoClient {
             Ok(value) => value,
             Err(ForgejoError::Api { status: 404, .. }) => {
                 confirm_policy_absent(client, repo, commit).await?;
-                return RepositoryConfig::parse("", repo).map_err(|problem| problem.to_string());
+                return Ok(RepositoryConfigSnapshot {
+                    config: RepositoryConfig::parse("", repo)
+                        .map_err(|problem| problem.to_string())?,
+                    default_branch: branch.into(),
+                    commit_sha: commit.into(),
+                    file_present: false,
+                });
             }
             Err(error) => return Err(format!("cannot read Forgejo repository policy: {error}")),
         };
@@ -62,7 +84,12 @@ impl ForgejoClient {
             .map_err(|_| "Forgejo repository policy is not valid base64")?;
         let text =
             String::from_utf8(bytes).map_err(|_| "Forgejo repository policy is not valid UTF-8")?;
-        RepositoryConfig::parse(&text, repo).map_err(|problem| problem.to_string())
+        Ok(RepositoryConfigSnapshot {
+            config: RepositoryConfig::parse(&text, repo).map_err(|problem| problem.to_string())?,
+            default_branch: branch.into(),
+            commit_sha: commit.into(),
+            file_present: true,
+        })
     }
 }
 

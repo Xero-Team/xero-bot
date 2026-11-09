@@ -146,6 +146,15 @@ pub fn github_installation(cfg: &Config, installation: i64) -> Result<(), GhErro
 pub fn github_scope(cfg: &Config, installation: i64, name: &str, id: Option<i64>) -> bool {
     policy(cfg).is_some_and(|p| p.github_entry(installation, name, id).is_some())
 }
+/// Resolve only a deployment-admitted name. Callers must still verify live
+/// metadata and visibility before returning any project information publicly.
+pub(crate) fn github_identity(cfg: &Config, name: &str) -> Option<(i64, i64)> {
+    policy(cfg)?
+        .github
+        .iter()
+        .find(|entry| entry.repository.eq_ignore_ascii_case(name))
+        .map(|entry| (entry.installation_id, entry.repository_id))
+}
 pub fn forgejo_scope(cfg: &Config, name: &str, id: Option<i64>) -> bool {
     policy(cfg).is_some_and(|p| p.forgejo_entry(name, id).is_some())
 }

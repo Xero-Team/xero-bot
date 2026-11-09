@@ -1,9 +1,5 @@
 //! Minimal, project-scoped, read-only queue and generated command reference.
-use crate::{
-    config::{repository::CommandId, Config},
-    lang::Lang,
-    trigger_state::Store,
-};
+use crate::{config::Config, lang::Lang, trigger_state::Store};
 use axum::{
     extract::{Path, Query, State},
     http::{header, StatusCode},
@@ -14,6 +10,9 @@ use axum::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::sync::Arc;
+#[path = "command_reference.rs"]
+mod command_reference;
+use command_reference::{command_data, commands, project_command_data, project_commands};
 #[derive(Clone)]
 pub struct WebState {
     pub cfg: Config,
@@ -41,9 +40,11 @@ pub fn routes<S: Clone + Send + Sync + 'static>(state: WebState) -> Router<S> {
         .route("/queue", get(projects))
         .route("/queue/{owner}/{repo}", get(project))
         .route("/commands", get(commands))
+        .route("/commands/{owner}/{repo}", get(project_commands))
         .route("/api/queue", get(data))
         .route("/api/queue/{owner}/{repo}", get(project_data))
         .route("/api/commands", get(command_data))
+        .route("/api/commands/{owner}/{repo}", get(project_command_data))
         .route("/assets/queue.js", get(script))
         .with_state(state)
 }
@@ -56,18 +57,21 @@ fn escape(s: &str) -> String {
 }
 fn page(title: &str, body: &str, path: &str, lang: Lang) -> impl IntoResponse {
     let locale = code(lang);
+    let language_path = format!(
+        "{}{}lang=",
+        escape(path),
+        if path.contains('?') { "&amp;" } else { "?" }
+    );
     let html = format!(
-        r#"<!doctype html><html lang="{locale}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{} · Xero Bot</title><style>{}</style></head><body><nav><a href="/?lang={locale}">Xero Bot</a> | <a href="/queue?lang={locale}">{}</a> | <a href="/commands?lang={locale}">{}</a><span class="languages"><a href="{}?lang=en" lang="en">English</a> | <a href="{}?lang=zh" lang="zh">中文</a></span></nav><main>{body}</main><footer>Xero Bot v{} · {}</footer></body></html>"#,
+        r#"<!doctype html><html lang="{locale}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{} · Xero Bot</title><style>{}</style></head><body><nav><a href="/?lang={locale}">Xero Bot</a> | <a href="/queue?lang={locale}">{}</a> | <a href="/commands?lang={locale}">{}</a><span class="languages"><a href="{language_path}en" lang="en">English</a> | <a href="{language_path}zh" lang="zh">中文</a></span></nav><main>{body}</main><footer>Xero Bot v{} · {}</footer></body></html>"#,
         escape(title),
         include_str!("style.css"),
         lang.pick("Projects", "项目"),
         lang.pick("Commands", "指令"),
-        escape(path),
-        escape(path),
         env!("CARGO_PKG_VERSION"),
         lang.pick(
-            "Read-only queue. Updated every 10 seconds.",
-            "只读队列，每 10 秒更新。"
+            "Read-only dashboard. Queue updates every 10 seconds.",
+            "只读看板，队列每 10 秒更新。"
         )
     );
     ([(header::CACHE_CONTROL,"no-store"),(header::CONTENT_SECURITY_POLICY,"default-src 'none'; style-src 'unsafe-inline'; script-src 'self'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'"),(header::X_CONTENT_TYPE_OPTIONS,"nosniff")],Html(html))
@@ -101,53 +105,21 @@ async fn project(
     page(
         &title,
         &format!(
-            r#"<h1>{}</h1><div class="toolbar"><span id="summary"></span><span id="updated" role="status">{}</span><button id="refresh">{}</button></div><div id="queues" data-project="{}"></div><script src="/assets/queue.js" defer></script>"#,
+            r#"<h1>{}</h1><p><a href="/commands/{}/{}?lang={}">{}</a></p><div class="toolbar"><span id="summary"></span><span id="updated" role="status">{}</span><button id="refresh">{}</button></div><div id="queues" data-project="{}"></div><script src="/assets/queue.js" defer></script>"#,
             escape(&title),
+            crate::github::enc_seg(&owner),
+            crate::github::enc_seg(&repo),
+            code(lang),
+            lang.pick(
+                "View project commands and @ requirements",
+                "查看项目可用指令及 @ 规则"
+            ),
             lang.pick("Loading…", "加载中…"),
             lang.pick("Refresh", "刷新"),
             escape(&name)
         ),
         &path,
         lang,
-    )
-}
-fn specs(cfg: &Config, lang: Lang) -> Vec<Value> {
-    CommandId::ALL.into_iter().map(|id|{
-        let syntax=match id {CommandId::Approve=>"r+ / r+ rollup / r+ as @user",CommandId::Rollup=>"rollup / rollup=never",CommandId::Label=>"label +name -name",CommandId::Cc=>"cc @user",CommandId::Assign=>"assign @user",CommandId::RequestReview=>"r? @user",_=>id.name()};
-        json!({"command":id.name(),"syntax":syntax,"aliases":id.aliases(),"description":crate::handlers::help::description(id,lang),"requires_pr":id.requires_pr(),"trigger":format!("{:?}",id.default_mode()),"github":true,"forgejo":!matches!(id,CommandId::Review|CommandId::Codeql),"rollup_enabled":cfg.rollup_enabled})
-    }).collect()
-}
-async fn commands(State(s): State<WebState>, Query(q): Query<Language>) -> impl IntoResponse {
-    let lang = q.get();
-    let mut body=format!("<h1>{}</h1><p>{}</p><p>GitHub: <code>@{}</code> · Forgejo: <code>@{}</code></p><div class=table-wrap><table><thead><tr><th>{}</th><th>{}</th><th>{}</th><th>{}</th></tr></thead><tbody>",lang.pick("Commands","指令"),lang.pick("Generated from the running bot. Use help in a project to see its effective policy.","由运行版本自动生成。在项目中使用 help 查看实际生效的策略。"),escape(&s.cfg.bot_name),escape(&s.cfg.forgejo_bot_name),lang.pick("Command","指令"),lang.pick("Description","作用"),lang.pick("Scope","范围"),lang.pick("Provider","平台"));
-    for row in specs(&s.cfg, lang) {
-        body.push_str(&format!(
-            "<tr><td><code>{}</code></td><td>{}</td><td>{}</td><td>{}</td></tr>",
-            escape(row["syntax"].as_str().unwrap_or("")),
-            escape(row["description"].as_str().unwrap_or("")),
-            if row["requires_pr"] == true {
-                "PR"
-            } else {
-                "PR / Issue"
-            },
-            if row["forgejo"] == true {
-                "GitHub, Forgejo"
-            } else {
-                "GitHub"
-            }
-        ));
-    }
-    body.push_str("</tbody></table></div><p>");
-    body.push_str(lang.pick("r+ approves a revision; r+ rollup allows batching. GitHub CI falls back to Forgejo; either complete suite passing on the same candidate permits merging. Web Approve does not enqueue in rollup mode.","r+ 批准当前提交，r+ rollup 允许组批。GitHub CI 失败后转交 Forgejo；同一候选在任一侧完整通过即可合并。Rollup 模式下，网页 Approve 不自动入队。"));
-    body.push_str("</p>");
-    page(lang.pick("Commands", "指令"), &body, "/commands", lang)
-}
-async fn command_data(State(s): State<WebState>, Query(q): Query<Language>) -> impl IntoResponse {
-    (
-        [(header::CACHE_CONTROL, "no-store")],
-        Json(
-            json!({"version":env!("CARGO_PKG_VERSION"),"language":code(q.get()),"commands":specs(&s.cfg,q.get())}),
-        ),
     )
 }
 pub(crate) fn public_snapshot(repos: Vec<super::Repository>) -> Value {

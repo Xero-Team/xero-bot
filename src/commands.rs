@@ -4,6 +4,7 @@
 //! their source evidence. Callers must gate each candidate before passing the
 //! permitted subset to `resolve_commands`. Parsing itself performs no I/O.
 
+pub mod catalog;
 pub mod diag;
 mod lex;
 mod mask;
